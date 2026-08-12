@@ -1,0 +1,53 @@
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ESP32-S3R8 configuration verified by the bring-up project.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Keep the native USB Serial/JTAG console available in VS Code.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# The app switches to this MSC-only USB descriptor only after the user taps
+# the Media Disk launcher icon. Normal boot remains USB Serial/JTAG.
+CONFIG_TINYUSB_MSC_ENABLED=y
+
+# BLE control channel (same NimBLE GATT test service used by test_Pacon).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="PACON Media Disk"
+CONFIG_TINYUSB_DESC_MSC_STRING="PACON NAND"
+
+# Keep Wi-Fi usable alongside BLE, QSPI DMA, and SD NAND. The default Wi-Fi
+# buffer counts consume too much internal RAM for SoftAP startup on PACON.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_RX_BA_WIN=4
+CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
+
+# BLE uploads keep their user-visible .rgb565 names on the FAT volume.
+# Heap-backed long-file-name support is required for the final rename.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# Native anti-aliased UI text.  The fluid itself still uses the direct QSPI
+# DMA renderer; LVGL is linked here only for its compact Montserrat glyphs.
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+# CONFIG_LV_BUILD_EXAMPLES is not set

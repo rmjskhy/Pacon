@@ -1,0 +1,53 @@
+# ESP-IDF / CMake generated output
+**/build/
+**/esp-idf/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/.bin_timestamp
+**/*.temp.overrides
+**/.ninja_deps
+**/.ninja_log
+**/build.ninja
+**/cmake_install.cmake
+**/compile_commands.json
+**/project_description.json
+**/component_manager_run_counter.*
+**/gdbinit/
+**/config.env
+**/kconfigs.in
+**/kconfigs_projbuild.in
+**/ldgen_libraries
+**/ldgen_libraries.in
+**/x509_crt_bundle.S
+**/project_elf_src_*.c
+**/config/
+**/bootloader-prefix/
+**/dependencies.lock
+**/flasher_args.json
+**/*-flash_args
+**/flash_args*
+**/*.bin
+**/*.elf
+**/*.map
+**/*.a
+**/*.o
+**/*.obj
+
+# Android Studio / Gradle generated output and machine-local settings
+PaconBleTool/.gradle/
+PaconBleTool/.idea/
+PaconBleTool/**/build/
+PaconBleTool/local.properties
+PaconBleTool/**/*.apk
+PaconBleTool/**/*.iml
+
+# Large generated media; keep the conversion/documentation inputs instead.
+my_Pacon/assets/media/rgb565/*.rgb565
+my_Pacon/main/assets/*.rgb565
+
+# Local/editor noise
+**/.DS_Store
+**/Thumbs.db
+*.user
+*.suo
+.git-pacon/

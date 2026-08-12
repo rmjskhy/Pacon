@@ -1,0 +1,327 @@
+# PACON 固件设计文档
+
+更新日期：2026-08-05  
+适用工程：`D:\my_project\Pacon\my_Pacon`  
+目标环境：ESP-IDF v5.4.3，ESP32-S3，默认下载/调试端口 COM11
+
+## 1. 文档定位与事实优先级
+
+本文描述 `my_Pacon` 当前正式固件的整体设计，供后续开发者和 Agent 快速接手。内容以当前源码为准，并把已经集成的功能、仅在测试工程验证的外设、尚待验证的修改分开记录。
+
+发生冲突时，按以下顺序判断：
+
+1. 当前源码、`sdkconfig`、原理图和目标板实测结果；
+2. 本文档；
+3. `USB_MSC_NOTES.md` 等专题文档；
+4. `DEVELOPMENT_LOG.md` 和 `POWER_KEY_AND_PMIC_DIAGNOSIS.md` 中的历史记录。
+
+历史日志保留了排障过程，其中部分阶段性结论已被后续实测推翻，不能脱离日期直接作为当前设计依据。
+
+## 2. 产品目标
+
+PACON 是一块圆形电子吧唧。默认界面用于显示静态图片或短动画；从顶部下拉进入应用列表。当前主要功能包括：
+
+- 本地图片/动画电子吧唧；
+- 倾斜和触摸交互的流体效果；
+- 仿 OuO 风格的互动表情；
+- SkyOrb 飞机雷达；
+- Wi-Fi 与 SkyOrb 参数设置；
+- 将板载 SD NAND 临时切换为 USB U 盘。
+
+现阶段目标是先保持硬件稳定、显示正确和交互流畅，再逐步扩展新应用。正式固件应继续支持在 VS Code ESP-IDF 插件中直接编译、下载和监视串口。
+
+## 3. 系统结构
+
+```mermaid
+flowchart TD
+    A["app_main"] --> B["共享 I2C 与 AXP2101"]
+    B --> C["SH8601 显示初始化"]
+    C --> D["FT3168 触摸与 QMI8658 IMU"]
+    D --> E["挂载 MKDV4GCL-AB /sdnand"]
+    E --> F["主循环与界面状态机"]
+    F --> H["默认媒体主页"]
+    F --> I["应用启动器"]
+    I --> J["Fluid"]
+    I --> K["0u0"]
+    I --> L["SkyOrb"]
+    I --> M["Settings"]
+    I --> N["USB Disk"]
+```
+
+目前大部分实现集中在 `main/fluid_pendant.c`。这种结构便于快速实验，但模块间耦合较高，是后续重构的重点。
+
+## 4. 硬件映射
+
+### 4.1 已由正式固件使用
+
+| 模块 | 芯片/接口 | ESP32-S3 引脚或地址 | 说明 |
+|---|---|---|---|
+| 共享 I2C | I2C0 | SCL GPIO1，SDA GPIO2 | PMIC、触摸、IMU 共用；超时 50 ms |
+| PMIC | AXP2101 | I2C `0x34` | 支持 ID `0x4A` 和当前板实测的 `0x47` |
+| 触摸 | FT3168/FT5x06 兼容驱动 | I2C `0x38`，RST GPIO4 | 睡眠时仍用于唤醒屏幕 |
+| IMU | QMI8658 | I2C `0x6A` | 流体、0u0 和 SkyOrb 方位交互 |
+| 圆屏 | SH8601 QSPI | RST 5，POWER 6，CS 7，CLK 8，D3 9，D2 10，D1 11，D0 12 | 475×466，SPI2_HOST |
+| 板载存储 | MKDV4GCL-AB SD NAND | D2 14，D3 15，CLK 16，CMD 17，D0 18，D1 21 | SDMMC 4-bit，挂载点 `/sdnand` |
+
+### 4.2 已在测试工程验证、尚未正式集成
+
+| 模块 | 接口 | 当前验证结果 |
+|---|---|---|
+| RTC PCF85063 | I2C `0x51` | 通信和走时已验证；首次上电 `VL=1` 属于时间未初始化提示 |
+| 数字麦克风 MSM261S4030H0R | SCK GPIO39，WS GPIO40，SD GPIO47 | I2S 左声道已获得随声音变化的有效数据 |
+| 蜂鸣器/扬声器 | GPIO48 | 测试固件中已听到声音 |
+
+这些外设不能仅因测试通过就视为正式应用可用；接入主程序时仍需处理初始化顺序、资源冲突、功耗和 UI。
+
+## 5. 启动和供电顺序
+
+`app_main()` 当前按以下顺序启动：
+
+1. 初始化共享 I2C；
+2. 探测并配置 AXP2101；
+3. 等待电源轨稳定；
+4. 初始化 SH8601 并打开屏幕电源门控；
+5. 初始化粒子、触摸和 IMU；
+6. 探测并挂载 SD NAND；
+7. 扫描媒体文件、建立缓存并进入主循环。
+
+屏幕电源在 PMIC 和 I2C 初始化阶段保持关闭，避免电源尚未稳定时 OLED 提前点亮。正常亮度为 `0x80`，约 50%；20 秒无操作降到 `0x24`，60 秒无操作关闭显示。触摸控制器保持工作，第一次完整触摸只负责唤醒，不直接触发应用。
+
+为降低 OLED 静态烧屏风险，默认媒体界面的状态栏和内容会按周期做轻微位置偏移。固定高亮、高亮度和长时间静止画面仍应避免。
+
+## 6. 显示与渲染约束
+
+- 面板逻辑分辨率为 475×466，画布使用 RGB565；
+- 完整工作画布放在 PSRAM；内部 SRAM 中保留 64 行 DMA 条带；
+- SH8601 传输前需要交换 RGB565 字节序；
+- 实测窄 X 区域更新会产生地址回绕、残影或覆盖，因此脏矩形优化只裁剪 Y 范围，X 始终发送完整 475 像素行；
+- 流体等高帧率界面优先保证传输正确和视觉流畅，不能再次引入窄 X 窗口优化；
+- 主页媒体读取由后台任务执行，避免单次约 200 ms 的 NAND 读取阻塞触摸轮询。
+
+屏幕出现从上到下刷新的观感时，优先检查媒体读取是否阻塞、DMA 条带是否串行等待，以及一次帧更新是否被拆成过多事务，而不是先改变 SH8601 的稳定全行传输规则。
+
+## 7. 界面状态与导航
+
+当前界面状态包括：
+
+| 状态 | 用途 | 主要进入/退出方式 |
+|---|---|---|
+| `UI_SCREEN_HOME` | 默认图片/动图主页 | 左右滑动切换媒体；顶部下拉进入应用列表 |
+| `UI_SCREEN_APPS` | 应用启动器 | 点击图标进入应用；上滑或点击底部返回区以反向动画返回主页 |
+| `UI_SCREEN_FLUID` | 流体 | 触摸显示控制；15 秒无触摸隐藏返回和设置按钮 |
+| `UI_SCREEN_FLUID_SETTINGS` | 流体模式设置 | 选择三种形态，进入调色盘 |
+| `UI_SCREEN_COLOUR_PICKER` | 独立调色盘 | 触摸连续选色并立即应用 |
+| `UI_SCREEN_OUO` | 互动表情 | 触摸、拖动和晃动改变表情 |
+| `UI_SCREEN_OUO_MENU` | 表情/心情菜单 | 选择预设状态后返回表情页 |
+| `UI_SCREEN_SKYORB` | 飞机雷达 | 使用保存的网络、位置与量程配置 |
+| `UI_SCREEN_SETTINGS` | 设备设置 | 启动临时配置 AP 和网页 |
+| `UI_SCREEN_USB_DISK` | USB U 盘交接 | 安全弹出后返回会软重启 |
+
+### 7.1 统一视觉规范
+
+2026-08-05 起，系统层界面采用适合 475×466 圆形 AMOLED 的 watchOS 启发式视觉语言。这里模仿的是布局原则和交互层级，不复制 Apple 图标、商标或系统资源。
+
+- 背景以纯黑 `#000000` 为主，利用 AMOLED 黑位并降低常亮像素面积；
+- 应用启动器使用圆形图标和蜂窝式排布，不在图标下堆叠文字；
+- 返回、设置等高频操作优先使用圆形图标按钮；必须使用文字的主要操作采用胶囊按钮；
+- 设置项使用深灰分组卡片：基础表面 `#1C1C1E`，抬升表面 `#2C2C2E`；
+- 系统强调色统一为蓝色 `#0A84FF`，成功为绿色 `#30D158`，警告为橙色 `#FF9F0A`，危险为红色 `#FF453A`；
+- 主文字使用接近白色 `#F5F5F7`，次要信息使用灰色 `#8E8E93`；
+- 可见控件和触摸热区至少按 44×44 像素设计；圆屏边缘按钮向内收，避免内容被面板裁切；
+- 沉浸式应用保留自身视觉身份：媒体主页继续全屏显示内容，Fluid 保留动态流体，0u0 保留黑底白色表情，SkyOrb 保留雷达画面；只统一导航和设置控件；
+- 文字只用于状态或无法用图形明确表达的动作，能够用通用图形表达时不显示按钮文字。
+
+当前已按该规范调整应用启动器、Fluid 设置与调色盘、0u0 菜单、SkyOrb 顶部控件、设备设置、USB Disk 状态页和 Fluid 浮动控制。触摸命中区域保持与原交互一致，避免视觉重构改变操作手感。
+
+## 8. 默认媒体主页
+
+正常启动后扫描 `/sdnand/media`，最多加载 12 个媒体文件。左右滑动使用软件合成的横向过渡，不应表现为立即跳图。主页下拉进入应用启动器；启动器上滑或点击底部返回区时，应用卡片向上移出、主页媒体从底部进入。动画播放期间，触摸手势的优先级高于下一帧解码/读取，以避免需要连续滑动多次才响应。
+
+媒体格式规则：
+
+- 扩展名为 `.rgb565`，允许 FAT 生成的 8.3 文件名别名；
+- 每帧固定 475×466、RGB565 小端，共 442700 字节；
+- 文件只有一帧时作为静态图片；多帧时循环播放；
+- 文件名包含 `Nfps` 时以 N 帧每秒播放，否则默认 8 fps；
+- 没有媒体目录、目录为空或文件无效时，显示初音青绿色备用界面。
+
+主页顶部仅保留紧凑电池图标，百分比显示在图标内部；充电状态使用颜色或符号表达。布局应避开圆屏顶部裁切区，尽量少用文字。
+
+## 9. 应用设计
+
+### 9.1 Fluid
+
+Fluid 源自 Opal_Fluid 的思路，并针对 PACON 的直接 QSPI 渲染路径重写。当前使用 220 个粒子，接收 QMI8658 倾斜重力和触摸扰动。
+
+提供三种形态：`SIMPLE`、`BLOCKS`、`MATRIX`。颜色通过独立调色盘连续选择。渲染使用全宽脏 Y 条带；粒子物理与显示刷新解耦，以触感和流畅度优先。
+
+### 9.2 0u0
+
+0u0 是参考 OuO 交互风格实现的自绘表情，不是原应用代码的移植。眼睛和嘴会响应触摸位置、揉脸/拖动动作、设备倾斜和达到阈值的摇晃；还包含眨眼、开心、挤压、生气、惊讶、困倦、难过和眩晕等状态。
+
+后续调整应以本地参考视频逐帧比对，避免随意新增与原作风格不一致的瞳孔、轮廓或自动循环表情。静止且无触摸时不应无理由快速轮换表情。
+
+### 9.3 SkyOrb
+
+SkyOrb 参考 GulfCoastMaker/SkyOrb 与 ESP32-Plane-Radar 的功能思路，适配为单块圆形 SH8601 屏幕。当前雷达刷新周期 180 ms，网络数据抓取周期 5 s，最多显示 28 架飞机。
+
+配置保存在 NVS 命名空间 `skyorb`，包括家庭 Wi-Fi、经纬度、自动定位标记和量程。未设置经纬度时，可在联网后尝试通过公网地址获得粗略位置；该结果只适合作为默认值，不替代用户设置。
+
+### 9.4 Settings 与配置 AP
+
+进入 Settings 时启动配置热点：
+
+- SSID：`PACON-Sky`；
+- 密码：`pacon-sky`；
+- 地址：`http://192.168.4.1`；
+- WPA2、信道 6、CN 2.4 GHz 域。
+
+信道 6/CN 配置已在目标手机上验证可被扫描；之前的信道 1/默认区域配置曾出现热点不可见。网页主页面设置家庭 Wi-Fi，子页面设置经纬度和量程。
+
+当前源码设计为“设置会话”模式：进入 Settings 才开启 AP；离开后停止 AP。若已保存家庭网络，则切换到 STA 并连接；否则关闭 Wi-Fi。该最后一项生命周期修改已经写入源码并通过编译，但仍应在目标板上做一次最终验证。
+
+### 9.5 USB Disk
+
+Disk 功能把 U2 的块设备所有权从固件交给电脑：
+
+1. 正常模式由固件挂载 `/sdnand`；
+2. 进入 Disk 后先卸载 FAT，再启动 TinyUSB MSC；
+3. 电脑独占文件系统，固件不能同时读写；
+4. 电脑安全弹出后，在板上退出 Disk；
+5. 固件软重启，恢复 USB Serial/JTAG 并重新挂载 NAND。
+
+Type-C 正反插不能作为“串口/U 盘模式”选择信号。两种模式使用同一条有效 USB 数据通道，只能由应用明确切换。详细规则见 `USB_MSC_NOTES.md`。
+
+## 10. AXP2101、电池与充电
+
+正式固件接受 AXP2101 ID `0x4A` 和 `0x47`。当前目标板通信问题最终与周边错误器件/焊接有关，修正后 `0x47` 可稳定读取，因此历史文档中“AXP2101 一定损坏或无法软件访问”的阶段性结论已经过时。
+
+当前软件配置目标：
+
+- 充电目标电压 4.0 V；
+- 预充电电流 25 mA；
+- 恒流充电 50 mA；
+- 终止电流 25 mA，并启用终止；
+- 启用电池检测、充电器和电量计；
+- 每 5 秒读取 VBUS、BAT、VSYS、电量、充电状态和 PMIC 温度。
+
+任何提高充电电压或电流的修改都必须先确认电池规格、实际截止行为、板温和测量点。寄存器显示目标值不等于物理端口已经安全截止；涉及电池的改动必须用真实电压和串口状态共同验证。
+
+## 11. 存储、内存与并发
+
+- ESP32-S3 外部 PSRAM 保存完整画布和媒体缓存；
+- 内部 DMA 能力内存保存 LCD 条带；
+- SD NAND 正常模式只由 VFS/媒体读取任务拥有；MSC 模式只由 PC 拥有；
+- 媒体缓存当前有 4 个槽位，读取请求由后台任务处理；
+- 主循环负责 UI 状态、触摸、渲染、休眠和周期性 PMIC 日志；
+- 网络和 USB 栈启动时会占用额外任务和内存，新增功能必须检查栈大小、PSRAM 分配失败和 UI 卡顿。
+
+## 12. 工程与构建
+
+工程根目录为 `D:\my_project\Pacon\my_Pacon`。根 `CMakeLists.txt` 复用相邻 `D:\my_project\Pacon\Pacon\components` 中的 SH8601、LVGL 和 CMake utility 组件。构建产物、配置缓存和下载文件保留在工程目录的 `build` 中，便于 VS Code ESP-IDF 插件继续使用。
+
+分区表：
+
+| 分区 | 类型 | 大小 |
+|---|---|---|
+| `nvs` | data/nvs | `0x6000` |
+| `app0` | factory app | 15000 KiB |
+
+常用流程：选择 ESP-IDF v5.4.3 环境，目标设为 ESP32-S3，在工程根目录编译；进入下载模式后从 COM11 烧录。只修改文档时不需要重新编译或烧录。
+
+## 13. 验证状态
+
+| 项目 | 状态 | 备注 |
+|---|---|---|
+| SH8601 显示、亮度、息屏和触摸唤醒 | 已在板验证 | 全行传输规则必须保留 |
+| 图片/动画读取与左右切换 | 已在板验证 | 动画手势和刷新仍可继续优化 |
+| Fluid 三种模式和调色盘 | 已在板验证 | 流畅度优先 |
+| 0u0 基本触摸和 IMU 表情 | 已在板验证 | 与原应用的细节仍有差距 |
+| AXP2101 `0x47` 通信与状态读取 | 已在板验证 | 充电安全继续以物理测量为准 |
+| USB MSC 媒体拷贝 | 已在板验证 | 严禁双重挂载 |
+| SkyOrb 设置 AP 可见与可配置 | 已在板验证 | 信道 6/CN 可见 |
+| 离开 Settings 后关闭 AP/切 STA | 待最终板上确认 | 源码已修改并编译通过 |
+| 系统界面统一 watchOS 启发式视觉 | 已编译，待板上确认 | 检查圆屏边缘、图标可辨识度和触摸命中 |
+| PCF85063、数字麦克风、蜂鸣器 | 测试工程已验证 | 尚未合入正式功能 |
+
+## 14. 开发约束与后续重构
+
+开发时应遵守以下不变量：
+
+- 不把芯片封装焊盘号当作 ESP-IDF GPIO 编号；
+- 不在同一时刻让 MSC 和固件 VFS 同时访问 NAND；
+- 不恢复已证明会产生残影的窄 X 显示窗口；
+- 不用一次 I2C 扫描成功代替连续寄存器读写验证；
+- 不仅凭 AXP 寄存器配置判断真实充电电压；
+- 不让耗时 NAND/网络操作长时间阻塞触摸和 UI；
+- 新增静态 UI 时考虑 OLED 亮度、自动息屏和像素位移。
+
+建议按下列边界逐步拆分 `fluid_pendant.c`，每次只做可验证的小步重构：
+
+```text
+main/
+  bsp/        引脚、I2C、LCD、触摸、IMU、PMIC、RTC、音频
+  display/    画布、DMA、SH8601 刷新和图元
+  media/      NAND、缓存、媒体索引和 USB MSC
+  ui/         状态机、手势、状态栏和应用启动器
+  apps/
+    fluid/
+    ouo/
+    skyorb/
+    settings/
+  network/    STA、配置 AP、HTTP 和定位
+```
+
+重构前后必须分别验证启动、主页、触摸、息屏、三种 Fluid 模式、0u0、SkyOrb、Disk 交接和串口日志，避免一次拆分掩盖硬件时序问题。
+
+## 15. 相关资料
+
+- `README.md`：工程的简短入口说明；
+- `DEVELOPMENT_LOG.md`：按时间记录的开发和排障历史；
+- `USB_MSC_NOTES.md`：U 盘模式及媒体格式；
+- `POWER_KEY_AND_PMIC_DIAGNOSIS.md`：早期电源键与 PMIC 排查记录；
+- `assets/media/README.md`：媒体资源制作说明；
+- `main/fluid_pendant.c`：当前实现的最终事实来源。
+# 2026-08-09 Settings and BLE delta
+
+The formal application now has a fixed-header, vertically scrollable Settings screen. Bluetooth is exposed as a switch and uses the verified `PACON-BLE-TEST` NimBLE service. Display brightness is changed with a slider and persisted in NVS (`pacon_ui/brightness`). Wi-Fi/AP remains only as a transitional SkyOrb configuration path and is no longer started just by opening Settings. Remove that path after BLE `GET/SET` commands for Wi-Fi, display, SkyOrb, and media have been implemented and tested; see `SETTINGS_BLE_NOTES.md`.
+
+## Launcher interaction and performance (2026-08-09)
+
+The app launcher keeps one native RGB565 composition in PSRAM while it is visible.  Its upward return transition therefore reuses cached icon pixels and overlaps two full-width LCD DMA stripes instead of recomputing the complete icon scene for every animation step.  Any page transition invalidates this cache before another app page is entered.
+
+Page-changing contacts are edge-triggered: after opening or dismissing the launcher, touch handling remains blocked until FT3168 reports zero contacts.  This avoids stale touch state after a long display flush and prevents a subsequent pull from being interpreted as a continuation of the preceding swipe.
+
+The launcher also has a four-step downward entrance animation.  Upward and downward transitions share a scanline compositor backed by the PSRAM home/launcher caches, so the animation does not rebuild icon geometry for every pixel.
+
+The launcher compositor must keep only one horizontal pixel loop per scanline.  A duplicated nested loop was removed after runtime testing because it amplified CPU work and could trigger the task watchdog during page transitions.
+
+The vertical Settings page uses a full-canvas first frame, then clears/recomposes only the scrollable card viewport.  Its dirty rectangle is sent with the two LCD stripe buffers in flight so finger scrolling can overlap CPU composition and QSPI DMA.
+
+Settings labels use direct glyph-bitmap composition with viewport clipping, and card icons use the same scroll offset as their text.  This avoids repeated per-pixel string searches and prevents fixed-position artifacts during scrolling.
+
+OuO's settings/menu remains visually unobtrusive but uses a broad bottom-left long-press zone.  Minor finger drift is tolerated and the release path confirms the hold duration, making the hidden control dependable even when a display render delays one polling tick.
+
+## BLE configuration protocol (2026-08-09)
+
+The existing `PACON-BLE-TEST` service keeps `PING`/`PONG` for regression testing and now forwards line-oriented configuration commands to the application.  Supported settings commands are `GET STATUS`, `GET SETTINGS`, `GET HELP`, `SET BRIGHTNESS 0..100`, `SET RANGE 0..3`, `SET LOCATION lat lon`, `SET AUTO_LOCATION`, and `SET WIFI ssid|password`.  Brightness is applied by the main UI task and persisted after validation; SkyOrb values use its existing NVS keys.  The status response omits the Wi-Fi password.  A separate media command state machine now handles native RGB565 uploads.
+
+The media extension uses `MEDIA_BEGIN`, a binary `MEDIA_DATA_UUID` windowed
+channel, `MEDIA_END`, and `MEDIA_ABORT`.  Transfers are native `475x466`
+RGB565 frames and use a short FAT-compatible staging file plus an atomic
+rename.  The binary channel carries a four-byte little-endian offset followed
+by raw RGB565LE bytes and emits one cumulative acknowledgement per eight
+packets.  The original hexadecimal command path remains as a compatibility
+fallback for older firmware.  The NAND
+reader is paused during replacement; the main UI task rescans the carousel only
+after the commit, so an animation cannot observe a partially written frame.
+When the media directory was empty at boot, the cache/task runtime is initialized lazily on the
+first committed upload, so the new asset becomes visible without a reboot.
+The lazy-initialization build was flashed to COM11 and boot-checked on 2026-08-10;
+NAND mount, PMIC telemetry, and the display task all started normally.
+
+Media management commands (2026-08-11): the same BLE command characteristic
+now accepts MEDIA_LIST, MEDIA_INFO <index>, and MEDIA_DELETE <name>. LIST/INFO
+enumerate valid native RGB565 files on /sdnand/media without replacing the
+active renderer snapshot; DELETE validates the filename, pauses the NAND
+reader, removes the file, and schedules the existing main-task rescan.
