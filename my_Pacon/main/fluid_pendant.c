@@ -313,6 +313,10 @@ static bool s_skyorb_wifi_events_registered;
 static bool s_skyorb_ap_ready;
 static esp_err_t s_skyorb_network_status = ESP_ERR_INVALID_STATE;
 static bool s_skyorb_network_task_started;
+/* Authoritative user-facing Wi-Fi switch state.  Connection/AP event flags
+ * are transient and must not make the Settings switch appear to turn itself
+ * off while the background radar task is still active. */
+static volatile bool s_skyorb_wifi_enabled;
 static bool s_skyorb_wifi_connected;
 static bool s_skyorb_fetch_in_progress;
 static bool s_skyorb_fetch_failed;
@@ -5192,24 +5196,23 @@ static bool skyorb_connect_saved_station(void)
     return err == ESP_OK;
 }
 
-static void skyorb_leave_setup_session(void)
+static void skyorb_disable_network(void)
 {
-    if (!s_skyorb_network_started) return;
+    s_skyorb_wifi_enabled = false;
 
     if (s_skyorb_http_server != NULL) {
         (void)httpd_stop(s_skyorb_http_server);
         s_skyorb_http_server = NULL;
     }
-    if (skyorb_connect_saved_station()) return;
-
+    (void)esp_wifi_disconnect();
     const esp_err_t err = esp_wifi_stop();
     s_skyorb_network_started = false;
     s_skyorb_ap_ready = false;
     s_skyorb_wifi_connected = false;
-    s_skyorb_network_status = err;
+    s_skyorb_network_status = (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
     skyorb_mark_dirty();
-    ESP_LOGI(TAG, "SkyOrb: setup AP stopped; no saved Wi-Fi to join (%s)",
-             esp_err_to_name(err));
+    ESP_LOGI(TAG, "SkyOrb: Wi-Fi disabled; radar network paused (%s)",
+             err == ESP_ERR_INVALID_STATE ? "already stopped" : esp_err_to_name(err));
 }
 
 static void skyorb_wifi_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -5231,7 +5234,12 @@ static void skyorb_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_skyorb_wifi_connected = false;
         skyorb_mark_dirty();
-        ESP_LOGW(TAG, "SkyOrb: Wi-Fi disconnected");
+        if (s_skyorb_wifi_enabled && s_skyorb_network_started) {
+            const esp_err_t retry = esp_wifi_connect();
+            ESP_LOGW(TAG, "SkyOrb: Wi-Fi disconnected; reconnect=%s", esp_err_to_name(retry));
+        } else {
+            ESP_LOGW(TAG, "SkyOrb: Wi-Fi disconnected");
+        }
     }
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         s_skyorb_wifi_connected = true;
@@ -5423,6 +5431,7 @@ static void skyorb_start_http_server(void)
 
 static bool skyorb_network_failure(const char *stage, esp_err_t err)
 {
+    s_skyorb_wifi_enabled = false;
     s_skyorb_network_started = false;
     s_skyorb_ap_ready = false;
     s_skyorb_network_status = err;
@@ -5566,6 +5575,29 @@ static bool skyorb_start_network(void)
              checked_ap.ap.ssid);
     ESP_LOGI(TAG, "SkyOrb AP: SSID=%s channel=%u WPA2 URL=http://192.168.4.1",
              SKYORB_AP_SSID, (unsigned)checked_ap.ap.channel);
+    return true;
+}
+
+/* Bring up the saved home network when credentials exist.  The SoftAP is
+ * retained only as the fallback provisioning path; it is not the meaning of
+ * the Settings Wi-Fi switch. */
+static bool skyorb_start_requested_network(void)
+{
+    if (!skyorb_start_network()) return false;
+
+    skyorb_config_t config = {0};
+    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
+    config = s_skyorb_config;
+    xSemaphoreGive(s_skyorb_mutex);
+    if (!config.wifi_valid) return true;
+
+    if (s_skyorb_http_server != NULL) {
+        (void)httpd_stop(s_skyorb_http_server);
+        s_skyorb_http_server = NULL;
+    }
+    if (!skyorb_connect_saved_station()) {
+        return skyorb_network_failure("saved Wi-Fi connection", s_skyorb_network_status);
+    }
     return true;
 }
 
@@ -5764,7 +5796,7 @@ static void skyorb_network_task(void *argument)
 {
     (void)argument;
     ESP_LOGI(TAG, "[WIFI-DBG] network task entered; starting Wi-Fi once on dedicated task");
-    if (!skyorb_start_network()) {
+    if (!skyorb_start_requested_network()) {
         s_skyorb_fetch_failed = true;
         skyorb_mark_dirty();
         s_skyorb_network_task_started = false;
@@ -5776,6 +5808,21 @@ static void skyorb_network_task(void *argument)
     /* Do not call esp_wifi_scan_start() while this SoftAP is active.  On this
      * board, an active scan makes the AP disappear from phones. */
     while (true) {
+        if (!s_skyorb_wifi_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        /* The task deliberately survives an explicit Wi-Fi OFF so a later ON
+         * does not need another large stack allocation. */
+        if (!s_skyorb_network_started) {
+            ESP_LOGI(TAG, "[WIFI-DBG] Wi-Fi re-enabled; restarting network on existing task");
+            if (!skyorb_start_requested_network()) {
+                s_skyorb_fetch_failed = true;
+                skyorb_mark_dirty();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+        }
         const TickType_t now = xTaskGetTickCount();
         skyorb_config_t config = {0};
         xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
@@ -6088,6 +6135,8 @@ static void skyorb_render_frame(void)
 
 static void skyorb_start_network_task(void)
 {
+    s_skyorb_wifi_enabled = true;
+    skyorb_mark_dirty();
     if (s_skyorb_mutex == NULL) {
         s_skyorb_mutex = xSemaphoreCreateMutex();
     }
@@ -6176,10 +6225,10 @@ static void device_settings_compose_canvas(bool full_refresh)
     skyorb_circle_dot(84, settings_screen_y(128), 16, blue);
     settings_text("CONNECTIVITY", 110, 112, &lv_font_montserrat_18, white);
     settings_text("Wi-Fi", 86, 151, &lv_font_montserrat_14, white);
-    settings_text(s_skyorb_ap_ready || s_skyorb_wifi_connected ? "ON" : "OFF",
+    settings_text(s_skyorb_wifi_enabled ? "ON" : "OFF",
                   290, 155, &lv_font_montserrat_14,
-                  s_skyorb_ap_ready || s_skyorb_wifi_connected ? green : secondary);
-    settings_switch(147, s_skyorb_ap_ready || s_skyorb_wifi_connected, blue);
+                  s_skyorb_wifi_enabled ? green : secondary);
+    settings_switch(147, s_skyorb_wifi_enabled, blue);
     settings_text("Bluetooth", 86, 204, &lv_font_montserrat_14, white);
     settings_text(ble_pacon_is_enabled() ? (ble_pacon_is_connected() ? "LINK" : "ON") : "OFF",
                   270, 208, &lv_font_montserrat_14,
@@ -6275,13 +6324,13 @@ static void settings_handle_touch(int x, int y)
     }
     const int content_y = y + s_settings_scroll_y;
     if (content_y >= 136 && content_y <= 188 && !s_settings_touch_dragging) {
-        const bool enable = !(s_skyorb_ap_ready || s_skyorb_wifi_connected);
+        const bool enable = !s_skyorb_wifi_enabled;
         if (enable) {
             ESP_LOGI(TAG, "[WIFI-DBG] Settings Wi-Fi ON requested; queueing dedicated network task");
             skyorb_start_network_task();
         } else {
             ESP_LOGI(TAG, "[WIFI-DBG] Settings Wi-Fi OFF requested");
-            skyorb_leave_setup_session();
+            skyorb_disable_network();
         }
         s_device_settings_dirty = true;
         return;

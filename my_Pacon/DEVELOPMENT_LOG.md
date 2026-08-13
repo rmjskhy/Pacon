@@ -393,3 +393,25 @@ the media catalog; the next work starts with the Android settings UX.
 - Firmware and Android sources were pushed to
   `git@github.com:rmjskhy/Pacon.git` on branch `main` after the SSH key was
   installed. Generated build output remains ignored.
+
+# 2026-08-13 Wi-Fi switch state synchronization
+
+- Reproduction: Wi-Fi could be enabled once and SkyOrb continued animating,
+  but reopening Settings showed Wi-Fi OFF. Further taps appeared to do
+  nothing because the persistent `skyorb_net` task was already allocated.
+- Root cause: the Settings switch was rendered from transient AP/STA event
+  flags (`ap_ready || wifi_connected`) while task lifetime and driver state
+  were tracked separately. A disconnect therefore changed the UI to OFF even
+  though the user had not disabled Wi-Fi.
+- Added an authoritative user-requested Wi-Fi state. Settings now remains ON
+  during reconnects, OFF explicitly stops the driver, and ON reuses the
+  existing network task. Saved credentials select STA mode; the provisioning
+  AP remains a fallback only when credentials are absent.
+- Incremental build with 24 jobs completed in about 11 seconds and the app-only
+  COM11 flash in about 15.5 seconds. Runtime verification showed repeated STA
+  reconnect attempts with no `ESP_ERR_NO_MEM` and no reset. The saved home
+  network had not obtained an IP during the 45-second capture, so live ADS-B
+  data was not yet confirmed; SkyOrb animation alone may be demo data.
+- Hardware UI verification passed: after leaving Settings and entering it
+  again, the Wi-Fi switch still displayed ON while the STA reconnect loop was
+  active.
