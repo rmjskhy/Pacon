@@ -5473,6 +5473,23 @@ static bool skyorb_start_network(void)
         }
     }
     wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
+    /* PACON keeps a large QSPI DMA working set, BLE, and the NAND reader
+     * alive while Wi-Fi is enabled.  The generated defaults are intentionally
+     * conservative, but make the values explicit here as well so an older
+     * sdkconfig cannot silently restore the 16/32-buffer profile. */
+    wifi_init.static_rx_buf_num = 2;
+    wifi_init.dynamic_rx_buf_num = 2;
+    wifi_init.static_tx_buf_num = 4;
+    wifi_init.dynamic_tx_buf_num = 0;
+    wifi_init.cache_tx_buf_num = 4;
+    wifi_init.rx_mgmt_buf_num = 2;
+    wifi_init.rx_ba_win = 2;
+    wifi_init.mgmt_sbuf_num = 6; /* IDF minimum */
+    ESP_LOGI(TAG, "[WIFI-DBG] init buffers: static_rx=%d dynamic_rx=%d static_tx=%d cache_tx=%d rx_mgmt=%d ba=%d mgmt_sbuf=%d",
+             wifi_init.static_rx_buf_num, wifi_init.dynamic_rx_buf_num,
+             wifi_init.static_tx_buf_num, wifi_init.cache_tx_buf_num,
+             wifi_init.rx_mgmt_buf_num, wifi_init.rx_ba_win,
+             wifi_init.mgmt_sbuf_num);
     ESP_LOGI(TAG, "[WIFI-DBG] initializing Wi-Fi driver");
     err = esp_wifi_init(&wifi_init);
     if (err == ESP_ERR_INVALID_STATE) {

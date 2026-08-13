@@ -361,3 +361,22 @@ the media catalog; the next work starts with the Android settings UX.
 - Rebuilt the complete app successfully with ESP-IDF 5.4.3. Runtime testing
   on COM11 is still required; do not treat the fix as confirmed until Wi-Fi
   can be enabled without a reset.
+
+# 2026-08-13 Wi-Fi startup allocation failure (follow-up)
+
+- The COM11 log from the flashed image shows that the Settings switch does
+  reach the dedicated network task. `esp_wifi_init()` then fails with
+  `ESP_ERR_NO_MEM`: the Wi-Fi driver reports `malloc buffer fail` and cannot
+  allocate its expected RX buffers. This is why the switch appears to do
+  nothing; the task exits after reporting the failure.
+- The flashed image did not contain the latest runtime buffer override (there
+  was no `[WIFI-DBG] init buffers` line), so the board was still running the
+  previous 16/32-buffer profile. A separate `build_wifi_fix` directory was
+  configured with ccache disabled and built successfully with ESP-IDF 5.4.3.
+  The new application image is
+  `build_wifi_fix/pacon_fluid_pendant.bin`; it has not been flashed yet.
+- The 1 h 13 min wall time was dominated by repeated environment/configuration
+  and full-build retries. A normal cached build/flash is much shorter; the
+  clean 1,385-target build in `build_wifi_fix` completed in about 46 seconds
+  after configuration, confirming that the two-minute flash step was not the
+  whole session.
