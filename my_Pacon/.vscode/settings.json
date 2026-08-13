@@ -8,9 +8,9 @@
   ],
   "idf.portWin": "COM11",
   "idf.monitorNoReset": true,
-  "idf.buildPath": "${workspaceFolder}/build",
+  "idf.buildPath": "${workspaceFolder}/build_wifi_fix",
   "idf.buildArgs": [
-    "-j8"
+    "-j24"
   ],
   "idf.flashType": "UART",
   "idf.customExtraVars": {

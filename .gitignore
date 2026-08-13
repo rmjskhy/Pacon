@@ -1,5 +1,6 @@
 # ESP-IDF / CMake generated output
 **/build/
+**/build_wifi_fix/
 **/esp-idf/
 **/CMakeFiles/
 **/CMakeCache.txt
@@ -51,3 +52,5 @@ my_Pacon/main/assets/*.rgb565
 *.user
 *.suo
 .git-pacon/
+**/.ninja_lock
+**/.codex_fluid_compile.cmd

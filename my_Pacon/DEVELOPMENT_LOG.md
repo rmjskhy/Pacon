@@ -380,3 +380,16 @@ the media catalog; the next work starts with the Android settings UX.
   clean 1,385-target build in `build_wifi_fix` completed in about 46 seconds
   after configuration, confirming that the two-minute flash step was not the
   whole session.
+
+# 2026-08-13 Build-time cleanup and repository publish
+
+- The host exposes 32 logical processors. The successful clean firmware build
+  used `ninja -j16`; VS Code is now configured for `-j24`, leaving some CPU
+  capacity for the IDE and operating system.
+- The ESP-IDF extension now consistently uses `build_wifi_fix`, the clean and
+  verified build tree with ccache disabled. A no-change build check takes about
+  0.15 seconds; normal source-only changes should recompile and relink instead
+  of rebuilding all 1,385 targets.
+- Firmware and Android sources were pushed to
+  `git@github.com:rmjskhy/Pacon.git` on branch `main` after the SSH key was
+  installed. Generated build output remains ignored.
