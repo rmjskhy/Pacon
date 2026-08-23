@@ -14,6 +14,14 @@ bool ble_pacon_is_enabled(void);
 bool ble_pacon_is_connected(void);
 esp_err_t ble_pacon_set_enabled(bool enabled);
 
+/* The standard HID-over-GATT consumer-control report lets a paired phone
+ * treat PACON as a camera remote.  The implementation sends a short
+ * Volume Increment press/release pulse; Android and iOS camera apps commonly
+ * expose the volume key as their shutter action. */
+bool ble_pacon_is_camera_remote_enabled(void);
+esp_err_t ble_pacon_set_camera_remote_enabled(bool enabled);
+esp_err_t ble_pacon_camera_shutter(void);
+
 /* The application owns configuration and status state.  BLE only transports
  * a short, line-oriented command and returns the application response. */
 typedef esp_err_t (*ble_pacon_command_handler_t)(const char *command,

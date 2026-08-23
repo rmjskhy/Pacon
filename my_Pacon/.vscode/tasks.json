@@ -1,0 +1,47 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "PACON: Environment Check",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "check"],
+      "problemMatcher": []
+    },
+    {
+      "label": "PACON: Tests",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "test"],
+      "problemMatcher": []
+    },
+    {
+      "label": "PACON: Build",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "build"],
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "PACON: Flash COM11",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "flash", "-Port", "COM11"],
+      "problemMatcher": []
+    },
+    {
+      "label": "PACON: Build + Flash COM11",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "build-flash", "-Port", "COM11"],
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "PACON: Android Build",
+      "type": "shell",
+      "command": "powershell",
+      "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${workspaceFolder}/tools/pacon.ps1", "android-build"],
+      "problemMatcher": []
+    }
+  ]
+}

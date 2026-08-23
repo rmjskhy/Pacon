@@ -9,14 +9,18 @@ NAND) to the PC as a USB Mass Storage Class device.  The implementation is in
 ## Required ownership sequence
 
 1. Normal boot mounts U2 at `/sdnand`; the board can use its files normally.
-2. Tapping **Disk** unmounts the firmware FAT VFS and initializes the NAND as
-   an MSC block device.
-3. The native USB connection re-enumerates as **PACON Media Disk**.
-4. Windows/macOS/Linux owns the filesystem while the disk screen says `READY`.
+2. Tapping **Disk** only opens the status page. Serial/JTAG remains connected,
+   NAND stays mounted, and no USB mode change happens yet.
+3. Turning the on-screen switch **ON** unmounts the firmware FAT VFS and
+   initializes the NAND as an MSC block device.
+4. The native USB connection re-enumerates as **PACON Media Disk**, so the
+   serial port disconnects only after this explicit switch action.
+5. Windows/macOS/Linux owns the filesystem while the disk screen says `USB
+   DISK ON`.
    Firmware must not read or write `/sdnand` in this state.
-5. Safely eject the disk on the computer, then tap **RETURN** on the pendant.
-   It performs a soft reboot and returns to normal Serial/JTAG and application
-   mode with U2 mounted at `/sdnand`.
+6. Safely eject the disk on the computer, then turn the on-screen switch
+   **OFF**. It performs a soft reboot and returns to normal Serial/JTAG and
+   application mode with U2 mounted at `/sdnand`.
 
 This one-way hand-off deliberately avoids corrupting the FAT filesystem with
 simultaneous PC and firmware access.
@@ -46,7 +50,8 @@ quiet initial-Miku teal background instead of a bundled photograph.
 The ESP32-S3 native USB data pair has no software-visible plug-orientation
 state.  Firmware therefore cannot reliably assign `normal plug = serial` and
 `flipped plug = disk`.  Normal boot uses the existing Serial/JTAG path; the
-Disk app explicitly switches the same working native-USB path to MSC.
+Disk app exposes an explicit switch which changes the same working native-USB
+path to MSC. Merely opening the page does not disconnect serial.
 
 ## Project settings
 

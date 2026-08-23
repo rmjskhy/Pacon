@@ -50,9 +50,11 @@ When the firmware exposes the media data characteristic ending in `...05`,
 the tool uses raw binary packets with an eight-packet cumulative-ACK window.
 Older firmware falls back to the sequential hexadecimal command path.
 
-The picker also accepts ordinary PNG/JPEG/WebP images.  They are center-cropped
-and scaled to PACON's 475x466 panel, converted to little-endian RGB565, and
-uploaded as a single `.rgb565` frame.  A raw `.rgb565` file can still contain
+The picker also accepts ordinary PNG/JPEG/WebP images. Before conversion it
+opens a native-aspect preview: drag with one finger and pinch with two fingers
+to choose the subject position and zoom inside the round-screen guide. The
+confirmed 475x466 crop is converted to little-endian RGB565 and uploaded as a
+single `.rgb565` frame. A raw `.rgb565` file bypasses the crop screen and can still contain
 multiple complete frames; include a name such as `8fps` to select its playback
 rate.
 
@@ -77,7 +79,8 @@ Tap `设备设置` after connecting to open the device panel. It uses the existi
 BLE command protocol, so no firmware media changes are required:
 
 - display brightness: `SET BRIGHTNESS 0..100`
-- SkyOrb range: `SET RANGE 0..3`
+- automatic screen-off time: `SET SCREEN TIMEOUT 0|15|30|60|120|300`; `0` disables panel-off but keeps idle dimming
+- SkyOrb radius: `SET RANGE 0..5` maps to `5/10/15/25/35/50 km`; 50 km is the center-to-edge radius, not the diameter
 - manual coordinates: `SET LOCATION latitude longitude`
 - automatic location mode: `SET AUTO_LOCATION`
 - saved Wi-Fi: `SET WIFI ssid|password`
@@ -85,3 +88,18 @@ BLE command protocol, so no firmware media changes are required:
 `读取` sends `GET SETTINGS`; `保存` writes the coordinate and Wi-Fi fields.
 The brightness and range sliders apply when released, and the panel reports
 the device response below the controls.
+
+## Clock and alarm
+
+The `时钟与闹钟` panel uses the same acknowledged BLE command path:
+
+- `GET CLOCK` reads RTC validity, current time, source, sync state, alarm and watch style;
+- custom date/time sends `SET TIME yyyy-mm-dd hh:mm:ss CUSTOM`;
+- Bluetooth calibration sends the phone's local time with source `BLE`;
+- Wi-Fi calibration sends `SYNC WIFI TIME`; PACON waits for its saved Wi-Fi connection, obtains SNTP time and writes PCF85063;
+- alarm controls send `SET ALARM hh:mm`, `SET ALARM OFF`, or `STOP ALARM`;
+- watch style sends `SET WATCH STYLE 0|1`.
+
+Without a calibration request the firmware continues to use PCF85063. The
+alarm is stored on PACON and GPIO48 sounds at the configured RTC time, so the
+phone does not need to remain connected.

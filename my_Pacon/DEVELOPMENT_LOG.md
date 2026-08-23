@@ -1,6 +1,18 @@
 # PACON 开发交接记录
 
-最后更新：2026-08-05
+最后更新：2026-08-22
+
+## 2026-08-22：KKD2 独立手臂图层顺序修复
+
+- 对照原 APK 的 `kkd2_watchface.xml`，确认完整人物/小时层先绘制，独立手臂/分钟层最后绘制在前景。
+- 之前反转图层顺序会遮住手臂与人物的连接部分，只剩一段看似偏移的手臂；现恢复为背景、时间盘、完整人物小时层、独立分钟手臂的原始顺序。
+- `tests/check_kkd2_reference_pose.ps1` 同时检查 APK XML 与固件绘制顺序，防止后续再次反转。
+
+## 2026-08-22：KKD2 参考姿态与确定性构建入口
+
+- 对照 `com.KKD2.apk` 解包后的 `kkd2_watchface.xml` 确认：完整人物是整数小时层（`HOUR_0_23 * 30`），独立胳膊是分钟层（`MINUTE * 6`）。因此 16:02 时人物应为 120°、胳膊应为 12°，照片中接近 12 点并略向右偏的位置符合原 APK。
+- 删除固件中 KKD2 人物角度额外加入的分钟插值；新增 `tests/check_kkd2_reference_pose.ps1`，固定校验 XML 公式、资源原点、图层顺序和 16:02 参考姿态。
+- 新增 `tools/pacon.ps1` 和 VS Code PACON 任务，统一 ESP-IDF/Python/Ninja、`build_wifi_fix`、COM11 与并行度；旧 `build`、根目录构建和 `build_noccache` 不再作为烧录来源，避免误烧旧 BIN 和重复排查环境。
 
 ## 工程与环境
 
@@ -45,6 +57,7 @@
 - 未焊接的 `1N5819WT` 位于蜂鸣器支路，补焊后再评估发声；麦克风未焊接，当前只能测试 I2S 引脚初始化，不能验证采样。
 - 已新增 `test_Pacon/tools/audit_pin_mapping.py`：它直接解析 EasyEDA `.epro2` 原理图，2026-07-24 已校验工厂示例、`Pacon`、`test_Pacon` 与本工程共 57 个 `GPIO_NUM_x` 定义，全部匹配。`GPIO39`/`GPIO40` 的网名仍为 `JTAG_MTCK`/`JTAG_MTDO`，编号和连线正确；待麦克风补焊后再验证其 I2S 时序与采样协议。
 - 2026-07-24 已烧录 `test_Pacon` 的蜂鸣器短音测试：GPIO48 的 LEDC 定时器、通道均返回 `ESP_OK`，执行 3 次 2 kHz、80 ms 脉冲后程序继续运行且未复位。用户已确认实际听到短音；GPIO48 映射、软件 PWM 与当前蜂鸣器支路可用。
+- 2026-08-22 因正式固件闹钟仍无声，新增 `test_Pacon/buzzer_test` 独立诊断固件：只初始化 GPIO48 的 LEDC，以 2 kHz、50% 占空比循环输出 1 秒并静音 1 秒，不启动屏幕、BLE、RTC 或其他外设。另移除表盘普通触摸对 `s_watch_style` 的异或切换，避免 Android 选择 KKD2 后又被触摸切回 KKD1。
 
 ## 烧录与测试约定
 
@@ -91,7 +104,7 @@
 # 2026-08-09 BLE settings command channel
 
 - Kept the nRF Connect `PING`/`PONG` regression command and added an application-owned command callback to the PACON BLE service.
-- Added line-oriented commands: `GET STATUS`, `GET SETTINGS`, `GET HELP`, `SET BRIGHTNESS 0..100`, `SET RANGE 0..3`, `SET LOCATION lat lon`, `SET AUTO_LOCATION`, and `SET WIFI ssid|password`.
+- Added line-oriented commands: `GET STATUS`, `GET SETTINGS`, `GET HELP`, `SET BRIGHTNESS 0..100`, `SET RANGE 0..5`, `SET LOCATION lat lon`, `SET AUTO_LOCATION`, and `SET WIFI ssid|password`. The six range indices map to 5/10/15/25/35/50 km.
 - BLE brightness writes are applied by the main UI task, then persisted in `pacon_ui`; this avoids touching SH8601 from the NimBLE host task.
 - SkyOrb settings are validated, written to the existing `skyorb` NVS namespace, and reflected in the Settings/SkyOrb state without automatically starting the AP.
 - The command channel deliberately does not expose the Wi-Fi password in status responses and does not yet implement image/file transfer.
@@ -415,3 +428,584 @@ the media catalog; the next work starts with the Android settings UX.
 - Hardware UI verification passed: after leaving Settings and entering it
   again, the Wi-Fi switch still displayed ON while the STA reconnect loop was
   active.
+- Follow-up fixed the inverse path: entering Sky Radar no longer forces a
+  user-disabled Wi-Fi switch back ON, and duplicate FT3168 touch edges within
+  700 ms are ignored. Hardware verification confirmed Wi-Fi remained OFF
+  after entering and leaving the radar app.
+- Sky Radar continues its local sweep and demo-aircraft animation while Wi-Fi
+  is disabled. The radar status now explicitly reads `OFFLINE / DEMO DATA`;
+  `CONNECTING` is reserved for an enabled Wi-Fi connection that has not yet
+  obtained network connectivity.
+- Wi-Fi re-enable testing showed the switch and driver were ON, but the STA
+  repeatedly transitioned `init -> auth -> init` without obtaining an IP.
+  SkyOrb now records the ESP-IDF disconnect reason and distinguishes
+  `AUTH FAILED / CHECK PASSWORD`, `AP NOT FOUND`, and generic `CONNECTING`
+  rather than presenting every non-connected state as offline.
+
+# 2026-08-13 Phone-style Wi-Fi settings and cold-start radar fix
+
+- A cold boot with Wi-Fi left OFF could reset immediately after entering Sky
+  Radar. `skyorb_snapshot_aircraft()` unconditionally took
+  `s_skyorb_mutex`, but that mutex was only created by the network startup
+  path. The snapshot now has a safe no-mutex path before networking has ever
+  been initialized.
+- Wi-Fi enablement, scanning, selecting a saved network, connecting, and the
+  obtained-IP state are now separate states. Turning the master switch ON
+  starts STA mode and scans; it no longer silently connects or starts the old
+  provisioning SoftAP. The saved credential row reports visibility/RSSI and
+  must be tapped to connect.
+- Added a dedicated scroll-free Wi-Fi detail page reached from Settings. It
+  contains a master switch, the currently saved network, `SCANNING`,
+  `IN RANGE`, animated `CONNECTING`, `CONNECTED`, `AUTH FAILED`, and
+  `NOT IN RANGE` states, plus an explicit rescan control. The current NVS
+  schema stores one saved network, so this first version displays one row.
+- Sky Radar now consumes the same authoritative state: `OFFLINE / DEMO DATA`
+  when Wi-Fi is disabled, `WI-FI ON / NOT CONNECTED` before a network is
+  selected, specific connection errors while joining, and online/live states
+  after an IP is obtained. The large central automatic-location/network-IP
+  prompt was removed; the location hint is kept unobtrusively near the bottom.
+- Full ESP-IDF build succeeded. Application size is `0x15ed20` bytes with 91%
+  of the smallest app partition still free. Hardware verification on COM11 is
+  required for touch layout, scan results, joining, and the cold-start radar
+  path.
+- Hardware connection trace showed the saved AP at `-61 dBm`, followed by
+  repeated `init -> auth -> init` transitions and disconnect reasons 2
+  (`WIFI_REASON_AUTH_EXPIRE`) and 205 (`WIFI_REASON_CONNECTION_FAIL`). The
+  station never associated and DHCP was never reached. Both reasons are now
+  terminal authentication failures instead of being retried until the generic
+  15-second timeout. The Wi-Fi page reports `AUTH FAILED / CHECK PASSWORD`;
+  the saved password or router security mode must be corrected over BLE.
+
+# 2026-08-14 Router-specific Wi-Fi authentication diagnosis
+
+- PACON still reported `AUTH FAILED` for the saved `lcy` network after Wi-Fi
+  power saving was disabled, but connected successfully to a phone 2.4 GHz
+  hotspot. This verifies the board's STA transmit/receive path, DHCP path,
+  generic WPA credential handling, and antenna well enough to move the fault
+  boundary to the `lcy` router or its advertised security/association setup.
+- Increasing the previously minimal Wi-Fi buffers and disabling power saving
+  did not change the `lcy` failure. The earlier reasons 2/205 occur before an
+  IP address is obtained and the UI's `AUTH FAILED` label is therefore a broad
+  association category, not proof that the stored password is wrong.
+- Added `[WIFI-SCAN]` diagnostics for the selected BSSID, channel, auth mode,
+  pairwise/group cipher, RSSI, and advertised PHY modes. A connection now pins
+  the exact BSSID/channel from the saved-network scan row, preventing a
+  dual-band/mesh router with several same-name BSSIDs from silently selecting
+  a different candidate. The next hardware trace must compare `lcy` with the
+  known-good phone hotspot before changing further connection parameters.
+- Hardware trace for `lcy`: BSSID `E0:40:07:67:E0:94`, channel 1,
+  `auth=3` (WPA2-PSK), pairwise/group cipher 4 (CCMP/AES), RSSI -57 dBm,
+  and 802.11b/g/n support. The pinned BSSID still transitions
+  `init -> auth -> init` after one second with reason 2, never reaching
+  association or the WPA four-way handshake. This rules out WPA3/mixed mode,
+  weak signal, and selection of another same-name BSSID. Since the same
+  firmware connects to a phone hotspot, the next one-variable hardware test
+  is to disable BLE before joining `lcy`; if it still fails, inspect router
+  MAC filtering/access control for station MAC `10:20:BA:78:4F:A4`.
+- Root cause confirmed on the router: its 2.4 GHz radio failed PACON
+  authentication while bandwidth was set to automatic `20/40 MHz`, but PACON
+  connected successfully after the router bandwidth was forced to `40 MHz`.
+  The saved password, WPA2-PSK/CCMP security, BLE coexistence, RSSI, and board
+  RF hardware were not the cause. For this router, retain fixed 40 MHz unless
+  later firmware/router updates are re-tested. Disconnect reason 2 should be
+  presented as a generic router authentication/compatibility failure rather
+  than always instructing the user to check the password.
+
+# 2026-08-14 Sky Radar `DATA RETRY` state fix
+
+- After Wi-Fi connectivity was restored, Sky Radar displayed `DATA RETRY`.
+  Inspection found that an automatic IP-location failure incorrectly set the
+  aircraft-data failure flag. The task then called the aircraft API every five
+  seconds even when no valid latitude/longitude existed, and the UI checked
+  `fetch_failed` before `location_valid`.
+- Sky Radar now skips aircraft requests until a valid location exists and
+  displays `ONLINE / SET LOCATION` for the missing-location state. Only an
+  actual aircraft HTTP/parsing failure can display `DATA RETRY`; non-200
+  responses now log the HTTP status and a short response preview.
+- The Airplanes.live periodic request interval was changed from 5 seconds to
+  180 seconds. This caps uninterrupted periodic polling at 480 requests/day,
+  within the documented approximate 500-request free allowance; the first
+  fetch after connection remains immediate.
+
+# 2026-08-15 Multi-network Wi-Fi profiles and Android settings split
+
+- Replaced the single saved Wi-Fi credential with a five-profile NVS model.
+  Existing `ssid/password` data migrates to profile 0 and the selected profile
+  remains mirrored to those legacy keys for rollback compatibility.
+- The board Wi-Fi page now lists only saved networks. A tap selects/connects;
+  a 700 ms long press exposes a per-row delete control. Background scanning
+  annotates saved profiles with visibility, RSSI, BSSID, and channel without
+  displaying unknown access points.
+- Extended the BLE settings protocol with `GET WIFI LIST`, `GET WIFI <index>`,
+  `SELECT WIFI <index>`, and `DELETE WIFI <index>`. `SET WIFI` now upserts by
+  SSID and also supports open networks with an empty password.
+- Split the Android tool into Device/Display, Wi-Fi Management, and Radar
+  Settings panels. The Wi-Fi list refreshes over BLE, taps connect, long
+  presses confirm deletion, and radar save/automatic-location operations no
+  longer alter Wi-Fi credentials.
+- Verification: ESP-IDF build `build_wifi_fix` succeeded with 24 Ninja jobs;
+  application size is `0x160170` bytes with 91% of the smallest app partition
+  free. Android `assembleDebug` also succeeded. Hardware interaction and BLE
+  list migration still require target-board verification.
+
+# 2026-08-15 Wi-Fi switch sequencing, full-face radar, and BLE client state
+
+- Fixed the first profile-switch timeout by routing both the board Wi-Fi list
+  and BLE `SELECT WIFI` through one sequencer. It disables retry of the old
+  profile, disconnects, waits briefly, scans the selected saved SSID, and only
+  then starts association. `tests/check_wifi_switch_sequence.ps1` guards this
+  ordering and passes after failing against the old direct-connect path.
+- Sky Radar now uses a 230-pixel-radius full-face canvas. Visible Back/Settings
+  controls were removed; the top-left 104x104 region is an invisible exit
+  target. A circular drag around the face changes range one step on release:
+  clockwise increases and counter-clockwise decreases, with a 0.40-radian
+  threshold to reject incidental touches.
+- The Android client now shows explicit discovered/connecting/service-ready/
+  disconnected state. Connect is disabled while connecting or connected and
+  Disconnect is disabled while idle. The whole page is scrollable, uses
+  `adjustResize`, and scrolls focused Wi-Fi credential fields above the soft
+  keyboard.
+- Verification: Wi-Fi sequencing regression check passed; ESP-IDF
+  `build_wifi_fix` produced a `0x160420`-byte application with 91% of the
+  smallest app partition free. Android `assembleDebug` completed successfully.
+  Physical profile switching and circular gesture direction still require the
+  target-board interaction check.
+# 2026-08-15 SkyOrb range visual feedback
+
+- Reproduced the range-visibility issue with a source-level regression check: offline demo aircraft used fixed normalized radii, so every range produced the same layout.
+- Unified the physical radar scale with the then-advertised 5/10/15/25 km choices; the later six-position update below extends this model to 5/10/15/25/35/50 km.
+- Demo targets now have fixed distances in kilometres and are rescaled with the active range; out-of-range targets become rim markers, matching live-data behaviour.
+- Added a persistent `RANGE n KM` readout and a half-range ring label so scale changes remain visible even when few aircraft are present.
+
+## BLE radar coordinate readback
+
+- Reproduced that Android read SkyOrb coordinates from the aggregate `GET SETTINGS` JSON, whose typical response is already about 241 bytes and can exceed a 256-byte ATT MTU payload when the SSID is longer.
+- Added a compact `GET RADAR` command carrying `location_valid`, `location_auto`, latitude, longitude and range.
+- Android now uses the compact response and distinguishes IP-derived, manually saved and not-yet-generated locations instead of silently hiding zero coordinates.
+- Automatic location is asynchronous. `GET RADAR` now also reports
+  `location_state` and `location_error`; Android polls it after
+  `SET AUTO_LOCATION` and displays waiting, progress, success, or a concrete
+  network/HTTP/parse failure instead of immediately falling back to "not set".
+- The firmware first tries the documented key-free `https://ipapi.co/json/`
+  client-IP endpoint, then falls back to the documented free
+  `http://ipwho.is/` endpoint. This avoids making auto-location depend on one
+  service or on the previously assumed HTTPS form of the ipwhois endpoint.
+- Verification: `tests/check_radar_settings_ble.ps1`, ESP-IDF
+  `build_wifi_fix`, and Android `assembleDebug` pass. Target-network provider
+  reachability remains a hardware/network test.
+
+# 2026-08-15 Offline radar and launcher polish
+
+- Sky Radar no longer draws either demo or cached/live aircraft unless the
+  station has a current Wi-Fi connection. The radar grid, sweep, range and
+  explicit offline/network state remain visible.
+- Radar network/status labels and the range label now use measured Montserrat
+  glyph advances to center themselves on the physical display instead of
+  relying on per-string hand-tuned X coordinates.
+- After checking the current Google Play artwork, the launcher now follows the
+  real OuO icon composition: black field, two white circular eyes on a
+  diagonal, and a small white crescent mouth. A thin dark-grey rim keeps the
+  black tile visible against PACON's launcher background. The interactive 0u0
+  application itself is unchanged.
+- Verification: `tests/check_skyorb_offline_and_launcher_ui.ps1`, the existing
+  SkyOrb range and BLE radar checks, and ESP-IDF `build_wifi_fix` pass.
+
+# 2026-08-15 Remove legacy SoftAP and HTTP setup server
+
+- Removed the retired `PACON-Sky` SoftAP constants, AP event handling, URL/form
+  parser, HTTP configuration pages and `esp_http_server` component dependency.
+- Formal firmware networking is now STA-only. BLE and the board's saved-profile
+  Wi-Fi page remain the only provisioning paths.
+- Preserved `esp_http_client` because Sky Radar data and public-IP geolocation
+  depend on outbound HTTP requests.
+- Added `tests/check_sta_only_network.ps1` to prevent the AP/server path from
+  being reintroduced while checking that STA mode, BLE Wi-Fi commands and the
+  HTTP client remain present.
+- All five source regression checks pass. ESP-IDF v5.4.3 produced a
+  `0x1604e0`-byte application, 976 bytes smaller than the preceding
+  `0x1608b0` build. It was flashed successfully through COM11. Startup capture
+  confirmed SH8601, BLE advertising, FT3168 touch, QMI8658, AXP2101 and SD NAND;
+  no setup AP or embedded HTTP server was started.
+
+# 2026-08-15 SkyOrb HTTPS allocation failure
+
+- Reproduced `DATA RETRY` while COM11 remained attached. Wi-Fi association and
+  DHCP completed, the HTTP fallback generated automatic coordinates, but both
+  HTTPS providers failed before sending a request with
+  `mbedtls_ssl_setup returned -0x7F00`.
+- ESP-IDF defines `-0x7F00` as `MBEDTLS_ERR_SSL_ALLOC_FAILED`. The active
+  configuration forced all mbedTLS allocations into internal RAM and reserved
+  16 KiB RX plus 4 KiB TX buffers while the pre-Wi-Fi largest internal block
+  was only about 31 KiB.
+- mbedTLS now allocates from the board's PSRAM and uses dynamic TLS RX/TX
+  buffers. `tests/check_tls_memory.ps1` prevents reverting to the
+  internal-only configuration.
+- A transient target-board run displayed live aircraft data, but the result was
+  not stable across the following firmware restart; it must not be treated as a
+  completed fix until the fetch path is observed repeatedly on the current build.
+
+# 2026-08-15 Sky Radar retry diagnostics
+
+- Reproduced the reported `DATA RETRY` state while monitoring COM11. During more
+  than five minutes of capture there was no Wi-Fi startup, association, DHCP, or
+  aircraft HTTP log, proving that the generic label could outlive the request
+  which originally set it.
+- Wi-Fi OFF and a fresh `GOT_IP` now clear both the stale failure flag and fetch
+  deadline. A fresh IP therefore triggers an immediate request.
+- Failed aircraft requests now retry every 15 seconds instead of waiting for the
+  normal 180-second success refresh interval.
+- Added `[SKYORB-FETCH]` stage diagnostics and matching on-screen states for
+  client allocation, TLS/network open, HTTP response, body read, and JSON parse
+  failures. Added `tests/check_skyorb_retry_diagnostics.ps1`.
+- The diagnostic build proved that Wi-Fi/DNS/TLS were healthy and
+  `api.airplanes.live` was returning HTTP 403 with a project-approval message.
+  A desktop request carrying a descriptive PACON `User-Agent` was rejected the
+  same way, so this was not an ESP32 header or TLS defect.
+- Switched the compatible point endpoint to the public `api.adsb.lol` service,
+  which returned HTTP 200 in a direct validation request, and added a
+  project-identifying `User-Agent`. The response remains readsb-compatible and
+  uses the existing `ac` parser. ADSB.lol data is ODbL 1.0 licensed.
+
+# 2026-08-15 SkyOrb successful-empty response and OLED wake redraw
+
+- Runtime capture confirmed the replacement ADSB.lol request completed and
+  parsed successfully, but the selected location/range returned zero aircraft:
+  `SkyOrb: refreshed 0 aircraft`.
+- The request completed after OLED idle protection had already issued display
+  off.  Touch wake previously restored panel power and brightness but assumed
+  the controller retained a visible frame.  Wake now marks the active screen
+  dirty so its normal renderer restores the complete frame.
+- A successful zero-aircraft response now displays `NO AIRCRAFT / IN SELECTED
+  RANGE` instead of the ambiguous `LIVE 0` state.  A throttled
+  `[SKYORB-RENDER]` log records flush result, link state, aircraft count,
+  location state, fetch state, and panel sleep state.
+- Regression: `tests/check_skyorb_empty_and_wake.ps1`.
+- A separate `build_noccache` build tree was generated because the installed
+  ccache instance could stall or report `File exists`. A 12-way uncached build
+  completed successfully in about 50 seconds; the application is `0x1610e0`
+  bytes and leaves 91% of the factory application partition free.
+
+# 2026-08-15 50 km radar, rounded switches, and mechanical Watch
+
+- SkyOrb range indices now map to `5/10/15/25/35/50 km`. Firmware validation,
+  NVS clamping, rotary wraparound, BLE help/error text, Android range control,
+  and visual regression checks share the six-position model.
+- The Settings and Wi-Fi switch tracks now use capsule-shaped rounded drawing;
+  the existing 0u0 menu switch was already rounded.
+- Added `UI_SCREEN_WATCH` and a sixth launcher icon. The original watch face is
+  inspired by the circular gold mechanical composition of the two supplied KKD
+  APK references without copying their character art. It reads PCF85063 once
+  per second, renders analog hands plus a date/time complication, and falls back
+  to uptime with an explicit `RTC SET` warning while RTC data is invalid.
+- The top-left Watch corner is an invisible return target; a normal tap changes
+  between two dark/gold themes. Added
+  `tests/check_watchface_and_switches.ps1`.
+- All nine firmware source/regression checks pass. A clean 12-way ESP-IDF build
+  produced a `0x162630`-byte application with 91% of the application partition
+  free, and the image was flashed successfully to COM11 with a stable startup.
+- The Android range selector was expanded to the same six positions;
+  `assembleDebug` completed successfully and produced
+  `PaconBleTool/app/build/outputs/apk/debug/app-debug.apk`.
+
+# 2026-08-15 RTC calibration, alarm, watch-face fidelity, and guarded USB MSC
+
+- Clarified the SkyOrb scale: the six values are radar radii, and the highest
+  setting means 50 km from the screen centre to the outer ring. The on-screen
+  readout now says `RADIUS 50 KM` rather than the ambiguous `RANGE`.
+- Reworked Watch toward the supplied bright gold/orange reference: cream Roman
+  numeral annulus, mechanical decoration, analog hands, a dark time/date
+  subdial, and a central region which can reuse the user's current NAND media.
+  No bitmap or character artwork was extracted from the reference APKs.
+- Integrated PCF85063 into the formal firmware as the persistent clock source.
+  Custom and phone-BLE time writes update the RTC; Wi-Fi calibration uses SNTP
+  and then updates the same RTC. An invalid/VL RTC stays visibly marked instead
+  of silently treating uptime as calibrated time.
+- Added a persisted daily alarm. At the configured RTC minute GPIO48 emits an
+  intermittent 2 kHz alert for up to 20 seconds; the same date cannot retrigger
+  it. Touching Watch or BLE `STOP ALARM` stops the active alert.
+- Added `GET CLOCK`, `SET TIME`, `SYNC WIFI TIME`, `SET ALARM`, `STOP ALARM`,
+  and `SET WATCH STYLE` to BLE, plus an Android `时钟与闹钟` section covering
+  custom time, phone/BLE sync, Wi-Fi sync, alarm control and watch style.
+- Opening USB Disk now leaves Serial/JTAG active. Only the explicit switch on
+  that page starts MSC and disconnects serial; after PC eject, switching OFF
+  requests the safe reboot back to application/serial ownership.
+- Added `tests/check_clock_alarm_usb.ps1` and changed the radar visual test to
+  require `RADIUS`. ESP-IDF `build_wifi_fix` and Android `assembleDebug` both
+  complete successfully; target-board time/alarm/USB interaction remains to be
+  verified in this iteration.
+
+# 2026-08-15 KKD1 character-arm watch mechanism correction
+
+- The first Watch implementation was structurally incorrect: it placed a media
+  image behind conventional software-drawn hour/minute hands. Inspection of the
+  supplied `com.KKD1(1).apk` watch-face XML established that the character and
+  both arms remain static; the hour and minute rings rotate behind those arms,
+  so the arms themselves are the time pointers.
+- Imported the five supplied KKD1 layers needed by that mechanism (character,
+  seconds ring, minutes ring, Roman-hours ring, and centre mechanism) into
+  compact embedded RGB565+alpha assets. The renderer now reproduces the APK
+  layer order and transforms: minute/second rings rotate clockwise and the
+  Roman hour ring rotates in the opposite direction, while the character stays
+  fixed above them.
+- Removed the conventional hour/minute/second line hands. The existing RTC,
+  BLE/SNTP calibration, complication, alarm and hidden return interaction are
+  unchanged.
+- Added `tools/make_kkd1_watch_asset.py` for deterministic asset regeneration
+  and strengthened `tests/check_watchface_and_switches.ps1` to reject a return
+  of conventional hands. All firmware checks pass; `build_wifi_fix` builds a
+  `0x350470`-byte image with 77% of the application partition free.
+
+# 2026-08-15 Watch seconds-ring skipped-mark correction
+
+- Target observation: the rotating seconds ring sometimes advanced two or four
+  marks in one visible update. PCF85063 polling was already once per second;
+  the visible ring nevertheless consumed the latest cached RTC second directly.
+- The Watch cadence timestamp was also written after the layered render. Its
+  real start-to-start interval therefore became one second plus render time,
+  making skipped RTC values increasingly likely when a frame was expensive.
+- Added a separate seconds-of-day display clock. A normal delay of up to ten
+  seconds is rendered as consecutive one-mark catch-up frames; a deliberate
+  large time correction still snaps to the newly calibrated time. A transient
+  one-second-old RTC sample can no longer move the visible dial backwards.
+- The one-second cadence is now anchored before rendering, so render duration
+  is not added to every interval. `tests/check_watchface_and_switches.ps1`
+  requires the one-step helper and rejects direct raw-RTC seconds-ring wiring.
+
+# 2026-08-22 Configurable display timeout, interactive image crop, and OLED risk audit
+
+- Added persisted `pacon_ui/sleep_s` display timeout values of 15/30/60/120/300
+  seconds plus 0 for no panel-off. `GET STATUS`/`GET SETTINGS` now expose
+  `screen_timeout`, and `SET SCREEN TIMEOUT` updates it over the verified BLE
+  command channel. The existing 20-second dimming remains active even when
+  panel-off is disabled.
+- Android `设备与显示` now provides the matching timeout selector and reads the
+  stored value back from PACON. Ordinary PNG/JPEG/WebP uploads now open a
+  475x466 round-screen crop preview with one-finger pan and pinch zoom before
+  RGB565LE conversion. Native `.rgb565` files keep the established direct path.
+- Closed an OLED startup-state gap: GPIO6 is now explicitly driven low before
+  I2C/PMIC setup instead of relying on reset defaults. Panel power then settles
+  for 20 ms at zero brightness, and user brightness is restored only after
+  panel initialization plus a further 40 ms.
+- Screen-risk review: default 50% brightness, idle dimming, configurable true
+  panel-off, wake redraw, and home/status pixel shifting are present. Remaining
+  risk is cumulative OLED differential aging when using 100% brightness,
+  static non-home pages, or the no-timeout option; firmware cannot validate an
+  out-of-spec physical panel rail.
+- Added `tests/check_display_timeout_and_crop.ps1`. All firmware source checks,
+  ESP-IDF 5.4.3 `build_wifi_fix`, and Android `assembleDebug` pass. The firmware
+  image is `0x350880` bytes with 77% of the app partition free.
+
+# Current development plan status (2026-08-22)
+
+1. BLE media management is complete and retained without protocol changes.
+2. Android settings/transfer UX now covers media management, Wi-Fi profiles,
+   radar, clock/alarm, brightness, display timeout, and interactive image crop.
+3. Next work returns to final firmware cleanup/performance: remove obsolete
+   transitional configuration paths, split the monolithic UI/network/media
+   responsibilities into documented modules, then repeat full board regression
+   without changing the validated display, charging, BLE, or media formats.
+
+# 2026-08-22 Battery replacement and 4.2 V charge target
+
+- After replacing the protected battery with a 4.2 V full-charge cell, changed
+  AXP2101 register `0x64[2:0]` from `0x01` (4.0 V) to `0x03` (4.2 V).
+- Kept the previously verified 50 mA constant-current, 25 mA precharge and
+  25 mA termination settings unchanged. The periodic status decoder now reports
+  every supported target code (4.0/4.1/4.2/4.35/4.4 V) instead of only 4.0 V.
+- The target-board regression must confirm `target=4200 mV` and observe the BAT
+  voltage and charger state near termination; software register configuration
+  does not replace a multimeter check at the battery pads.
+
+# 2026-08-22 Android BLE PING disconnect correction
+
+- Reproduced the phone-side failure sequence after a successful connection:
+  low-latency scanning continued, automatic media refresh occupied the
+  acknowledged GATT write, manual `PING` could not enter the write queue,
+  Android reported write status 133, then disconnected with status 8 at the
+  five-second supervision timeout. The firmware `PING` handler was not the
+  source of the disconnect.
+- `connectSelected()` now stops scanning before `connectGatt()`. Manual control
+  commands and media/settings commands all run on the existing single-thread
+  `mediaExecutor`; the automatic reconnect catalog refresh is retained but
+  delayed 1.2 seconds after notification setup.
+- Added `tests/check_android_ble_command_stability.ps1`. The structural check
+  passes and Android `:app:assembleDebug` completes successfully. The repaired
+  APK was installed and launched on the authorized Xiaomi device; the final
+  connection/PING regression still requires one physical tap sequence.
+- Follow-up showed that disconnection also occurred without pressing `PING`.
+  Android connected at 11:52:32.423, automatically changed from 1M to 2M PHY at
+  11:52:34.093, and disconnected with status 8 at 11:52:39.222—about one
+  supervision timeout after the PHY change. The pending 10-byte `GET STATUS`
+  write then surfaced status 133, but was not the initial trigger.
+- The Android client now calls `setPreferredPhy()` with 1M TX/RX immediately
+  after connection and logs every PHY update. The regression check requires
+  the explicit 1M preference; the rebuilt APK was installed on the Xiaomi
+  phone for a 15-second idle-link and command test.
+- The forced-1M build still disconnected with Android status 8. Its trace
+  confirmed a successful 1M PHY update, MTU 256 and service discovery, followed
+  by the reconnect-time automatic `GET STATUS` write and then the five-second
+  supervision timeout. This disproves the 2M-PHY hypothesis but does not yet
+  distinguish an idle-link failure from a first-command failure.
+- Installed an explicit A/B diagnostic APK with
+  `AUTO_MEDIA_REFRESH_ON_CONNECT=false`. It performs discovery and CCCD setup
+  but sends no command until the operator presses one, so a 15-second idle wait
+  followed by a manual `PING` can identify which side of that boundary fails.
+- Board testing completed that isolation: the idle connection remained up and
+  `PING`/`PONG` also remained stable, but opening Android “设备与显示” sent
+  `GET SETTINGS` and disconnected the link. The command shared the full status
+  JSON, which can reach about 300 bytes while an MTU-256 notification can carry
+  only 253 bytes.
+- Fixed two firmware faults in that failure path. `GET SETTINGS` now has a
+  compact dedicated response and `GET STATUS` omits radar/Wi-Fi detail that has
+  separate query commands. `notify_response()` bounds every notification by
+  the negotiated ATT MTU and no longer frees an mbuf after
+  `ble_gatts_notify_custom()`, whose API consumes it even on failure. The old
+  failure path therefore performed a double free after the oversized notify.
+  Disconnect reason logging and `tests/check_ble_notification_safety.ps1` were
+  added. Both BLE checks pass and the ESP-IDF 5.4.3 formal firmware build
+  succeeds in `build_wifi_fix`. The corrected image was flashed successfully
+  to the ESP32-S3 on COM11; Android “设备与显示” and reconnect catalog
+  regression remain to be confirmed on the board.
+- Fixed the Android client's clipped bottom diagnostics before continuing the
+  BLE regression. The log now has its own 300 dp scrolling pane, follows the
+  newest line automatically, and yields outer-page gesture interception only
+  while the operator drags inside the log. Root padding now includes the
+  runtime status/navigation-bar insets on both Android 30+ and the legacy API.
+  `tests/check_android_log_visibility.ps1` and the BLE command-stability check
+  pass; the debug APK built successfully and was installed/launched on the
+  authorized Xiaomi handset. A captured device screenshot confirms that the
+  log card ends above the system navigation bar.
+
+# 2026-08-22 Alarm trigger and watch-style differentiation
+
+- Replaced the scheduled alarm's fragile `second < 2` gate with a whole-minute
+  match plus the existing once-per-date key. A delayed RTC poll can therefore
+  no longer miss the alarm merely because it first observes second 2 or later.
+- Added BLE `TEST ALARM` and an Android `测试响铃` action for direct GPIO48
+  verification. LEDC timer/channel/duty failures are now checked and logged;
+  the audible test uses a 2 kHz, 50% duty tone with the existing 20-second
+  alarm cadence and can still be stopped through `STOP ALARM`.
+- Added a genuinely separate KKD2 face from the extracted `com.KKD2.apk`
+  background, character/hour, arm/minute and complication assets. The Android
+  selector now names `KKD1 · 狂三双臂指针` and `KKD2 · 旋转人物表盘`, rather
+  than presenting two nearly identical color variants.
+- Added `tests/check_alarm_watchface_runtime.ps1`; it failed against the prior
+  first-two-seconds trigger and color-only style, then passed after the runtime,
+  asset and Android control changes.
+- Corrected a separate Android usability regression in the diagnostics pane.
+  `ScrollView.fullScroll(FOCUS_DOWN)` moved keyboard focus to the log whenever
+  BLE output arrived, which could also pull the outer settings page away from
+  the button being pressed. New lines now follow only when the log was already
+  at its bottom, using focus-free child `scrollTo`; otherwise both the log and
+  the outer page retain the operator's position.
+
+# 2026-08-22 Watch-face layer isolation
+
+- A board photo showed KKD1 looking like two watch faces were stacked. The
+  style selector itself was already mutually exclusive; the actual cause was
+  the KKD1 path painting a second procedural gold face and three generated
+  gears before compositing the extracted APK dial, mechanism and character
+  layers.
+- Split KKD1 into `watch_compose_kkd1()`. Both KKD compositors now clear the
+  full canvas and draw only their own APK-derived layers. Removed the obsolete
+  procedural gear renderer while retaining the KKD1 digital complication.
+- Added `tests/check_watchface_layer_isolation.ps1`. It first failed on the
+  mixed renderer and now enforces dedicated routing, full-frame clearing and
+  the absence of procedural gear overlays.
+
+# 2026-08-22 KKD1 reference-frame differential check
+
+- A second board photo still appeared visually crowded, so the dial transform
+  was checked against the APK's own 450x450 preview rather than adjusted by
+  eye. `tools/compare_kkd1_rotation.py` recovered the preview's 10:08 minute
+  layer at -48 degrees in PIL coordinates and its hour layer at -150 degrees;
+  these exactly match the firmware's clockwise transform convention. The
+  rotating rings and static character are therefore intentional APK behavior,
+  not remaining KKD1/KKD2 overlap.
+- The differential check exposed the remaining real mismatch: firmware had
+  omitted APK resource `wfs_6` and drew a larger synthetic complication at
+  `(74,158)`. The converter now scales `wfs_6` into the XML-prescribed
+  110x110 box at `(106,121)`, embeds it as `kkd1_complication.rgb565a`, and
+  centres the time/date inside the original slot before drawing the character.
+- Added `tests/check_kkd1_complication_layout.ps1`. It failed before the asset
+  existed, then passed together with the layer-isolation, alarm/watch runtime,
+  and watchface/switch checks after the correction.
+- Recorded an unambiguous `00:02` visual reference: the rightward character arm
+  points to Roman `XII` and the raised arm points to minute tick `2`. The
+  2026-08-22 board photograph matches that geometry. Its displayed complication
+  also reads `00:02`; when that differs from wall-clock time, the remaining
+  fault is RTC/time synchronisation rather than watch-face composition.
+
+# 2026-08-22 Verified watch-style hand-off
+
+- A later report described KKD1 and KKD2 as still mixed. The supplied board
+  photo is a complete KKD1 frame and matches the APK-derived `00:02` reference;
+  it contains neither KKD2's inverted character nor a retained partial frame.
+  The unresolved ambiguity was that Android did not show whether the device
+  had actually accepted the requested style.
+- `GET CLOCK` now returns both the numeric `style` and `style_name`. Android's
+  Apply action performs a write followed by a device read-back and reports a
+  mismatch instead of always claiming success. The settings status continuously
+  identifies the device-reported KKD1/KKD2 style.
+- On a real style transition, the UI task now flushes one explicit black full
+  frame before composing the selected APK face and logs the rendered style.
+  This gives a deterministic visual boundary without affecting normal
+  one-second watch animation. `tests/check_watch_style_roundtrip.ps1` locks the
+  command/read-back/clear contract.
+# 2026-08-22 KKD2 reference pose and deterministic tool environment
+
+- Compared the reported KKD2 16:02 board pose with the original watch-face
+  XML. The APK rotates the complete character by `HOUR_0_23 * 30` and the
+  separate arm by `MINUTE * 6`; therefore the arm's near-12-o'clock position
+  at 16:02 is intentional. Firmware removed its extra minute interpolation
+  from the character layer so the transform now matches the APK exactly.
+- Added `tests/check_kkd2_reference_pose.ps1`, which first failed on the
+  interpolated character angle and now locks the XML formulas, asset origins,
+  layer order and the 16:02 reference pose (120 degrees / 12 degrees).
+- Added `tools/pacon.ps1` plus VS Code tasks. Firmware operations now use one
+  verified contract: ESP-IDF 5.4, `build_wifi_fix`, pinned Ninja 1.12.1,
+  24 build jobs and COM11. The wrapper validates all paths before doing work,
+  reads the generated flash manifest rather than hard-coding binary names,
+  and also exposes deterministic Android build/install commands. Historical
+  root and `build_noccache` trees remain untouched but are no longer selected.
+### 2026-08-22：固定串口监视器 Python 环境
+
+- `tools/pacon.ps1 -Action monitor` 现在显式设置 `IDF_TOOLS_PATH` 与 `IDF_PYTHON_ENV_PATH`，与编译、烧录共同使用 `D:\espidf\mytools` 和其中的 `python_env\idf5.4_py3.11_env`。
+- 同时把已验证的 `xtensa-esp-elf\esp-14.2.0_20250730` 工具链加入监视器子进程的 `PATH`，避免 `addr2line` 又落到残留环境或无法解析异常地址。
+- 原因：`idf.py monitor` 会启动子进程；若只用固定 Python 调用 `idf.py`，子进程仍可能读取旧的全局 `.espressif` 环境路径并报 Python 不存在。
+- 后续统一使用 `tools/pacon.ps1` 的 `check/test/build/flash/monitor` 入口，避免 VS Code 或用户环境变量漂移造成重复排查。
+
+### 2026-08-22：KKD2 左臂肩部遮挡修复
+
+- 多个时刻的实机照片证明问题不是单一角度或坐标偏移，而是独立分钟臂位图始终绘制在完整人物上方，暴露了肩部根节点，视觉上形成悬浮、脱体。
+- 嵌入式素材为不透明栅格，合成顺序调整为：背景、信息盘、独立分钟臂、完整人物/小时层。完整人物最后覆盖肩部根部，臂端仍可随分钟旋转显示。
+- `tests/check_kkd2_reference_pose.ps1` 新增固件栅格层顺序断言，防止后续又恢复为脱体显示。
+
+### 2026-08-22：KKD2 左臂图层关系纠正
+
+- 最新完整表盘照片确认上一版对遮挡关系的判断相反：完整人物层后绘制时，会遮住独立左臂靠近肩部的一段，因此即使坐标正确，视觉上仍像断臂。
+- 保留已经校正的旋转中心和坐标，仅恢复原 APK 的图层顺序：背景、信息盘、完整人物/小时层、独立左臂/分钟层。左臂作为前景覆盖在人物之上，肩部连接段不再被身体层截断。
+- 同步修改 `tests/check_kkd2_reference_pose.ps1` 的层序断言，防止以后再次把人物层绘制到独立左臂之后。
+### 2026-08-23：KKD1 / KKD2 信息盘文字光学居中
+
+- 根据两种表盘的实机照片分别校正黑色圆形信息盘内的时间与日期，而不是共用旧坐标：KKD1 时间/日期顶部调整为 160/187，KKD2 调整为 162/188，水平中心均保持 XML 槽位中心 x=161。
+- KKD2 恢复两行信息（18 px 时间、14 px 日期），避免只显示单行时间且整体贴近圆盘上沿；KKD1 同样显式使用两行独立坐标。此次未改动已经验证正确的 KKD2 左臂坐标和图层顺序。
+- 最新实机照片确认：仅按字体 `adv_w`（逻辑前进宽度）居中时，Montserrat 字形的左右边距会让可见笔画仍显得偏左。现新增 `watch_text_visible_bounds()`，利用 LVGL 字形描述中的 `box_w`、`box_h` 和 `ofs_x` 计算整行文字的实际可见像素包围盒，再由 `watch_text_optically_centered()` 将包围盒中心对准黑色圆盘中心；KKD1、KKD2 的时间和日期均使用该方法，纵向坐标、手臂坐标和图层顺序保持不变。
+- `tests/check_watch_complication_text_alignment.ps1` 与 `tests/check_kkd1_complication_layout.ps1` 已先验证旧实现会失败，再验证新实现通过；表盘图层隔离、样式切换和闹钟/表盘运行时回归检查也通过。
+
+### 2026-08-23：BLE HID 手机拍照遥控
+
+- 在现有 NimBLE host 的 PACON GATT 数据库中增加标准 HID-over-GATT 服务
+  `0x1812`，报告地图使用 Consumer Control 的 Volume Increment 输入位；
+  不启动第二套 HID host，避免破坏已经验证的自定义命令和媒体通道。
+- 广播响应同时携带 PACON 自定义服务 UUID 与 HID 服务 UUID。`CAMERA SHUTTER`
+  和 Settings 页的 `Camera shutter` 行通过一个独立任务发送 35 ms 的按下/释放
+  报告，`SET CAMERA REMOTE ON|OFF` 提供显式开关，默认开启。
+- Android BLE Tool 增加 `拍照` 命令按钮；但只有在手机系统蓝牙设置中把
+  `PACON-BLE-TEST` 配对为 HID 输入设备后，系统相机才能接收 HID 快门，单纯
+  的自定义 GATT 连接只适合验证命令返回。
+- 新增 `tests/check_camera_remote.ps1`，固定检查 HID UUID、Consumer Control
+  报告、快门 worker、PACON 命令、Settings 入口和 Android 按钮，拒绝再次引入
+  第二套 NimBLE HID host。
+- 尚未在目标手机/相机和实物板上完成配对、音量键快门以及 HID 通知的最终回归；
+  本次先完成固件/Android 构建级验证。

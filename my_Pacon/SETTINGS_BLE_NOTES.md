@@ -9,8 +9,8 @@ Date: 2026-08-09
 - The GATT command characteristic still accepts the validation command `PING` and returns `PONG`.
 - The Settings screen is now a watch-style page: fixed header, vertically scrollable cards, Wi-Fi, Bluetooth, brightness, SkyOrb, and system status.
 - Settings scrolling now transfers only the card viewport after the first frame; the fixed header is refreshed only when its BLE state changes.
-- Entering Settings no longer starts the `PACON-Sky` access point automatically.
-- Wi-Fi remains a transitional local toggle for the current SkyOrb configuration path. It can be removed after BLE settings commands are implemented and tested.
+- The retired `PACON-Sky` access point and embedded HTTP configuration server have been removed from the formal firmware.
+- Wi-Fi is STA-only. Credentials are managed through BLE or the board's saved-profile page; the HTTP client remains available for radar data and IP geolocation.
 - Bluetooth is enabled at boot by default and can be switched off from Settings. Disabling it also terminates an active BLE connection.
 - BLE is initialized after SH8601 setup. The panel needs two large internal-DMA stripes; initializing NimBLE first caused `SH8601 initialization failed: ESP_ERR_NO_MEM`.
 - Display brightness is controlled by the slider and persisted in NVS namespace `pacon_ui` under key `brightness`.
@@ -34,7 +34,7 @@ GET STATUS
 GET SETTINGS
 GET HELP
 SET BRIGHTNESS 0..100
-SET RANGE 0..3
+SET RANGE 0..5
 SET LOCATION <latitude> <longitude>
 SET AUTO_LOCATION
 SET WIFI <ssid>|<password>

@@ -11,8 +11,11 @@
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
+#include "host/ble_att.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
@@ -34,6 +37,54 @@ static const ble_uuid128_t s_media_data_uuid = BLE_UUID128_INIT(
     0x9a, 0x70, 0x43, 0x21, 0x5b, 0x8c, 0x4d, 0x2a,
     0x91, 0x50, 0x50, 0x41, 0x43, 0x4f, 0x4e, 0x05);
 
+/* Standard HID-over-GATT UUIDs.  This is intentionally registered in the
+ * same NimBLE database as the PACON service instead of starting a second HID
+ * host.  Android/iOS can therefore discover the input device while the
+ * existing PACON command channel remains available to the companion app. */
+static const ble_uuid16_t s_hid_service_uuid = BLE_UUID16_INIT(0x1812);
+static const ble_uuid16_t s_hid_info_uuid = BLE_UUID16_INIT(0x2A4A);
+static const ble_uuid16_t s_hid_report_map_uuid = BLE_UUID16_INIT(0x2A4B);
+static const ble_uuid16_t s_hid_control_point_uuid = BLE_UUID16_INIT(0x2A4C);
+static const ble_uuid16_t s_hid_report_uuid = BLE_UUID16_INIT(0x2A4D);
+static const ble_uuid16_t s_hid_protocol_mode_uuid = BLE_UUID16_INIT(0x2A4E);
+static const ble_uuid16_t s_hid_report_reference_uuid = BLE_UUID16_INIT(0x2908);
+
+/* Consumer Control: one input bit for Volume Increment and seven padding
+ * bits.  A report ID keeps the format extensible without changing the GATT
+ * characteristic later. */
+static const uint8_t s_hid_report_map[] = {
+    0x05, 0x0C,       /* Usage Page (Consumer) */
+    0x09, 0x01,       /* Usage (Consumer Control) */
+    0xA1, 0x01,       /* Collection (Application) */
+    0x85, 0x01,       /* Report ID (1) */
+    0x09, 0xE9,       /* Usage (Volume Increment) */
+    0x15, 0x00,       /* Logical Minimum (0) */
+    0x25, 0x01,       /* Logical Maximum (1) */
+    0x75, 0x01,       /* Report Size (1) */
+    0x95, 0x01,       /* Report Count (1) */
+    0x81, 0x02,       /* Input (Data,Var,Abs) */
+    0x95, 0x07,       /* Report Count (7) */
+    0x81, 0x03,       /* Input (Const,Var,Abs) */
+    0xC0,             /* End Collection */
+};
+
+static const uint8_t s_hid_info[4] = {0x11, 0x01, 0x00, 0x03};
+static uint8_t s_hid_protocol_mode = 0x01;
+static uint8_t s_hid_control_point;
+static uint8_t s_hid_report_value;
+static uint16_t s_hid_report_value_handle;
+static TaskHandle_t s_camera_shutter_task;
+static bool s_camera_remote_enabled = true;
+
+enum {
+    HID_ATTR_INFO = 10,
+    HID_ATTR_REPORT_MAP,
+    HID_ATTR_CONTROL_POINT,
+    HID_ATTR_REPORT,
+    HID_ATTR_PROTOCOL_MODE,
+    HID_ATTR_REPORT_REFERENCE,
+};
+
 static uint16_t s_response_value_handle;
 static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t s_own_addr_type;
@@ -54,6 +105,148 @@ static char s_binary_response[96];
 
 static void ble_start_advertising(void);
 
+static int hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    const uintptr_t kind = (uintptr_t)arg;
+    if (kind == HID_ATTR_REPORT_REFERENCE && ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        const uint8_t reference[2] = {0x01, 0x01}; /* report ID 1, input */
+        return os_mbuf_append(ctxt->om, reference, sizeof(reference)) == 0 ?
+               0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        const uint8_t *data = NULL;
+        size_t length = 0;
+        switch (kind) {
+        case HID_ATTR_INFO:
+            data = s_hid_info;
+            length = sizeof(s_hid_info);
+            break;
+        case HID_ATTR_REPORT_MAP:
+            data = s_hid_report_map;
+            length = sizeof(s_hid_report_map);
+            break;
+        case HID_ATTR_REPORT:
+            data = &s_hid_report_value;
+            length = 1;
+            break;
+        case HID_ATTR_PROTOCOL_MODE:
+            data = &s_hid_protocol_mode;
+            length = 1;
+            break;
+        default:
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        return os_mbuf_append(ctxt->om, data, length) == 0 ?
+               0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR &&
+        (kind == HID_ATTR_CONTROL_POINT || kind == HID_ATTR_PROTOCOL_MODE)) {
+        if (OS_MBUF_PKTLEN(ctxt->om) != 1U) {
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        uint8_t value = 0;
+        if (os_mbuf_copydata(ctxt->om, 0, 1, &value) != 0) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        if (kind == HID_ATTR_PROTOCOL_MODE) {
+            if (value > 1U) return BLE_ATT_ERR_UNLIKELY;
+            s_hid_protocol_mode = value;
+        } else if (value > 1U) {
+            return BLE_ATT_ERR_UNLIKELY;
+        } else {
+            s_hid_control_point = value;
+        }
+        return 0;
+    }
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_dsc_def s_hid_report_descriptors[] = {
+    {
+        .uuid = &s_hid_report_reference_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_REPORT_REFERENCE,
+        .att_flags = BLE_ATT_F_READ,
+    },
+    { 0 },
+};
+
+static const struct ble_gatt_chr_def s_hid_characteristics[] = {
+    {
+        .uuid = &s_hid_info_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_INFO,
+        .flags = BLE_GATT_CHR_F_READ,
+    },
+    {
+        .uuid = &s_hid_report_map_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_REPORT_MAP,
+        .flags = BLE_GATT_CHR_F_READ,
+    },
+    {
+        .uuid = &s_hid_control_point_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_CONTROL_POINT,
+        .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {
+        .uuid = &s_hid_report_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_REPORT,
+        .val_handle = &s_hid_report_value_handle,
+        .descriptors = (struct ble_gatt_dsc_def *)s_hid_report_descriptors,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+    },
+    {
+        .uuid = &s_hid_protocol_mode_uuid.u,
+        .access_cb = hid_access_cb,
+        .arg = (void *)(uintptr_t)HID_ATTR_PROTOCOL_MODE,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    { 0 },
+};
+
+static esp_err_t hid_notify_report(uint8_t value)
+{
+    if (s_connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        s_hid_report_value_handle == 0U) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_hid_report_value = value;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(&s_hid_report_value, 1);
+    if (om == NULL) return ESP_ERR_NO_MEM;
+    const int rc = ble_gatts_notify_custom(s_connection_handle,
+                                           s_hid_report_value_handle, om);
+    /* ble_gatts_notify_custom() consumes om on every outcome. */
+    if (rc != 0) {
+        ESP_LOGW(TAG, "camera HID report=%u failed rc=%d", (unsigned)value, rc);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+static void camera_shutter_task(void *argument)
+{
+    (void)argument;
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!s_camera_remote_enabled ||
+            s_connection_handle == BLE_HS_CONN_HANDLE_NONE) {
+            continue;
+        }
+        if (hid_notify_report(0x01) == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(35));
+            if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
+                (void)hid_notify_report(0x00);
+            }
+        }
+    }
+}
+
 static int append_text(struct os_mbuf *om, const char *text)
 {
     return os_mbuf_append(om, text, strlen(text)) == 0 ? 0 :
@@ -67,11 +260,29 @@ static void notify_response(const char *response)
         s_response_value_handle == 0U) {
         return;
     }
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(response, strlen(response));
+    const uint16_t mtu = ble_att_mtu(s_connection_handle);
+    const size_t max_payload = mtu > 3U ? (size_t)mtu - 3U : 20U;
+    const size_t response_length = strlen(response);
+    char size_error[72];
+    const char *payload = response;
+    if (response_length > max_payload) {
+        ESP_LOGE(TAG, "response too large: len=%u mtu=%u max=%u",
+                 (unsigned)response_length, (unsigned)mtu,
+                 (unsigned)max_payload);
+        snprintf(size_error, sizeof(size_error),
+                 "ERR response too large len=%u mtu=%u\r\n",
+                 (unsigned)response_length, (unsigned)mtu);
+        payload = size_error;
+    }
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(payload, strlen(payload));
     if (om == NULL) return;
     const int rc = ble_gatts_notify_custom(s_connection_handle,
                                            s_response_value_handle, om);
-    if (rc != 0) os_mbuf_free_chain(om);
+    /* ble_gatts_notify_custom() consumes om on every outcome. */
+    if (rc != 0) {
+        ESP_LOGE(TAG, "notify failed rc=%d len=%u mtu=%u", rc,
+                 (unsigned)strlen(payload), (unsigned)mtu);
+    }
 }
 
 static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
@@ -137,6 +348,11 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 static const struct ble_gatt_svc_def s_services[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &s_hid_service_uuid.u,
+        .characteristics = s_hid_characteristics,
+    },
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = &s_service_uuid.u,
         .characteristics = (struct ble_gatt_chr_def[]) {
             {
@@ -178,6 +394,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGW(TAG, "DISCONNECTED conn=%u reason=0x%02X",
+                 (unsigned)event->disconnect.conn.conn_handle,
+                 (unsigned)event->disconnect.reason);
         s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         if (s_enabled) ble_start_advertising();
         return 0;
@@ -197,12 +416,17 @@ static void ble_start_advertising(void)
     fields.name = (const uint8_t *)"PACON-BLE-TEST";
     fields.name_len = strlen("PACON-BLE-TEST");
     fields.name_is_complete = 1;
+    fields.appearance = 0x03C0; /* Generic HID */
+    fields.appearance_is_present = 1;
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_set_fields rc=%d", rc);
         return;
     }
     struct ble_hs_adv_fields rsp = {0};
+    rsp.uuids16 = &s_hid_service_uuid;
+    rsp.num_uuids16 = 1;
+    rsp.uuids16_is_complete = 1;
     rsp.uuids128 = (ble_uuid128_t *)&s_service_uuid;
     rsp.num_uuids128 = 1;
     rsp.uuids128_is_complete = 1;
@@ -262,12 +486,36 @@ void ble_pacon_init(void)
     ESP_ERROR_CHECK(rc == 0 ? ESP_OK : ESP_FAIL);
     rc = ble_gatts_add_svcs(s_services);
     ESP_ERROR_CHECK(rc == 0 ? ESP_OK : ESP_FAIL);
+    if (xTaskCreate(camera_shutter_task, "camera_hid", 3072, NULL, 4,
+                    &s_camera_shutter_task) != pdPASS) {
+        s_camera_shutter_task = NULL;
+        ESP_LOGE(TAG, "camera HID task allocation failed");
+    }
     ESP_LOGI(TAG, "BLE ready; scan for PACON-BLE-TEST");
     nimble_port_freertos_init(ble_host_task);
 }
 
 bool ble_pacon_is_enabled(void) { return s_enabled; }
 bool ble_pacon_is_connected(void) { return s_connection_handle != BLE_HS_CONN_HANDLE_NONE; }
+
+bool ble_pacon_is_camera_remote_enabled(void) { return s_camera_remote_enabled; }
+
+esp_err_t ble_pacon_set_camera_remote_enabled(bool enabled)
+{
+    s_camera_remote_enabled = enabled;
+    return ESP_OK;
+}
+
+esp_err_t ble_pacon_camera_shutter(void)
+{
+    if (!s_camera_remote_enabled) return ESP_ERR_INVALID_STATE;
+    if (s_connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        s_camera_shutter_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xTaskNotifyGive(s_camera_shutter_task);
+    return ESP_OK;
+}
 
 void ble_pacon_set_command_handler(ble_pacon_command_handler_t handler)
 {

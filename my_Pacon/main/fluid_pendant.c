@@ -16,9 +16,11 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
+#include "driver/ledc.h"
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
 #include "sdmmc_cmd.h"
@@ -26,11 +28,11 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
-#include "esp_http_server.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_crt_bundle.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -80,7 +82,9 @@ static const char *TAG = "FLUID_PENDANT";
 #define I2C_TIMEOUT_MS          50
 #define ADDR_AXP2101            0x34
 #define ADDR_TOUCH              0x38
+#define ADDR_PCF85063           0x51
 #define ADDR_QMI8658            0x6A
+#define PIN_SPKOUT              GPIO_NUM_48
 
 #define AXP2101_CHIP_ID         0x4A
 #define AXP2101_CHIP_ID2        0x47
@@ -89,6 +93,54 @@ static const char *TAG = "FLUID_PENDANT";
 #define LCD_HOST                SPI2_HOST
 #define LCD_WIDTH               475
 #define LCD_HEIGHT              466
+
+/* KKD1 uses the character's raised left arm and outstretched right arm as
+ * stationary pointers.  The minute and hour dials rotate behind the artwork;
+ * they are not conventional hands drawn over the character. */
+#define WATCH_SOURCE_SIZE              450
+#define WATCH_MINUTE_POINTER_ANGLE     0.0f
+#define WATCH_HOUR_POINTER_ANGLE       (3.14159265f / 2.0f)
+
+extern const uint8_t kkd1_character_start[]
+    asm("_binary_kkd1_character_rgb565a_start");
+extern const uint8_t kkd1_character_end[]
+    asm("_binary_kkd1_character_rgb565a_end");
+extern const uint8_t kkd1_second_dial_start[]
+    asm("_binary_kkd1_second_dial_rgb565a_start");
+extern const uint8_t kkd1_second_dial_end[]
+    asm("_binary_kkd1_second_dial_rgb565a_end");
+extern const uint8_t kkd1_minute_dial_start[]
+    asm("_binary_kkd1_minute_dial_rgb565a_start");
+extern const uint8_t kkd1_minute_dial_end[]
+    asm("_binary_kkd1_minute_dial_rgb565a_end");
+extern const uint8_t kkd1_hour_dial_start[]
+    asm("_binary_kkd1_hour_dial_rgb565a_start");
+extern const uint8_t kkd1_hour_dial_end[]
+    asm("_binary_kkd1_hour_dial_rgb565a_end");
+extern const uint8_t kkd1_mechanism_start[]
+    asm("_binary_kkd1_mechanism_rgb565a_start");
+extern const uint8_t kkd1_mechanism_end[]
+    asm("_binary_kkd1_mechanism_rgb565a_end");
+extern const uint8_t kkd1_complication_start[]
+    asm("_binary_kkd1_complication_rgb565a_start");
+extern const uint8_t kkd1_complication_end[]
+    asm("_binary_kkd1_complication_rgb565a_end");
+extern const uint8_t kkd2_background_start[]
+    asm("_binary_kkd2_background_rgb565a_start");
+extern const uint8_t kkd2_background_end[]
+    asm("_binary_kkd2_background_rgb565a_end");
+extern const uint8_t kkd2_hour_start[]
+    asm("_binary_kkd2_hour_rgb565a_start");
+extern const uint8_t kkd2_hour_end[]
+    asm("_binary_kkd2_hour_rgb565a_end");
+extern const uint8_t kkd2_minute_start[]
+    asm("_binary_kkd2_minute_rgb565a_start");
+extern const uint8_t kkd2_minute_end[]
+    asm("_binary_kkd2_minute_rgb565a_end");
+extern const uint8_t kkd2_complication_start[]
+    asm("_binary_kkd2_complication_rgb565a_start");
+extern const uint8_t kkd2_complication_end[]
+    asm("_binary_kkd2_complication_rgb565a_end");
 
 /* 0u0 face geometry: slightly oversized for the round 1.69-inch panel while
  * leaving generous black space at the rim. */
@@ -107,7 +159,7 @@ static const char *TAG = "FLUID_PENDANT";
 #define LCD_BRIGHTNESS_NORMAL   0x80U /* About 50%; avoids continuous OLED overdrive. */
 #define LCD_BRIGHTNESS_DIM      0x24U /* Gentle idle level before the panel is blanked. */
 #define DISPLAY_DIM_TIMEOUT_MS  20000
-#define DISPLAY_SLEEP_TIMEOUT_MS 60000
+#define DISPLAY_SLEEP_TIMEOUT_DEFAULT_SECONDS 60U
 #define HOME_PIXEL_SHIFT_MS     120000
 #define HOME_STATUS_SHIFT_MS    60000
 #define HOME_FALLBACK_MEDIA_COUNT 1
@@ -133,11 +185,15 @@ static const char *TAG = "FLUID_PENDANT";
 /* SkyOrb / Plane Radar.  The original dual-display project is MIT licensed;
  * PACON uses a single 475x466 SH8601 panel and its own direct-QSPI path. */
 #define SKYORB_FRAME_PERIOD_MS   180
-#define SKYORB_FETCH_PERIOD_MS   5000
+/* Airplanes.live's public/free API allowance is about 500 requests/day.
+ * Three minutes is at most 480 periodic requests/day if SkyOrb is left online
+ * continuously; the first fetch after connecting still happens immediately. */
+#define SKYORB_FETCH_PERIOD_MS   180000
+#define SKYORB_FETCH_RETRY_MS    15000
 #define SKYORB_MAX_AIRCRAFT      28
-#define SKYORB_AP_SSID           "PACON-Sky"
-#define SKYORB_AP_PASSWORD       "pacon-sky"
 #define SKYORB_CONFIG_NAMESPACE  "skyorb"
+#define CLOCK_CONFIG_NAMESPACE   "pacon_clock"
+#define ALARM_RING_MS            20000
 
 /* Ported from Opal_Fluid's "simple" mode.  PACON draws the droplets directly
  * into its SH8601 QSPI stripes, so the small round highlights remain sharp
@@ -209,7 +265,9 @@ typedef enum {
     UI_SCREEN_OUO_MENU,
     UI_SCREEN_USB_DISK,
     UI_SCREEN_SKYORB,
+    UI_SCREEN_WATCH,
     UI_SCREEN_SETTINGS,
+    UI_SCREEN_WIFI_SETTINGS,
 } ui_screen_t;
 
 typedef struct {
@@ -225,6 +283,19 @@ typedef struct {
 typedef struct {
     char ssid[33];
     char password[65];
+} wifi_profile_t;
+
+#define WIFI_PROFILE_MAX 5U
+
+typedef struct {
+    /* ssid/password/wifi_valid are the selected profile mirrored for the
+     * existing radar/network code.  Profile management stays behind the
+     * helpers below so callers do not need to understand the NVS layout. */
+    char ssid[33];
+    char password[65];
+    wifi_profile_t wifi_profiles[WIFI_PROFILE_MAX];
+    uint8_t wifi_count;
+    uint8_t wifi_selected;
     float latitude;
     float longitude;
     uint8_t range_index;
@@ -232,6 +303,31 @@ typedef struct {
     bool location_valid;
     bool location_auto;
 } skyorb_config_t;
+
+typedef struct {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+    bool valid;
+} clock_time_t;
+
+typedef enum {
+    CLOCK_SOURCE_RTC = 0,
+    CLOCK_SOURCE_CUSTOM,
+    CLOCK_SOURCE_BLE,
+    CLOCK_SOURCE_WIFI,
+} clock_source_t;
+
+typedef enum {
+    CLOCK_SYNC_IDLE = 0,
+    CLOCK_SYNC_WAIT_WIFI,
+    CLOCK_SYNC_RUNNING,
+    CLOCK_SYNC_OK,
+    CLOCK_SYNC_FAILED,
+} clock_sync_state_t;
 
 typedef enum {
     FLUID_SHAPE_SIMPLE,
@@ -298,19 +394,46 @@ static bool s_ouo_dirty;
 static bool s_ouo_menu_dirty;
 static bool s_usb_disk_dirty;
 static bool s_skyorb_dirty;
+static bool s_watch_dirty;
+static uint8_t s_watch_style;
+/* The BLE task may change the requested style while the UI task owns the
+ * display.  Keeping the last style actually flushed lets the UI perform a
+ * deterministic black-frame hand-off before drawing the other APK face. */
+static uint8_t s_watch_rendered_style = UINT8_MAX;
+static TickType_t s_watch_last_frame;
+static int32_t s_watch_display_seconds = -1;
+static clock_source_t s_clock_source = CLOCK_SOURCE_RTC;
+static clock_sync_state_t s_clock_sync_state = CLOCK_SYNC_IDLE;
+static clock_time_t s_clock_cached_time;
+static bool s_clock_time_pending;
+static clock_time_t s_clock_pending_time;
+static clock_source_t s_clock_pending_source;
+static bool s_clock_wifi_sync_requested;
+static TickType_t s_clock_wifi_sync_started;
+static bool s_alarm_enabled;
+static uint8_t s_alarm_hour = 7;
+static uint8_t s_alarm_minute;
+static bool s_alarm_ringing;
+static bool s_alarm_buzzer_ready;
+static bool s_alarm_tone_on;
+static TickType_t s_alarm_ring_deadline;
+static TickType_t s_alarm_next_tone_toggle;
+static int32_t s_alarm_last_date_key = -1;
 static bool s_device_settings_dirty;
+static bool s_wifi_settings_dirty;
 static int s_settings_scroll_y;
 static int s_settings_touch_origin_y;
 static int s_settings_touch_last_y;
 static bool s_settings_touch_dragging;
 static uint8_t s_user_brightness = LCD_BRIGHTNESS_NORMAL;
+static uint16_t s_display_sleep_timeout_seconds = DISPLAY_SLEEP_TIMEOUT_DEFAULT_SECONDS;
 static volatile bool s_ble_brightness_pending;
 static volatile uint8_t s_ble_pending_brightness;
 static bool s_settings_full_refresh = true;
 static bool s_settings_header_dirty;
+static TickType_t s_settings_wifi_last_toggle;
 static bool s_skyorb_network_started;
 static bool s_skyorb_wifi_events_registered;
-static bool s_skyorb_ap_ready;
 static esp_err_t s_skyorb_network_status = ESP_ERR_INVALID_STATE;
 static bool s_skyorb_network_task_started;
 /* Authoritative user-facing Wi-Fi switch state.  Connection/AP event flags
@@ -318,25 +441,72 @@ static bool s_skyorb_network_task_started;
  * off while the background radar task is still active. */
 static volatile bool s_skyorb_wifi_enabled;
 static bool s_skyorb_wifi_connected;
+static uint8_t s_skyorb_disconnect_reason;
+static bool s_wifi_scan_in_progress;
+static esp_err_t s_wifi_scan_status = ESP_ERR_INVALID_STATE;
+static bool s_wifi_profile_visible[WIFI_PROFILE_MAX];
+static int8_t s_wifi_profile_rssi[WIFI_PROFILE_MAX];
+/* Snapshot the exact 2.4 GHz BSS selected by the Wi-Fi page.  A router may
+ * advertise one SSID from several radios/BSSIDs with different security
+ * modes.  Reusing the scan result prevents esp_wifi_connect() from choosing
+ * a different candidate than the row the user tapped. */
+static wifi_ap_record_t s_wifi_profile_ap[WIFI_PROFILE_MAX];
+static bool s_wifi_profile_ap_valid[WIFI_PROFILE_MAX];
+static int s_wifi_delete_profile = -1;
+static int s_wifi_touch_profile = -1;
+static int64_t s_wifi_touch_started_us;
+static bool s_wifi_touch_long_handled;
+static volatile bool s_wifi_scan_requested;
+static volatile bool s_wifi_should_connect;
+static volatile bool s_wifi_connect_requested;
+/* A profile switch is a two-phase operation.  The network task first leaves
+ * the old AP and refreshes the selected BSS record, then starts association. */
+static volatile bool s_wifi_connect_after_scan;
+typedef enum {
+    WIFI_LINK_IDLE = 0,
+    WIFI_LINK_CONNECTING,
+    WIFI_LINK_ASSOCIATED,
+    WIFI_LINK_CONNECTED,
+    WIFI_LINK_AUTH_FAILED,
+    WIFI_LINK_NO_AP,
+    WIFI_LINK_TIMEOUT,
+    WIFI_LINK_FAILED,
+} wifi_link_state_t;
+typedef enum {
+    SKYORB_LOCATION_UNSET = 0,
+    SKYORB_LOCATION_REQUESTED,
+    SKYORB_LOCATION_IN_PROGRESS,
+    SKYORB_LOCATION_READY,
+    SKYORB_LOCATION_ERR_CLIENT,
+    SKYORB_LOCATION_ERR_OPEN,
+    SKYORB_LOCATION_ERR_RESPONSE,
+    SKYORB_LOCATION_ERR_HTTP,
+    SKYORB_LOCATION_ERR_PARSE,
+} skyorb_location_result_t;
+static volatile wifi_link_state_t s_wifi_link_state;
+static TickType_t s_wifi_connect_started;
+static TickType_t s_wifi_settings_last_frame;
 static bool s_skyorb_fetch_in_progress;
 static bool s_skyorb_fetch_failed;
-static bool s_skyorb_location_in_progress;
-static bool s_skyorb_auto_location_attempted;
-static bool s_skyorb_setup_saved;
+static const char *s_skyorb_fetch_failure_stage;
+static volatile bool s_skyorb_location_in_progress;
+static volatile bool s_skyorb_auto_location_attempted;
+static volatile skyorb_location_result_t s_skyorb_location_result = SKYORB_LOCATION_UNSET;
 static bool s_skyorb_config_loaded;
 static bool s_skyorb_demo_mode = true;
 static uint8_t s_skyorb_range_index = 1;
 static uint16_t s_skyorb_sweep_angle;
 static TickType_t s_skyorb_last_frame;
+static bool s_skyorb_rotate_active;
+static float s_skyorb_rotate_last_angle;
+static float s_skyorb_rotate_accumulated;
 static TickType_t s_skyorb_last_fetch;
 static TickType_t s_skyorb_last_success;
 static skyorb_config_t s_skyorb_config;
 static skyorb_aircraft_t s_skyorb_aircraft[SKYORB_MAX_AIRCRAFT];
 static size_t s_skyorb_aircraft_count;
 static SemaphoreHandle_t s_skyorb_mutex;
-static esp_netif_t *s_skyorb_ap_netif;
 static esp_netif_t *s_skyorb_sta_netif;
-static httpd_handle_t s_skyorb_http_server;
 /* OLED protection state.  Touch remains active while the panel is blanked,
  * and the first touch only wakes the display rather than activating a UI
  * control underneath it. */
@@ -492,10 +662,28 @@ static int clamp_int(int value, int low, int high);
 static void read_tilt(int *gravity_x, int *gravity_y);
 static void skyorb_enter(void);
 static void skyorb_handle_touch(int x, int y);
+static void skyorb_handle_touch_move(int x, int y);
+static void skyorb_handle_touch_release(void);
 static void skyorb_render_frame(void);
+static void watch_enter(void);
+static void watch_handle_touch(int x, int y);
+static void watch_render_frame(void);
+static int32_t watch_advance_display_time(int32_t displayed, int32_t target,
+                                          bool *catch_up_pending);
+static clock_time_t clock_read_rtc(void);
+static void clock_load_preferences(void);
+static void clock_service(TickType_t now);
+static void clock_save_preferences(void);
+static void alarm_stop(void);
 static void settings_enter(void);
 static void settings_handle_touch(int x, int y);
 static void render_device_settings_frame(void);
+static void wifi_settings_enter(void);
+static void wifi_settings_handle_touch(int x, int y);
+static void wifi_settings_update_touch(int x, int y);
+static void wifi_settings_handle_release(void);
+static bool wifi_request_profile_connection(uint8_t index);
+static void render_wifi_settings_frame(void);
 static void settings_load_preferences(void);
 static void block_touch_until_release(void);
 static esp_err_t fluid_ble_command(const char *command, char *response,
@@ -592,6 +780,20 @@ static esp_err_t lcd_set_brightness(uint8_t brightness)
     return esp_lcd_panel_io_tx_param(s_lcd_io, command, &brightness, 1);
 }
 
+static esp_err_t lcd_hold_power_off(void)
+{
+    const gpio_config_t config = {
+        .pin_bit_mask = 1ULL << PIN_LCD_POWER,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&config);
+    if (err == ESP_OK) err = gpio_set_level(PIN_LCD_POWER, 0);
+    return err;
+}
+
 static void settings_load_preferences(void)
 {
     nvs_handle_t nvs;
@@ -604,6 +806,13 @@ static void settings_load_preferences(void)
                                                 SETTINGS_BRIGHTNESS_MIN,
                                                 SETTINGS_BRIGHTNESS_MAX);
     }
+    uint16_t timeout_seconds = DISPLAY_SLEEP_TIMEOUT_DEFAULT_SECONDS;
+    if (nvs_get_u16(nvs, "sleep_s", &timeout_seconds) == ESP_OK &&
+        (timeout_seconds == 0U || timeout_seconds == 15U ||
+         timeout_seconds == 30U || timeout_seconds == 60U ||
+         timeout_seconds == 120U || timeout_seconds == 300U)) {
+        s_display_sleep_timeout_seconds = timeout_seconds;
+    }
     nvs_close(nvs);
 }
 
@@ -614,6 +823,17 @@ static void settings_save_brightness(void)
         return;
     }
     (void)nvs_set_u8(nvs, "brightness", s_user_brightness);
+    (void)nvs_commit(nvs);
+    nvs_close(nvs);
+}
+
+static void settings_save_display_timeout(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("pacon_ui", NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    (void)nvs_set_u16(nvs, "sleep_s", s_display_sleep_timeout_seconds);
     (void)nvs_commit(nvs);
     nvs_close(nvs);
 }
@@ -647,6 +867,27 @@ static void display_note_activity(void)
             s_display_sleeping = false;
             woke_panel = true;
             ESP_LOGI(TAG, "OLED: panel woke on touch");
+
+            /* SH8601 display-off/on is not guaranteed to preserve the visible
+             * frame on every panel revision.  Force the active screen through
+             * its normal renderer after wake instead of assuming GRAM is still
+             * visible. */
+            switch (s_ui_screen) {
+            case UI_SCREEN_HOME: s_home_dirty = true; break;
+            case UI_SCREEN_APPS: s_apps_dirty = true; break;
+            case UI_SCREEN_FLUID_SETTINGS: s_settings_dirty = true; break;
+            case UI_SCREEN_COLOUR_PICKER: s_colour_picker_dirty = true; break;
+            case UI_SCREEN_OUO: s_ouo_dirty = true; break;
+            case UI_SCREEN_OUO_MENU: s_ouo_menu_dirty = true; break;
+            case UI_SCREEN_USB_DISK: s_usb_disk_dirty = true; break;
+            case UI_SCREEN_SKYORB: s_skyorb_dirty = true; break;
+            case UI_SCREEN_WATCH: s_watch_dirty = true; break;
+            case UI_SCREEN_SETTINGS: s_device_settings_dirty = true; break;
+            case UI_SCREEN_WIFI_SETTINGS: s_wifi_settings_dirty = true; break;
+            case UI_SCREEN_FLUID:
+            default:
+                break;
+            }
         }
     }
     if (!s_display_sleeping && (s_display_dimmed || woke_panel)) {
@@ -665,10 +906,13 @@ static void display_update_idle(TickType_t now)
     }
 
     const TickType_t idle = now - s_last_user_activity;
-    if (idle >= pdMS_TO_TICKS(DISPLAY_SLEEP_TIMEOUT_MS)) {
+    const uint32_t sleep_timeout_ms =
+        (uint32_t)s_display_sleep_timeout_seconds * 1000U;
+    if (sleep_timeout_ms != 0U && idle >= pdMS_TO_TICKS(sleep_timeout_ms)) {
         if (esp_lcd_panel_disp_on_off(s_lcd_panel, false) == ESP_OK) {
             s_display_sleeping = true;
-            ESP_LOGI(TAG, "OLED: panel blanked after %d ms idle", DISPLAY_SLEEP_TIMEOUT_MS);
+            ESP_LOGI(TAG, "OLED: panel blanked after %lu ms idle",
+                     (unsigned long)sleep_timeout_ms);
         }
         return;
     }
@@ -2030,7 +2274,7 @@ static void home_compose_cached_slide_line(uint16_t *line, const uint16_t *from,
     memset(line + right + 1, 0, (size_t)(LCD_WIDTH - right - 1) * sizeof(*line));
 }
 
-/* watchOS-inspired honeycomb launcher.  PACON keeps the proven five large
+/* watchOS-inspired honeycomb launcher.  PACON keeps large, separated
  * touch regions, but the visible icons are circular, layered and label-free
  * so the round panel reads like a watch launcher instead of a phone grid. */
 static uint16_t apps_pixel(int x, int y)
@@ -2061,6 +2305,9 @@ static uint16_t apps_pixel(int x, int y)
     const int disk_cx = disk_left + icon_size / 2;
     const int top_cy = top_row + icon_size / 2;
     const int bottom_cy = bottom_row + icon_size / 2;
+    const int watch_cx = LCD_WIDTH / 2;
+    const int watch_cy = top_cy;
+    const int watch_radius = 34;
 
     if (home_in_circle(x, y, fluid_cx, top_cy, icon_radius)) {
         const int ix = x - fluid_cx;
@@ -2078,23 +2325,47 @@ static uint16_t apps_pixel(int x, int y)
     if (home_in_circle(x, y, ouo_cx, top_cy, icon_radius)) {
         const int ix = x - ouo_cx;
         const int iy = y - top_cy;
-        colour = rgb565(244, 246, 248);
-        if ((ix + 17) * (ix + 17) + (iy + 20) * (iy + 20) < 24 * 24) {
+        /* 0u0 launcher icon: official OuO-inspired face.
+         * The Android icon is deliberately minimal: a black field, two round
+         * white eyes on a diagonal, and a lower-left white crescent.  Keep the
+         * same proportions here instead of inventing a random in-app face. */
+        const int radius2 = ix * ix + iy * iy;
+        if (radius2 >= 37 * 37) {
+            colour = rgb565(42, 44, 52);
+        } else {
+            colour = rgb565(1, 1, 2);
+        }
+
+        const int eye_a = (ix + 19) * (ix + 19) + (iy + 19) * (iy + 19);
+        const int eye_b = (ix - 19) * (ix - 19) + (iy - 19) * (iy - 19);
+        if (eye_a <= 9 * 9 || eye_b <= 9 * 9) {
             colour = rgb565(255, 255, 255);
         }
-        const int left_dx = x - (ouo_cx - 14);
-        const int right_dx = x - (ouo_cx + 14);
-        const int eye_dy = y - (top_cy - 7);
-        if (left_dx * left_dx + eye_dy * eye_dy <= 8 * 8 ||
-            right_dx * right_dx + eye_dy * eye_dy <= 8 * 8) {
-            colour = rgb565(10, 12, 17);
+
+        const int mouth_outer = (ix + 2) * (ix + 2) + (iy - 4) * (iy - 4);
+        const int mouth_cutout = (ix - 5) * (ix - 5) + (iy + 2) * (iy + 2);
+        if (mouth_outer <= 14 * 14 && mouth_cutout > 13 * 13) {
+            colour = rgb565(255, 255, 255);
         }
-        const int mouth_dx = x - ouo_cx;
-        const int mouth_dy = y - (top_cy + 15);
-        if (mouth_dx >= -15 && mouth_dx <= 15 &&
-            mouth_dy >= 3 - mouth_dx * mouth_dx / 62 &&
-            mouth_dy <= 7 - mouth_dx * mouth_dx / 62) {
-            colour = rgb565(10, 12, 17);
+    }
+    if (home_in_circle(x, y, watch_cx, watch_cy, watch_radius)) {
+        const int ix = x - watch_cx;
+        const int iy = y - watch_cy;
+        const int radius2 = ix * ix + iy * iy;
+        colour = radius2 > 30 * 30 ? rgb565(174, 119, 36) :
+                 radius2 > 26 * 26 ? rgb565(241, 196, 91) :
+                                     rgb565(25, 18, 13);
+        const float angle = atan2f((float)iy, (float)ix);
+        const float tick = fabsf(fmodf(angle + 6.28318531f, 0.52359878f));
+        if (radius2 >= 22 * 22 && radius2 <= 27 * 27 &&
+            (tick < 0.055f || tick > 0.468f)) {
+            colour = rgb565(255, 224, 139);
+        }
+        /* Compact 10:10 hands, readable without a text label. */
+        if ((iy >= -19 && iy <= 2 && abs(ix + iy / 2) <= 2) ||
+            (ix >= -16 && ix <= 1 && abs(iy - ix / 3) <= 2) ||
+            radius2 <= 4 * 4) {
+            colour = rgb565(250, 244, 220);
         }
     }
     if (home_in_circle(x, y, sky_cx, bottom_cy, icon_radius)) {
@@ -2211,28 +2482,26 @@ static uint16_t usb_disk_pixel(int x, int y)
         }
     }
 
-    const char *state = ready ? "READY" : failed ? "ERROR" : "PREPARING";
-    const int state_x = ready ? 195 : failed ? 194 : 155;
+    const char *state = ready ? "USB DISK ON" : failed ? "USB ERROR" : "USB DISK OFF";
+    const int state_x = ready ? 145 : failed ? 157 : 137;
     uint8_t alpha = home_font_alpha(x, y, state_x, 310, &lv_font_montserrat_28, state);
     if (alpha != 0) {
         return rgb565_blend(colour, text, alpha);
     }
-    const char *hint = ready ? "EJECT ON COMPUTER FIRST" :
-                       failed ? "RESTART TO TRY AGAIN" : "USB MEDIA DISK";
-    const int hint_x = ready ? 137 : failed ? 146 : 172;
+    const char *hint = ready ? "EJECT ON COMPUTER BEFORE OFF" :
+                       failed ? "TOGGLE TO TRY AGAIN" : "SERIAL REMAINS CONNECTED";
+    const int hint_x = ready ? 105 : failed ? 151 : 137;
     alpha = home_font_alpha(x, y, hint_x, 348, &lv_font_montserrat_14, hint);
     if (alpha != 0) {
         return rgb565_blend(colour, secondary, alpha);
     }
-    if (ready) {
-        const bool button = home_in_round_rect(x, y, 154, 391, 321, 439, 24);
-        if (button) {
-            colour = rgb565(10, 132, 255);
-        }
-        alpha = home_font_alpha(x, y, 197, 422, &lv_font_montserrat_18, "DONE");
-        if (alpha != 0) {
-            return rgb565_blend(colour, text, alpha);
-        }
+    const bool track = home_in_round_rect(x, y, 170, 387, 305, 439, 26);
+    if (track) {
+        colour = ready ? rgb565(48, 209, 88) : rgb565(58, 58, 60);
+    }
+    const int knob_x = ready ? 278 : 197;
+    if ((x - knob_x) * (x - knob_x) + (y - 413) * (y - 413) <= 21 * 21) {
+        colour = text;
     }
     return colour;
 }
@@ -3116,6 +3385,266 @@ static esp_err_t i2c_write_byte(uint8_t address, uint8_t reg, uint8_t value)
                                       pdMS_TO_TICKS(I2C_TIMEOUT_MS));
 }
 
+static esp_err_t i2c_write(uint8_t address, uint8_t reg,
+                           const uint8_t *data, size_t length)
+{
+    if (data == NULL || length == 0 || length > 15) return ESP_ERR_INVALID_ARG;
+    uint8_t buffer[16];
+    buffer[0] = reg;
+    memcpy(buffer + 1, data, length);
+    return i2c_master_write_to_device(I2C_PORT, address, buffer, length + 1,
+                                      pdMS_TO_TICKS(I2C_TIMEOUT_MS));
+}
+
+static int clock_bcd_to_int(uint8_t value)
+{
+    return ((value >> 4) & 0x0F) * 10 + (value & 0x0F);
+}
+
+static uint8_t clock_int_to_bcd(int value)
+{
+    return (uint8_t)(((value / 10) << 4) | (value % 10));
+}
+
+static bool clock_is_leap_year(int year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+static bool clock_time_valid(const clock_time_t *time)
+{
+    static const uint8_t days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (time == NULL || time->year < 2000 || time->year > 2099 ||
+        time->month < 1 || time->month > 12 || time->day < 1 ||
+        time->hour < 0 || time->hour > 23 || time->minute < 0 ||
+        time->minute > 59 || time->second < 0 || time->second > 59) return false;
+    int maximum = days[time->month - 1];
+    if (time->month == 2 && clock_is_leap_year(time->year)) maximum = 29;
+    return time->day <= maximum;
+}
+
+static clock_time_t clock_read_rtc(void)
+{
+    uint8_t raw[7] = {0};
+    clock_time_t time = {0};
+    if (i2c_read(ADDR_PCF85063, 0x04, raw, sizeof(raw)) != ESP_OK ||
+        (raw[0] & 0x80U) != 0) return time;
+    time.second = clock_bcd_to_int(raw[0] & 0x7FU);
+    time.minute = clock_bcd_to_int(raw[1] & 0x7FU);
+    time.hour = clock_bcd_to_int(raw[2] & 0x3FU);
+    time.day = clock_bcd_to_int(raw[3] & 0x3FU);
+    time.month = clock_bcd_to_int(raw[5] & 0x1FU);
+    time.year = 2000 + clock_bcd_to_int(raw[6]);
+    time.valid = clock_time_valid(&time);
+    return time;
+}
+
+static esp_err_t clock_write_rtc(const clock_time_t *time)
+{
+    if (!clock_time_valid(time)) return ESP_ERR_INVALID_ARG;
+    const uint8_t raw[7] = {
+        clock_int_to_bcd(time->second), clock_int_to_bcd(time->minute),
+        clock_int_to_bcd(time->hour), clock_int_to_bcd(time->day), 0,
+        clock_int_to_bcd(time->month), clock_int_to_bcd(time->year - 2000),
+    };
+    return i2c_write(ADDR_PCF85063, 0x04, raw, sizeof(raw));
+}
+
+static const char *clock_source_name(clock_source_t source)
+{
+    switch (source) {
+        case CLOCK_SOURCE_CUSTOM: return "custom";
+        case CLOCK_SOURCE_BLE: return "ble";
+        case CLOCK_SOURCE_WIFI: return "wifi";
+        default: return "rtc";
+    }
+}
+
+static const char *clock_sync_name(clock_sync_state_t state)
+{
+    switch (state) {
+        case CLOCK_SYNC_WAIT_WIFI: return "waiting_wifi";
+        case CLOCK_SYNC_RUNNING: return "syncing";
+        case CLOCK_SYNC_OK: return "ok";
+        case CLOCK_SYNC_FAILED: return "failed";
+        default: return "idle";
+    }
+}
+
+static void clock_load_preferences(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(CLOCK_CONFIG_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    uint8_t value = 0;
+    if (nvs_get_u8(handle, "source", &value) == ESP_OK && value <= CLOCK_SOURCE_WIFI)
+        s_clock_source = (clock_source_t)value;
+    if (nvs_get_u8(handle, "alarm_en", &value) == ESP_OK) s_alarm_enabled = value != 0;
+    if (nvs_get_u8(handle, "alarm_h", &value) == ESP_OK && value < 24) s_alarm_hour = value;
+    if (nvs_get_u8(handle, "alarm_m", &value) == ESP_OK && value < 60) s_alarm_minute = value;
+    if (nvs_get_u8(handle, "style", &value) == ESP_OK && value < 2) s_watch_style = value;
+    nvs_close(handle);
+}
+
+static void clock_save_preferences(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(CLOCK_CONFIG_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) return;
+    (void)nvs_set_u8(handle, "source", (uint8_t)s_clock_source);
+    (void)nvs_set_u8(handle, "alarm_en", s_alarm_enabled ? 1 : 0);
+    (void)nvs_set_u8(handle, "alarm_h", s_alarm_hour);
+    (void)nvs_set_u8(handle, "alarm_m", s_alarm_minute);
+    (void)nvs_set_u8(handle, "style", s_watch_style);
+    (void)nvs_commit(handle);
+    nvs_close(handle);
+}
+
+static bool alarm_buzzer_init(void)
+{
+    if (s_alarm_buzzer_ready) return true;
+    const ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE, .duty_resolution = LEDC_TIMER_10_BIT,
+        .timer_num = LEDC_TIMER_1, .freq_hz = 2000, .clk_cfg = LEDC_AUTO_CLK,
+    };
+    const ledc_channel_config_t channel = {
+        .gpio_num = PIN_SPKOUT, .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1, .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_1, .duty = 0, .hpoint = 0,
+    };
+    const esp_err_t timer_err = ledc_timer_config(&timer);
+    const esp_err_t channel_err = timer_err == ESP_OK ?
+                                  ledc_channel_config(&channel) : timer_err;
+    if (timer_err != ESP_OK || channel_err != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm: LEDC init GPIO%d timer=%s channel=%s",
+                 PIN_SPKOUT, esp_err_to_name(timer_err), esp_err_to_name(channel_err));
+        return false;
+    }
+    s_alarm_buzzer_ready = true;
+    ESP_LOGI(TAG, "Alarm: buzzer ready on GPIO%d at 2000 Hz", PIN_SPKOUT);
+    return true;
+}
+
+static bool alarm_set_tone(bool on)
+{
+    if (!s_alarm_buzzer_ready) return false;
+    const esp_err_t duty_err = ledc_set_duty(
+        LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, on ? 512 : 0);
+    const esp_err_t update_err = duty_err == ESP_OK ?
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1) : duty_err;
+    if (duty_err != ESP_OK || update_err != ESP_OK) {
+        ESP_LOGE(TAG, "Alarm: tone %s failed duty=%s update=%s",
+                 on ? "ON" : "OFF", esp_err_to_name(duty_err),
+                 esp_err_to_name(update_err));
+        return false;
+    }
+    s_alarm_tone_on = on;
+    return true;
+}
+
+static void alarm_stop(void)
+{
+    (void)alarm_set_tone(false);
+    s_alarm_ringing = false;
+    s_watch_dirty = true;
+}
+
+static void alarm_start(TickType_t now)
+{
+    if (!alarm_buzzer_init()) {
+        ESP_LOGE(TAG, "Alarm: buzzer init failed");
+        return;
+    }
+    s_alarm_ringing = true;
+    s_alarm_ring_deadline = now + pdMS_TO_TICKS(ALARM_RING_MS);
+    s_alarm_next_tone_toggle = now + pdMS_TO_TICKS(350);
+    if (!alarm_set_tone(true)) {
+        s_alarm_ringing = false;
+        return;
+    }
+    s_watch_dirty = true;
+    ESP_LOGW(TAG, "Alarm: ringing at %02u:%02u", s_alarm_hour, s_alarm_minute);
+}
+
+static void clock_service(TickType_t now)
+{
+    static TickType_t next_rtc_check;
+    if (s_clock_time_pending) {
+        const clock_time_t pending = s_clock_pending_time;
+        const clock_source_t source = s_clock_pending_source;
+        s_clock_time_pending = false;
+        const esp_err_t err = clock_write_rtc(&pending);
+        if (err == ESP_OK) {
+            s_clock_source = source;
+            s_clock_sync_state = CLOCK_SYNC_OK;
+            clock_save_preferences();
+            s_watch_dirty = true;
+            ESP_LOGI(TAG, "Clock: RTC set by %s", clock_source_name(source));
+        } else {
+            s_clock_sync_state = CLOCK_SYNC_FAILED;
+            ESP_LOGE(TAG, "Clock: RTC write failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (s_clock_wifi_sync_requested) {
+        if (!s_skyorb_wifi_connected) {
+            s_clock_sync_state = CLOCK_SYNC_WAIT_WIFI;
+        } else if (s_clock_sync_state != CLOCK_SYNC_RUNNING) {
+            setenv("TZ", "CST-8", 1);
+            tzset();
+            esp_sntp_stop();
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_init();
+            s_clock_sync_state = CLOCK_SYNC_RUNNING;
+            s_clock_wifi_sync_started = now;
+            ESP_LOGI(TAG, "Clock: Wi-Fi SNTP sync started");
+        } else {
+            const time_t epoch = time(NULL);
+            struct tm local = {0};
+            localtime_r(&epoch, &local);
+            if (local.tm_year + 1900 >= 2024) {
+                clock_time_t synced = {
+                    .year = local.tm_year + 1900, .month = local.tm_mon + 1,
+                    .day = local.tm_mday, .hour = local.tm_hour,
+                    .minute = local.tm_min, .second = local.tm_sec, .valid = true,
+                };
+                s_clock_pending_time = synced;
+                s_clock_pending_source = CLOCK_SOURCE_WIFI;
+                s_clock_time_pending = true;
+                s_clock_wifi_sync_requested = false;
+                esp_sntp_stop();
+            } else if ((int32_t)(now - s_clock_wifi_sync_started) >=
+                       (int32_t)pdMS_TO_TICKS(15000)) {
+                s_clock_wifi_sync_requested = false;
+                s_clock_sync_state = CLOCK_SYNC_FAILED;
+                esp_sntp_stop();
+                ESP_LOGE(TAG, "Clock: Wi-Fi SNTP sync timed out");
+            }
+        }
+    }
+
+    if (s_alarm_ringing) {
+        if ((int32_t)(now - s_alarm_ring_deadline) >= 0) alarm_stop();
+        else if ((int32_t)(now - s_alarm_next_tone_toggle) >= 0) {
+            (void)alarm_set_tone(!s_alarm_tone_on);
+            s_alarm_next_tone_toggle = now + pdMS_TO_TICKS(350);
+        }
+    }
+    if ((int32_t)(now - next_rtc_check) < 0) return;
+    next_rtc_check = now + pdMS_TO_TICKS(1000);
+    const clock_time_t current = clock_read_rtc();
+    s_clock_cached_time = current;
+    if (!current.valid || !s_alarm_enabled || s_alarm_ringing) return;
+    const int32_t date_key = current.year * 10000 + current.month * 100 + current.day;
+    /* The previous two-second trigger window could be skipped by a delayed RTC
+     * sample.  The date key still guarantees at most one alarm per day, so the
+     * complete matching minute is a safe and deterministic trigger window. */
+    if (current.hour == s_alarm_hour && current.minute == s_alarm_minute &&
+        date_key != s_alarm_last_date_key) {
+        s_alarm_last_date_key = date_key;
+        alarm_start(now);
+    }
+}
+
 /* Keep the charge configuration with the fluid firmware, so switching away
  * from the diagnostic project cannot restore the old 4.4 V / 300 mA policy. */
 static bool axp2101_update_register(uint8_t reg, uint8_t clear_mask, uint8_t set_mask)
@@ -3146,13 +3675,13 @@ static bool configure_axp2101_charging(void)
     ok = axp2101_update_register(0x61, 0x03, 0x01) && ok; /* 25 mA precharge */
     ok = axp2101_update_register(0x62, 0x1F, 0x02) && ok; /* 50 mA CC */
     ok = axp2101_update_register(0x63, 0x0F, 0x11) && ok; /* 25 mA, termination on */
-    ok = axp2101_update_register(0x64, 0x07, 0x01) && ok; /* 4.0 V target */
+    ok = axp2101_update_register(0x64, 0x07, 0x03) && ok; /* 4.2 V target */
 
     /* Cell charger and fuel gauge on; button-cell charger off; battery detect on. */
     ok = axp2101_update_register(0x18, 0x04, 0x0A) && ok;
     ok = axp2101_update_register(0x68, 0x00, 0x01) && ok;
 
-    ESP_LOGI(TAG, "AXP2101 charging: target=4000 mV, CC=50 mA, precharge=25 mA, termination=25 mA: %s",
+    ESP_LOGI(TAG, "AXP2101 charging: target=4200 mV, CC=50 mA, precharge=25 mA, termination=25 mA: %s",
              ok ? "OK" : "FAILED");
     return ok;
 }
@@ -3242,7 +3771,8 @@ static void log_axp2101_charge_status(void)
     bool battery_present = (status1 & 0x08) != 0;
     const bool battery_charging = vbus_present && (status2 & 0x07) <= 0x03;
     bool percent_ok = i2c_read(ADDR_AXP2101, 0xA4, &percent, 1) == ESP_OK;
-    uint16_t target_mv = (target & 0x07) == 0x01 ? 4000 : 0;
+    static const uint16_t target_voltage_mv[] = {0, 4000, 4100, 4200, 4350, 4400, 0, 0};
+    const uint16_t target_mv = target_voltage_mv[target & 0x07];
 
     if (s_battery_mv != battery_mv || s_vbus_present != vbus_present ||
         s_battery_charging != battery_charging ||
@@ -3737,12 +4267,14 @@ static void enter_usb_disk_screen(void)
 {
     s_ui_screen = UI_SCREEN_USB_DISK;
     s_usb_disk_dirty = true;
-    s_usb_msc_start_requested = true;
+    /* Merely opening this page must not re-enumerate USB and close the serial
+     * monitor.  The user explicitly enables MSC with the on-screen switch. */
+    s_usb_msc_start_requested = false;
     s_usb_msc_exit_requested = false;
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
     block_touch_until_release();
-    ESP_LOGI(TAG, "Apps: requested USB disk mode");
+    ESP_LOGI(TAG, "Apps: entered USB disk controls; serial remains active");
 }
 
 static void block_touch_until_release(void)
@@ -3782,6 +4314,14 @@ static void poll_touch(void)
         s_display_wake_touch_suppressed = false;
         if (s_ui_screen == UI_SCREEN_OUO && s_touch_down) {
             ouo_end_touch();
+        }
+        if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS && s_touch_down &&
+            !s_touch_blocked_until_release) {
+            wifi_settings_handle_release();
+        }
+        if (s_ui_screen == UI_SCREEN_SKYORB && s_touch_down &&
+            !s_touch_blocked_until_release) {
+            skyorb_handle_touch_release();
         }
         s_touch_down = false;
         s_touch_blocked_until_release = false;
@@ -3912,6 +4452,8 @@ static void poll_touch(void)
                 enter_fluid_screen();
             } else if (home_in_round_rect(x, y, 292, 123, 374, 205, 22)) {
                 enter_ouo_screen();
+            } else if (home_in_round_rect(x, y, 204, 130, 271, 198, 24)) {
+                watch_enter();
             } else if (home_in_round_rect(x, y, 101, 274, 183, 356, 22)) {
                 skyorb_enter();
             } else if (home_in_round_rect(x, y, 292, 274, 374, 356, 22)) {
@@ -3931,13 +4473,27 @@ static void poll_touch(void)
     }
 
     if (s_ui_screen == UI_SCREEN_USB_DISK) {
-        if (!s_touch_down && s_usb_msc_started &&
-            home_in_round_rect(x, y, 154, 397, 321, 437, 12)) {
-            /* The PC must have ejected the volume first.  Restarting is a
-             * deliberate ownership hand-off: boot restores USB Serial/JTAG
-             * and mounts /sdnand without relying on a live FAT disconnect. */
-            s_usb_msc_exit_requested = true;
-            ESP_LOGW(TAG, "USB disk: return requested; restarting into serial/app mode");
+        if (!s_touch_down && home_in_round_rect(x, y, 160, 377, 315, 449, 24)) {
+            if (s_usb_msc_started) {
+                /* The PC must have ejected the volume first.  A reboot is the
+                 * only safe ownership hand-off back to the firmware VFS. */
+                s_usb_msc_exit_requested = true;
+                ESP_LOGW(TAG, "USB disk: OFF requested; restarting into serial/app mode");
+            } else {
+                s_usb_msc_result = ESP_ERR_INVALID_STATE;
+                s_usb_msc_start_requested = true;
+                s_usb_disk_dirty = true;
+                ESP_LOGW(TAG, "USB disk: ON requested; serial will disconnect after switch");
+            }
+            block_touch_until_release();
+            return;
+        }
+        if (!s_touch_down && !s_usb_msc_started && x < 104 && y < 104) {
+            s_ui_screen = UI_SCREEN_APPS;
+            s_apps_dirty = true;
+            block_touch_until_release();
+            ESP_LOGI(TAG, "USB disk: returned without changing USB mode");
+            return;
         }
         s_touch_down = true;
         return;
@@ -3946,6 +4502,16 @@ static void poll_touch(void)
     if (s_ui_screen == UI_SCREEN_SKYORB) {
         if (!s_touch_down) {
             skyorb_handle_touch(x, y);
+        } else {
+            skyorb_handle_touch_move(x, y);
+        }
+        s_touch_down = true;
+        return;
+    }
+
+    if (s_ui_screen == UI_SCREEN_WATCH) {
+        if (!s_touch_down) {
+            watch_handle_touch(x, y);
         }
         s_touch_down = true;
         return;
@@ -3968,6 +4534,16 @@ static void poll_touch(void)
                 s_device_settings_dirty = true;
             }
             s_settings_touch_last_y = y;
+        }
+        s_touch_down = true;
+        return;
+    }
+
+    if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS) {
+        if (!s_touch_down) {
+            wifi_settings_handle_touch(x, y);
+        } else {
+            wifi_settings_update_touch(x, y);
         }
         s_touch_down = true;
         return;
@@ -4548,6 +5124,26 @@ static void fill_canvas_rect(int x1, int y1, int x2, int y2, uint16_t colour,
     }
 }
 
+static void fill_canvas_round_rect(int x1, int y1, int x2, int y2, int radius,
+                                   uint16_t colour, const dirty_rect_t *clip)
+{
+    const int clip_x1 = clip == NULL ? 0 : clip->x1;
+    const int clip_y1 = clip == NULL ? 0 : clip->y1;
+    const int clip_x2 = clip == NULL ? LCD_WIDTH : clip->x2;
+    const int clip_y2 = clip == NULL ? LCD_HEIGHT : clip->y2;
+    const int left = clamp_int(x1, clip_x1, clip_x2);
+    const int top = clamp_int(y1, clip_y1, clip_y2);
+    const int right = clamp_int(x2, clip_x1, clip_x2);
+    const int bottom = clamp_int(y2, clip_y1, clip_y2);
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            if (home_in_round_rect(x, y, x1, y1, x2 - 1, y2 - 1, radius)) {
+                s_lcd_canvas[(size_t)y * LCD_WIDTH + (size_t)x] = colour;
+            }
+        }
+    }
+}
+
 static void render_blocks_into_canvas(const dirty_rect_t *clip)
 {
     for (int index = 0; index < PARTICLE_COUNT; ++index) {
@@ -4803,12 +5399,20 @@ static bool flush_canvas_rect(const dirty_rect_t *rect)
  * does not pull in Arduino, PlatformIO or a second display driver.
  * -------------------------------------------------------------------------- */
 
-static const float s_skyorb_ranges_km[] = {6.7f, 13.3f, 20.0f, 33.3f};
+/* Keep the physical scale identical to the values exposed by the UI/BLE API. */
+/* Clockwise rotation advances through six useful city-scale radar ranges.
+ * Keep the index stable in NVS/BLE; the Android client mirrors this table. */
+static const float s_skyorb_ranges_km[] = {
+    5.0f, 10.0f, 15.0f, 25.0f, 35.0f, 50.0f
+};
+#define SKYORB_RANGE_COUNT \
+    ((uint8_t)(sizeof(s_skyorb_ranges_km) / sizeof(s_skyorb_ranges_km[0])))
 
 static void skyorb_mark_dirty(void)
 {
     s_skyorb_dirty = true;
     s_device_settings_dirty = true;
+    s_wifi_settings_dirty = true;
 }
 
 static bool skyorb_nvs_open(nvs_handle_t *handle, nvs_open_mode_t mode)
@@ -4821,21 +5425,124 @@ static bool skyorb_nvs_open(nvs_handle_t *handle, nvs_open_mode_t mode)
     return true;
 }
 
+static void wifi_config_select_profile(skyorb_config_t *config, uint8_t index)
+{
+    if (config == NULL || config->wifi_count == 0 || index >= config->wifi_count) {
+        if (config != NULL) {
+            config->wifi_selected = 0;
+            config->wifi_valid = false;
+            config->ssid[0] = '\0';
+            config->password[0] = '\0';
+        }
+        return;
+    }
+    char selected_ssid[sizeof(config->ssid)];
+    char selected_password[sizeof(config->password)];
+    snprintf(selected_ssid, sizeof(selected_ssid), "%s", config->wifi_profiles[index].ssid);
+    snprintf(selected_password, sizeof(selected_password), "%s",
+             config->wifi_profiles[index].password);
+    config->wifi_selected = index;
+    memcpy(config->ssid, selected_ssid, sizeof(config->ssid));
+    memcpy(config->password, selected_password, sizeof(config->password));
+    config->wifi_valid = config->ssid[0] != '\0';
+}
+
+static int wifi_config_find_profile(const skyorb_config_t *config, const char *ssid)
+{
+    if (config == NULL || ssid == NULL) return -1;
+    for (uint8_t index = 0; index < config->wifi_count; ++index) {
+        if (strcmp(config->wifi_profiles[index].ssid, ssid) == 0) return index;
+    }
+    return -1;
+}
+
+static bool wifi_config_upsert_profile(skyorb_config_t *config, const char *ssid,
+                                       const char *password)
+{
+    if (config == NULL || ssid == NULL || password == NULL || ssid[0] == '\0') return false;
+    int index = wifi_config_find_profile(config, ssid);
+    if (index < 0) {
+        if (config->wifi_count >= WIFI_PROFILE_MAX) return false;
+        index = config->wifi_count++;
+    }
+    snprintf(config->wifi_profiles[index].ssid, sizeof(config->wifi_profiles[index].ssid),
+             "%s", ssid);
+    snprintf(config->wifi_profiles[index].password,
+             sizeof(config->wifi_profiles[index].password), "%s", password);
+    wifi_config_select_profile(config, (uint8_t)index);
+    return true;
+}
+
+static bool wifi_config_delete_profile(skyorb_config_t *config, uint8_t index)
+{
+    if (config == NULL || index >= config->wifi_count) return false;
+    for (uint8_t move = index; move + 1U < config->wifi_count; ++move) {
+        config->wifi_profiles[move] = config->wifi_profiles[move + 1U];
+    }
+    if (config->wifi_count > 0) {
+        --config->wifi_count;
+        memset(&config->wifi_profiles[config->wifi_count], 0,
+               sizeof(config->wifi_profiles[config->wifi_count]));
+    }
+    uint8_t selected = config->wifi_selected;
+    if (config->wifi_count == 0) {
+        selected = 0;
+    } else if (selected > index) {
+        --selected;
+    } else if (selected >= config->wifi_count) {
+        selected = config->wifi_count - 1U;
+    }
+    wifi_config_select_profile(config, selected);
+    return true;
+}
+
 static void skyorb_load_config(void)
 {
     skyorb_config_t config = {0};
     config.range_index = 1;
     nvs_handle_t handle;
     if (skyorb_nvs_open(&handle, NVS_READONLY)) {
-        size_t ssid_length = sizeof(config.ssid);
-        size_t password_length = sizeof(config.password);
+        char legacy_ssid[sizeof(config.ssid)] = {0};
+        char legacy_password[sizeof(config.password)] = {0};
+        size_t ssid_length = sizeof(legacy_ssid);
+        size_t password_length = sizeof(legacy_password);
         int32_t latitude_e6 = 0;
         int32_t longitude_e6 = 0;
         uint8_t range = 1;
         uint8_t location_auto = 0;
-        const bool have_ssid = nvs_get_str(handle, "ssid", config.ssid, &ssid_length) == ESP_OK;
-        const bool have_password = nvs_get_str(handle, "password", config.password,
+        const bool have_ssid = nvs_get_str(handle, "ssid", legacy_ssid, &ssid_length) == ESP_OK;
+        const bool have_password = nvs_get_str(handle, "password", legacy_password,
                                                 &password_length) == ESP_OK;
+        uint8_t stored_count = 0;
+        uint8_t stored_selected = 0;
+        const bool have_profile_schema = nvs_get_u8(handle, "wifi_count", &stored_count) == ESP_OK;
+        (void)nvs_get_u8(handle, "wifi_sel", &stored_selected);
+        stored_count = stored_count > WIFI_PROFILE_MAX ? WIFI_PROFILE_MAX : stored_count;
+        if (have_profile_schema) {
+            for (uint8_t index = 0; index < stored_count; ++index) {
+                char ssid_key[8];
+                char pass_key[8];
+                snprintf(ssid_key, sizeof(ssid_key), "ssid%u", (unsigned)index);
+                snprintf(pass_key, sizeof(pass_key), "pass%u", (unsigned)index);
+                wifi_profile_t profile = {0};
+                size_t profile_ssid_length = sizeof(profile.ssid);
+                size_t profile_password_length = sizeof(profile.password);
+                const bool profile_ok =
+                    nvs_get_str(handle, ssid_key, profile.ssid, &profile_ssid_length) == ESP_OK &&
+                    nvs_get_str(handle, pass_key, profile.password, &profile_password_length) == ESP_OK &&
+                    profile.ssid[0] != '\0';
+                if (profile_ok) config.wifi_profiles[config.wifi_count++] = profile;
+            }
+        }
+        if (config.wifi_count == 0 && have_ssid && have_password && legacy_ssid[0] != '\0') {
+            snprintf(config.wifi_profiles[0].ssid, sizeof(config.wifi_profiles[0].ssid),
+                     "%s", legacy_ssid);
+            snprintf(config.wifi_profiles[0].password,
+                     sizeof(config.wifi_profiles[0].password), "%s", legacy_password);
+            config.wifi_count = 1;
+            stored_selected = 0;
+            ESP_LOGI(TAG, "Wi-Fi: migrated legacy saved network into profile list");
+        }
         const bool have_lat = nvs_get_i32(handle, "lat_e6", &latitude_e6) == ESP_OK;
         const bool have_lon = nvs_get_i32(handle, "lon_e6", &longitude_e6) == ESP_OK;
         (void)nvs_get_u8(handle, "range", &range);
@@ -4843,8 +5550,9 @@ static void skyorb_load_config(void)
         nvs_close(handle);
         config.latitude = (float)latitude_e6 / 1000000.0f;
         config.longitude = (float)longitude_e6 / 1000000.0f;
-        config.range_index = range < 4 ? range : 1;
-        config.wifi_valid = have_ssid && have_password;
+        config.range_index = range < SKYORB_RANGE_COUNT ? range : 1;
+        wifi_config_select_profile(&config,
+                                   stored_selected < config.wifi_count ? stored_selected : 0);
         config.location_valid = have_lat && have_lon && fabsf(config.latitude) <= 90.0f &&
                                 fabsf(config.longitude) <= 180.0f;
         config.location_auto = location_auto != 0;
@@ -4859,7 +5567,8 @@ static void skyorb_load_config(void)
         s_skyorb_range_index = config.range_index;
     }
     s_skyorb_config_loaded = true;
-    ESP_LOGI(TAG, "SkyOrb: Wi-Fi=%s location=%s range=%u", config.wifi_valid ? "saved" : "none",
+    ESP_LOGI(TAG, "SkyOrb: Wi-Fi=%u saved selected=%u location=%s range=%u",
+             (unsigned)config.wifi_count, (unsigned)config.wifi_selected,
              config.location_valid ? (config.location_auto ? "automatic" : "manual") : "none",
              (unsigned)config.range_index);
     skyorb_mark_dirty();
@@ -4875,6 +5584,26 @@ static void skyorb_save_config(const skyorb_config_t *config)
     if (config->wifi_valid) {
         err = nvs_set_str(handle, "ssid", config->ssid);
         if (err == ESP_OK) err = nvs_set_str(handle, "password", config->password);
+    } else {
+        (void)nvs_erase_key(handle, "ssid");
+        (void)nvs_erase_key(handle, "password");
+    }
+    if (err == ESP_OK) err = nvs_set_u8(handle, "wifi_count", config->wifi_count);
+    if (err == ESP_OK) err = nvs_set_u8(handle, "wifi_sel", config->wifi_selected);
+    for (uint8_t index = 0; err == ESP_OK && index < WIFI_PROFILE_MAX; ++index) {
+        char ssid_key[8];
+        char pass_key[8];
+        snprintf(ssid_key, sizeof(ssid_key), "ssid%u", (unsigned)index);
+        snprintf(pass_key, sizeof(pass_key), "pass%u", (unsigned)index);
+        if (index < config->wifi_count) {
+            err = nvs_set_str(handle, ssid_key, config->wifi_profiles[index].ssid);
+            if (err == ESP_OK) {
+                err = nvs_set_str(handle, pass_key, config->wifi_profiles[index].password);
+            }
+        } else {
+            (void)nvs_erase_key(handle, ssid_key);
+            (void)nvs_erase_key(handle, pass_key);
+        }
     }
     if (err == ESP_OK && config->location_valid) {
         const int32_t latitude_e6 = (int32_t)lroundf(config->latitude * 1000000.0f);
@@ -4921,6 +5650,24 @@ static void ble_trim_ascii(char *text)
     }
 }
 
+static void ble_json_escape(char *destination, size_t destination_size, const char *source)
+{
+    if (destination == NULL || destination_size == 0) return;
+    size_t written = 0;
+    if (source != NULL) {
+        while (*source != '\0' && written + 1U < destination_size) {
+            const unsigned char value = (unsigned char)*source++;
+            if ((value == '"' || value == '\\') && written + 2U < destination_size) {
+                destination[written++] = '\\';
+                destination[written++] = (char)value;
+            } else if (value >= 0x20U) {
+                destination[written++] = (char)value;
+            }
+        }
+    }
+    destination[written] = '\0';
+}
+
 static void ble_snapshot_skyorb_config(skyorb_config_t *config)
 {
     if (config == NULL) return;
@@ -4947,19 +5694,43 @@ static void ble_store_skyorb_config(const skyorb_config_t *config)
         s_skyorb_range_index = config->range_index;
     }
     s_skyorb_config_loaded = true;
-    s_skyorb_setup_saved = true;
     skyorb_save_config(config);
     skyorb_mark_dirty();
+}
+
+static const char *skyorb_location_error_name(skyorb_location_result_t result)
+{
+    switch (result) {
+        case SKYORB_LOCATION_ERR_CLIENT: return "client_init";
+        case SKYORB_LOCATION_ERR_OPEN: return "network_open";
+        case SKYORB_LOCATION_ERR_RESPONSE: return "network_read";
+        case SKYORB_LOCATION_ERR_HTTP: return "http_status";
+        case SKYORB_LOCATION_ERR_PARSE: return "invalid_response";
+        default: return "none";
+    }
+}
+
+static const char *skyorb_location_state_name(const skyorb_config_t *config)
+{
+    if (config->location_valid) return "ready";
+    if (s_skyorb_location_in_progress ||
+        s_skyorb_location_result == SKYORB_LOCATION_IN_PROGRESS) return "pending";
+    if (!s_skyorb_wifi_enabled || !s_skyorb_wifi_connected) return "waiting_wifi";
+    if (s_skyorb_location_result >= SKYORB_LOCATION_ERR_CLIENT) return "failed";
+    if (config->location_auto ||
+        s_skyorb_location_result == SKYORB_LOCATION_REQUESTED) return "requested";
+    return "unset";
 }
 
 /* BLE configuration protocol.  Commands are ASCII and intentionally short so
  * they can be entered directly in nRF Connect:
  *   GET STATUS / GET SETTINGS
  *   SET BRIGHTNESS <0..100>
- *   SET RANGE <0..3>
+ *   SET RANGE <0..5>  (5/10/15/25/35/50 km)
  *   SET LOCATION <latitude> <longitude>
  *   SET AUTO_LOCATION
  *   SET WIFI <ssid>|<password>
+ *   CAMERA SHUTTER / SET CAMERA REMOTE ON|OFF
  */
 static esp_err_t fluid_ble_command(const char *command, char *response,
                                    size_t response_size)
@@ -4984,35 +5755,201 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
 
     skyorb_config_t config;
     ble_snapshot_skyorb_config(&config);
-    if (strcasecmp(text, "GET STATUS") == 0 || strcasecmp(text, "GET SETTINGS") == 0) {
-        const char *location = config.location_valid ?
-            (config.location_auto ? "auto" : "manual") : "none";
+    if (strcasecmp(text, "GET RADAR") == 0) {
+        snprintf(response, response_size, "{\"ok\":true,\"location_valid\":%s,\"location_auto\":%s,\"location_state\":\"%s\",\"location_error\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"range\":%u}\r\n",
+                 config.location_valid ? "true" : "false",
+                 config.location_auto ? "true" : "false",
+                 skyorb_location_state_name(&config),
+                 skyorb_location_error_name(s_skyorb_location_result),
+                 (double)config.latitude, (double)config.longitude,
+                 (unsigned)config.range_index);
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "GET CLOCK") == 0) {
+        const clock_time_t time = s_clock_cached_time;
+        snprintf(response, response_size,
+                 "{\"ok\":true,\"time\":\"%04d-%02d-%02d %02d:%02d:%02d\","
+                 "\"rtc_valid\":%s,\"source\":\"%s\",\"sync\":\"%s\","
+                 "\"alarm_enabled\":%s,\"alarm\":\"%02u:%02u\","
+                 "\"ringing\":%s,\"style\":%u,\"style_name\":\"%s\"}\r\n",
+                 time.year, time.month, time.day, time.hour, time.minute, time.second,
+                 time.valid ? "true" : "false", clock_source_name(s_clock_source),
+                 clock_sync_name(s_clock_sync_state), s_alarm_enabled ? "true" : "false",
+                 s_alarm_hour, s_alarm_minute, s_alarm_ringing ? "true" : "false",
+                 (unsigned)s_watch_style, s_watch_style == 1U ? "KKD2" : "KKD1");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "GET SETTINGS") == 0) {
+        snprintf(response, response_size,
+                 "{\"ok\":true,\"brightness\":%u,\"screen_timeout\":%u,\"camera_remote\":%s}\r\n",
+                 (unsigned)(((uint16_t)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 100U) /
+                            (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)),
+                 (unsigned)s_display_sleep_timeout_seconds,
+                 ble_pacon_is_camera_remote_enabled() ? "true" : "false");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "GET STATUS") == 0) {
+        /* Keep this below a single ATT notification at the negotiated
+         * 256-byte MTU. Radar and Wi-Fi details have dedicated commands. */
         snprintf(response, response_size,
                  "{\"ok\":true,\"battery_mv\":%u,\"battery_pct\":%u,"
                  "\"battery_valid\":%s,\"charging\":%s,\"vbus\":%s,"
-                 "\"brightness\":%u,\"ble\":%s,\"wifi\":%s,"
-                 "\"ssid\":\"%s\",\"location\":\"%s\","
-                 "\"lat\":%.6f,\"lon\":%.6f,\"range\":%u,"
-                 "\"media\":%u,\"media_index\":%u}\r\n",
+                 "\"brightness\":%u,\"screen_timeout\":%u,\"ble\":%s,\"wifi\":%s,"
+                 "\"camera_remote\":%s,\"media\":%u,\"media_index\":%u}\r\n",
                  (unsigned)s_battery_mv, (unsigned)s_battery_percent,
                  s_battery_percent_valid ? "true" : "false",
                  s_battery_charging ? "true" : "false",
                  s_vbus_present ? "true" : "false",
                  (unsigned)(((uint16_t)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 100U) /
                             (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)),
+                 (unsigned)s_display_sleep_timeout_seconds,
                  ble_pacon_is_enabled() ? "true" : "false",
-                 config.wifi_valid ? "true" : "false", config.ssid,
-                 location, (double)config.latitude, (double)config.longitude,
-                 (unsigned)config.range_index, (unsigned)s_home_external_media_count,
+                 config.wifi_valid ? "true" : "false",
+                 ble_pacon_is_camera_remote_enabled() ? "true" : "false",
+                 (unsigned)s_home_external_media_count,
                  (unsigned)s_home_media_index);
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "CAMERA SHUTTER") == 0) {
+        const esp_err_t shutter_err = ble_pacon_camera_shutter();
+        if (shutter_err != ESP_OK) {
+            snprintf(response, response_size, "ERR camera remote unavailable\r\n");
+            return shutter_err;
+        }
+        snprintf(response, response_size, "OK CAMERA SHUTTER\r\n");
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SET CAMERA REMOTE ", 19U) == 0) {
+        const char *value = text + 19;
+        if (strcasecmp(value, "ON") != 0 && strcasecmp(value, "OFF") != 0) {
+            snprintf(response, response_size, "ERR camera remote expects ON|OFF\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const bool enabled = strcasecmp(value, "ON") == 0;
+        (void)ble_pacon_set_camera_remote_enabled(enabled);
+        snprintf(response, response_size, "OK CAMERA REMOTE %s\r\n",
+                 enabled ? "ON" : "OFF");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "GET WIFI LIST") == 0) {
+        snprintf(response, response_size,
+                 "{\"ok\":true,\"count\":%u,\"selected\":%u}\r\n",
+                 (unsigned)config.wifi_count, (unsigned)config.wifi_selected);
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "GET WIFI ", 9U) == 0) {
+        char *end = NULL;
+        const long index = strtol(text + 9, &end, 10);
+        while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
+        if (end == NULL || *end != '\0' || index < 0 ||
+            index >= config.wifi_count) {
+            snprintf(response, response_size, "ERR invalid Wi-Fi index\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        char escaped_ssid[68];
+        ble_json_escape(escaped_ssid, sizeof(escaped_ssid),
+                        config.wifi_profiles[index].ssid);
+        snprintf(response, response_size,
+                 "{\"ok\":true,\"index\":%ld,\"ssid\":\"%s\",\"selected\":%s}\r\n",
+                 index, escaped_ssid, index == config.wifi_selected ? "true" : "false");
         return ESP_OK;
     }
     if (strcasecmp(text, "GET HELP") == 0) {
         snprintf(response, response_size,
-                 "GET STATUS; SET BRIGHTNESS 0..100; SET RANGE 0..3; "
+                 "GET STATUS; GET RADAR; GET CLOCK; SET BRIGHTNESS 0..100; "
+                 "SET SCREEN TIMEOUT 0|15|30|60|120|300; SET RANGE 0..5; "
+                 "CAMERA SHUTTER; SET CAMERA REMOTE ON|OFF; "
                  "SET LOCATION lat lon; SET AUTO_LOCATION; SET WIFI ssid|password; "
+                 "GET WIFI LIST; GET WIFI index; SELECT WIFI index; DELETE WIFI index; "
+                 "SET TIME yyyy-mm-dd hh:mm:ss CUSTOM|BLE; SYNC WIFI TIME; "
+                 "SET ALARM hh:mm; SET ALARM OFF; TEST ALARM; STOP ALARM; SET WATCH STYLE 0|1; "
                  "MEDIA_LIST; MEDIA_INFO index; MEDIA_PLAY name; MEDIA_DELETE name; "
                  "MEDIA_BEGIN name size frames fps; MEDIA_DATA offset hex; MEDIA_END\r\n");
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SET TIME ", 9U) == 0) {
+        clock_time_t time = {0};
+        char source[10] = {0};
+        if (sscanf(text + 9, "%d-%d-%d %d:%d:%d %9s", &time.year, &time.month,
+                   &time.day, &time.hour, &time.minute, &time.second, source) != 7) {
+            snprintf(response, response_size, "ERR time format yyyy-mm-dd hh:mm:ss CUSTOM|BLE\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        time.valid = clock_time_valid(&time);
+        if (!time.valid || (strcasecmp(source, "CUSTOM") != 0 &&
+                            strcasecmp(source, "BLE") != 0)) {
+            snprintf(response, response_size, "ERR invalid time or source\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_clock_pending_time = time;
+        s_clock_pending_source = strcasecmp(source, "BLE") == 0 ?
+                                 CLOCK_SOURCE_BLE : CLOCK_SOURCE_CUSTOM;
+        s_clock_time_pending = true;
+        snprintf(response, response_size, "OK TIME PENDING\r\n");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "SYNC WIFI TIME") == 0) {
+        s_clock_wifi_sync_requested = true;
+        s_clock_sync_state = s_skyorb_wifi_connected ? CLOCK_SYNC_IDLE : CLOCK_SYNC_WAIT_WIFI;
+        snprintf(response, response_size, "OK WIFI TIME PENDING\r\n");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "SET ALARM OFF") == 0) {
+        s_alarm_enabled = false;
+        alarm_stop();
+        clock_save_preferences();
+        snprintf(response, response_size, "OK ALARM OFF\r\n");
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SET ALARM ", 10U) == 0) {
+        int hour = -1;
+        int minute = -1;
+        char extra = '\0';
+        if (sscanf(text + 10, "%d:%d %c", &hour, &minute, &extra) != 2 ||
+            hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+            snprintf(response, response_size, "ERR alarm format hh:mm\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_alarm_hour = (uint8_t)hour;
+        s_alarm_minute = (uint8_t)minute;
+        s_alarm_enabled = true;
+        s_alarm_last_date_key = -1;
+        clock_save_preferences();
+        s_watch_dirty = true;
+        snprintf(response, response_size, "OK ALARM %02d:%02d\r\n", hour, minute);
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "STOP ALARM") == 0) {
+        alarm_stop();
+        snprintf(response, response_size, "OK ALARM STOPPED\r\n");
+        return ESP_OK;
+    }
+    if (strcasecmp(text, "TEST ALARM") == 0) {
+        alarm_start(xTaskGetTickCount());
+        if (!s_alarm_ringing) {
+            snprintf(response, response_size, "ERR ALARM BUZZER START\r\n");
+            return ESP_FAIL;
+        }
+        snprintf(response, response_size, "OK ALARM TEST\r\n");
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SET WATCH STYLE ", 16U) == 0) {
+        char *end = NULL;
+        const long style = strtol(text + 16, &end, 10);
+        while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
+        if (end == NULL || *end != '\0' || style < 0 || style > 1) {
+            snprintf(response, response_size, "ERR watch style must be 0..1\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_watch_style = (uint8_t)style;
+        clock_save_preferences();
+        s_watch_dirty = true;
+        s_watch_last_frame = 0;
+        s_watch_display_seconds = -1;
+        ESP_LOGI(TAG, "Watch style requested over BLE: %s (%ld)",
+                 style == 1 ? "KKD2" : "KKD1", style);
+        snprintf(response, response_size, "OK WATCH STYLE %ld %s\r\n",
+                 style, style == 1 ? "KKD2" : "KKD1");
         return ESP_OK;
     }
     if (strncasecmp(text, "SET BRIGHTNESS ", 15U) == 0) {
@@ -5030,12 +5967,30 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
         snprintf(response, response_size, "OK BRIGHTNESS %ld\r\n", percent);
         return ESP_OK;
     }
+    if (strncasecmp(text, "SET SCREEN TIMEOUT ", 19U) == 0) {
+        char *end = NULL;
+        const long seconds = strtol(text + 19, &end, 10);
+        while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
+        const bool valid = seconds == 0 || seconds == 15 || seconds == 30 ||
+                           seconds == 60 || seconds == 120 || seconds == 300;
+        if (end == NULL || *end != '\0' || !valid) {
+            snprintf(response, response_size,
+                     "ERR screen timeout must be 0|15|30|60|120|300\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        s_display_sleep_timeout_seconds = (uint16_t)seconds;
+        settings_save_display_timeout();
+        s_last_user_activity = xTaskGetTickCount();
+        snprintf(response, response_size, "OK SCREEN TIMEOUT %ld\r\n", seconds);
+        return ESP_OK;
+    }
     if (strncasecmp(text, "SET RANGE ", 10U) == 0) {
         char *end = NULL;
         const long range = strtol(text + 10, &end, 10);
         while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
-        if (end == NULL || *end != '\0' || range < 0 || range > 3) {
-            snprintf(response, response_size, "ERR range must be 0..3\r\n");
+        if (end == NULL || *end != '\0' || range < 0 ||
+            range >= SKYORB_RANGE_COUNT) {
+            snprintf(response, response_size, "ERR range must be 0..5\r\n");
             return ESP_ERR_INVALID_ARG;
         }
         config.range_index = (uint8_t)range;
@@ -5046,6 +6001,8 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
     if (strcasecmp(text, "SET AUTO_LOCATION") == 0) {
         config.location_valid = false;
         config.location_auto = true;
+        s_skyorb_auto_location_attempted = false;
+        s_skyorb_location_result = SKYORB_LOCATION_REQUESTED;
         ble_store_skyorb_config(&config);
         snprintf(response, response_size, "OK AUTO_LOCATION\r\n");
         return ESP_OK;
@@ -5064,6 +6021,7 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
         config.longitude = longitude;
         config.location_valid = true;
         config.location_auto = false;
+        s_skyorb_location_result = SKYORB_LOCATION_READY;
         ble_store_skyorb_config(&config);
         snprintf(response, response_size, "OK LOCATION %.6f %.6f\r\n",
                  (double)latitude, (double)longitude);
@@ -5084,76 +6042,59 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
         *separator++ = '\0';
         ble_trim_ascii(s_ble_wifi_credentials);
         ble_trim_ascii(separator);
-        if (s_ble_wifi_credentials[0] == '\0' || separator[0] == '\0' ||
+        if (s_ble_wifi_credentials[0] == '\0' ||
             strlen(s_ble_wifi_credentials) > 32U || strlen(separator) > 64U) {
             snprintf(response, response_size, "ERR invalid Wi-Fi credentials\r\n");
             return ESP_ERR_INVALID_ARG;
         }
-        snprintf(config.ssid, sizeof(config.ssid), "%s", s_ble_wifi_credentials);
-        snprintf(config.password, sizeof(config.password), "%s", separator);
-        config.wifi_valid = true;
+        if (!wifi_config_upsert_profile(&config, s_ble_wifi_credentials, separator)) {
+            snprintf(response, response_size, "ERR Wi-Fi list full (max %u)\r\n",
+                     (unsigned)WIFI_PROFILE_MAX);
+            return ESP_ERR_NO_MEM;
+        }
         ble_store_skyorb_config(&config);
-        snprintf(response, response_size, "OK WIFI SAVED\r\n");
+        memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
+        memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
+        s_wifi_scan_requested = s_skyorb_wifi_enabled;
+        snprintf(response, response_size, "OK WIFI SAVED %u\r\n",
+                 (unsigned)config.wifi_selected);
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SELECT WIFI ", 12U) == 0) {
+        char *end = NULL;
+        const long index = strtol(text + 12, &end, 10);
+        while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
+        if (end == NULL || *end != '\0' || index < 0 || index >= config.wifi_count) {
+            snprintf(response, response_size, "ERR invalid Wi-Fi index\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (!wifi_request_profile_connection((uint8_t)index)) {
+            snprintf(response, response_size, "ERR Wi-Fi switch unavailable\r\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        snprintf(response, response_size, "OK WIFI SELECTED %ld\r\n", index);
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "DELETE WIFI ", 12U) == 0) {
+        char *end = NULL;
+        const long index = strtol(text + 12, &end, 10);
+        while (end != NULL && *end != '\0' && isspace((unsigned char)*end)) ++end;
+        if (end == NULL || *end != '\0' || index < 0 || index >= config.wifi_count) {
+            snprintf(response, response_size, "ERR invalid Wi-Fi index\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        const bool deleted_active = config.wifi_selected == index;
+        (void)wifi_config_delete_profile(&config, (uint8_t)index);
+        ble_store_skyorb_config(&config);
+        if (deleted_active && s_skyorb_wifi_connected) (void)esp_wifi_disconnect();
+        memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
+        memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
+        s_wifi_scan_requested = s_skyorb_wifi_enabled;
+        snprintf(response, response_size, "OK WIFI DELETED %ld\r\n", index);
         return ESP_OK;
     }
     snprintf(response, response_size, "ERR unsupported command\r\n");
     return ESP_ERR_NOT_SUPPORTED;
-}
-
-static int skyorb_hex_value(char value)
-{
-    if (value >= '0' && value <= '9') return value - '0';
-    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
-    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
-    return -1;
-}
-
-static void skyorb_url_decode(char *destination, size_t destination_size, const char *source)
-{
-    if (destination_size == 0) return;
-    size_t written = 0;
-    while (*source != '\0' && written + 1 < destination_size) {
-        if (*source == '+') {
-            destination[written++] = ' ';
-            ++source;
-        } else if (*source == '%' && source[1] != '\0' && source[2] != '\0') {
-            const int high = skyorb_hex_value(source[1]);
-            const int low = skyorb_hex_value(source[2]);
-            if (high >= 0 && low >= 0) {
-                destination[written++] = (char)((high << 4) | low);
-                source += 3;
-            } else {
-                destination[written++] = *source++;
-            }
-        } else {
-            destination[written++] = *source++;
-        }
-    }
-    destination[written] = '\0';
-}
-
-static bool skyorb_form_value(const char *body, const char *key, char *value, size_t value_size)
-{
-    const size_t key_length = strlen(key);
-    const char *cursor = body;
-    while (*cursor != '\0') {
-        const char *equals = strchr(cursor, '=');
-        if (equals == NULL) break;
-        const char *end = strchr(equals + 1, '&');
-        if (end == NULL) end = cursor + strlen(cursor);
-        if ((size_t)(equals - cursor) == key_length && strncmp(cursor, key, key_length) == 0) {
-            char encoded[128];
-            size_t length = (size_t)(end - equals - 1);
-            length = length >= sizeof(encoded) ? sizeof(encoded) - 1 : length;
-            memcpy(encoded, equals + 1, length);
-            encoded[length] = '\0';
-            skyorb_url_decode(value, value_size, encoded);
-            return true;
-        }
-        cursor = *end == '&' ? end + 1 : end;
-    }
-    if (value_size != 0) value[0] = '\0';
-    return false;
 }
 
 static bool skyorb_connect_saved_station(void)
@@ -5180,35 +6121,90 @@ static bool skyorb_connect_saved_station(void)
            ssid_length < sizeof(station.sta.ssid) ? ssid_length : sizeof(station.sta.ssid));
     memcpy(station.sta.password, config.password,
            password_length < sizeof(station.sta.password) ? password_length : sizeof(station.sta.password));
-    station.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* Accept the AP's advertised security mode.  Requiring WPA2 here rejects
+     * some WPA/WPA2 mixed-mode routers before authentication even starts. */
+    station.sta.threshold.authmode = WIFI_AUTH_OPEN;
     station.sta.pmf_cfg.capable = true;
     station.sta.pmf_cfg.required = false;
-    (void)esp_wifi_disconnect();
+    const uint8_t selected = config.wifi_selected;
+    if (selected < WIFI_PROFILE_MAX && s_wifi_profile_ap_valid[selected]) {
+        station.sta.bssid_set = true;
+        memcpy(station.sta.bssid, s_wifi_profile_ap[selected].bssid,
+               sizeof(station.sta.bssid));
+        station.sta.channel = s_wifi_profile_ap[selected].primary;
+        ESP_LOGI(TAG,
+                 "[WIFI-LINK] target BSSID=%02X:%02X:%02X:%02X:%02X:%02X channel=%u auth=%d pairwise=%d group=%d rssi=%d",
+                 station.sta.bssid[0], station.sta.bssid[1], station.sta.bssid[2],
+                 station.sta.bssid[3], station.sta.bssid[4], station.sta.bssid[5],
+                 (unsigned)station.sta.channel,
+                 (int)s_wifi_profile_ap[selected].authmode,
+                 (int)s_wifi_profile_ap[selected].pairwise_cipher,
+                 (int)s_wifi_profile_ap[selected].group_cipher,
+                 (int)s_wifi_profile_ap[selected].rssi);
+    } else {
+        ESP_LOGW(TAG, "[WIFI-LINK] no saved scan record; connecting by SSID only");
+    }
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &station);
+    s_wifi_connect_started = xTaskGetTickCount();
     if (err == ESP_OK) err = esp_wifi_connect();
-    s_skyorb_ap_ready = false;
     s_skyorb_wifi_connected = false;
     s_skyorb_network_status = err;
+    s_wifi_link_state = err == ESP_OK ? WIFI_LINK_CONNECTING : WIFI_LINK_FAILED;
     skyorb_mark_dirty();
-    ESP_LOGI(TAG, "SkyOrb: leaving setup AP; joining saved Wi-Fi %s: %s",
+    ESP_LOGI(TAG, "SkyOrb: joining saved Wi-Fi %s: %s",
              config.ssid, esp_err_to_name(err));
     return err == ESP_OK;
+}
+
+static bool wifi_request_profile_connection(uint8_t index)
+{
+    skyorb_config_t config = {0};
+    ble_snapshot_skyorb_config(&config);
+    if (index >= config.wifi_count) return false;
+
+    wifi_config_select_profile(&config, index);
+    ble_store_skyorb_config(&config);
+
+    /* Stop the old station link's disconnect callback from racing a reconnect while the
+     * selected profile is being changed.  The network task owns the actual
+     * disconnect/scan/connect sequence. */
+    s_wifi_should_connect = false;
+    s_wifi_connect_requested = false;
+    s_wifi_connect_after_scan = s_skyorb_wifi_enabled;
+    s_wifi_scan_requested = s_skyorb_wifi_enabled;
+    s_wifi_connect_started = 0;
+    s_skyorb_disconnect_reason = 0;
+    s_wifi_link_state = s_skyorb_wifi_enabled ? WIFI_LINK_CONNECTING : WIFI_LINK_IDLE;
+    s_wifi_delete_profile = -1;
+    s_wifi_settings_dirty = true;
+    skyorb_mark_dirty();
+    ESP_LOGI(TAG, "[WIFI-SWITCH] queued profile %u (%s): disconnect -> scan -> connect",
+             (unsigned)index, config.ssid);
+    return true;
 }
 
 static void skyorb_disable_network(void)
 {
     s_skyorb_wifi_enabled = false;
+    s_wifi_should_connect = false;
+    s_wifi_connect_requested = false;
+    s_wifi_connect_after_scan = false;
+    s_wifi_scan_requested = false;
 
-    if (s_skyorb_http_server != NULL) {
-        (void)httpd_stop(s_skyorb_http_server);
-        s_skyorb_http_server = NULL;
-    }
     (void)esp_wifi_disconnect();
     const esp_err_t err = esp_wifi_stop();
     s_skyorb_network_started = false;
-    s_skyorb_ap_ready = false;
     s_skyorb_wifi_connected = false;
+    s_skyorb_disconnect_reason = 0;
+    s_wifi_scan_in_progress = false;
+    s_wifi_scan_status = ESP_ERR_INVALID_STATE;
+    memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
+    memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
+    s_wifi_link_state = WIFI_LINK_IDLE;
+    s_skyorb_last_fetch = 0;
+    s_skyorb_fetch_failed = false;
+    s_skyorb_fetch_failure_stage = NULL;
     s_skyorb_network_status = (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
     skyorb_mark_dirty();
     ESP_LOGI(TAG, "SkyOrb: Wi-Fi disabled; radar network paused (%s)",
@@ -5218,226 +6214,134 @@ static void skyorb_disable_network(void)
 static void skyorb_wifi_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     (void)arg;
-    (void)event_data;
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
-        s_skyorb_ap_ready = true;
-        s_skyorb_network_status = ESP_OK;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        s_wifi_link_state = WIFI_LINK_ASSOCIATED;
+        s_skyorb_disconnect_reason = 0;
         skyorb_mark_dirty();
-        ESP_LOGI(TAG, "SkyOrb: AP started, SSID=%s", SKYORB_AP_SSID);
-    }
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP) {
-        s_skyorb_ap_ready = false;
-        s_skyorb_network_status = ESP_ERR_INVALID_STATE;
-        skyorb_mark_dirty();
-        ESP_LOGW(TAG, "SkyOrb: AP stopped");
+        ESP_LOGI(TAG, "[WIFI-LINK] associated with AP; waiting for DHCP address");
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *disconnected =
+            (const wifi_event_sta_disconnected_t *)event_data;
+        s_skyorb_disconnect_reason = disconnected != NULL ? disconnected->reason : 0;
         s_skyorb_wifi_connected = false;
+        const bool authentication_failed =
+            s_skyorb_disconnect_reason == WIFI_REASON_AUTH_EXPIRE ||
+            s_skyorb_disconnect_reason == WIFI_REASON_AUTH_FAIL ||
+            s_skyorb_disconnect_reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT ||
+            s_skyorb_disconnect_reason == WIFI_REASON_HANDSHAKE_TIMEOUT ||
+            s_skyorb_disconnect_reason == WIFI_REASON_CONNECTION_FAIL;
+        const bool no_ap =
+            s_skyorb_disconnect_reason == WIFI_REASON_NO_AP_FOUND ||
+            s_skyorb_disconnect_reason == WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY ||
+            s_skyorb_disconnect_reason == WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD ||
+            s_skyorb_disconnect_reason == WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD;
+        if (authentication_failed) {
+            s_wifi_link_state = WIFI_LINK_AUTH_FAILED;
+            s_wifi_should_connect = false;
+        } else if (no_ap) {
+            s_wifi_link_state = WIFI_LINK_NO_AP;
+            s_wifi_should_connect = false;
+        } else if (s_wifi_should_connect) {
+            s_wifi_link_state = WIFI_LINK_CONNECTING;
+        } else if (s_wifi_link_state != WIFI_LINK_TIMEOUT &&
+                   s_wifi_link_state != WIFI_LINK_FAILED) {
+            s_wifi_link_state = WIFI_LINK_IDLE;
+        }
         skyorb_mark_dirty();
-        if (s_skyorb_wifi_enabled && s_skyorb_network_started) {
+        if (s_skyorb_wifi_enabled && s_skyorb_network_started && s_wifi_should_connect) {
             const esp_err_t retry = esp_wifi_connect();
-            ESP_LOGW(TAG, "SkyOrb: Wi-Fi disconnected; reconnect=%s", esp_err_to_name(retry));
+            ESP_LOGW(TAG, "[WIFI-LINK] disconnected reason=%u; reconnect=%s",
+                     (unsigned)s_skyorb_disconnect_reason, esp_err_to_name(retry));
         } else {
-            ESP_LOGW(TAG, "SkyOrb: Wi-Fi disconnected");
+            ESP_LOGW(TAG, "[WIFI-LINK] disconnected reason=%u; retry stopped state=%d",
+                     (unsigned)s_skyorb_disconnect_reason, (int)s_wifi_link_state);
         }
     }
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        s_skyorb_disconnect_reason = 0;
         s_skyorb_wifi_connected = true;
+        s_wifi_should_connect = false;
+        s_wifi_link_state = WIFI_LINK_CONNECTED;
+        s_skyorb_last_fetch = 0;
         s_skyorb_fetch_failed = false;
+        s_skyorb_fetch_failure_stage = NULL;
         s_skyorb_auto_location_attempted = false;
         skyorb_mark_dirty();
-        ESP_LOGI(TAG, "SkyOrb: Wi-Fi connected; location/ADS-B refresh enabled");
+        ESP_LOGI(TAG, "[WIFI-LINK] GOT_IP; location/ADS-B refresh enabled");
     }
 }
 
-static esp_err_t skyorb_http_root(httpd_req_t *request)
+static void wifi_scan_saved_network(void)
 {
-    const char page[] =
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<style>body{font:16px system-ui;background:#061526;color:#e7f5ff;margin:24px}"
-        "input,button{display:block;width:100%;box-sizing:border-box;margin:9px 0;padding:12px;"
-        "border-radius:10px;border:1px solid #2f7480;background:#0b2639;color:#fff}"
-        "button{background:#12a58f;font-weight:bold}a{color:#76efdc}</style>"
-        "<h2>PACON Settings</h2><p>Set the home Wi-Fi here. Radar location and range are in a separate menu."
-        "</p><form method=post action=/wifi><label>Wi-Fi name</label><input name=ssid maxlength=32 required>"
-        "<label>Wi-Fi password</label><input name=password type=password maxlength=64 required>"
-        "<button>Save Wi-Fi and connect</button></form>"
-        "<p><a href='/location'>Radar location and range</a></p>";
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
-}
-
-static bool skyorb_http_read_form(httpd_req_t *request, char *form, size_t form_size)
-{
-    if (form_size == 0 || request->content_len <= 0 || request->content_len >= (int)form_size) {
-        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid form");
-        return false;
+    s_wifi_scan_in_progress = true;
+    s_wifi_scan_status = ESP_ERR_INVALID_STATE;
+    memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
+    memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
+    for (uint8_t index = 0; index < WIFI_PROFILE_MAX; ++index) {
+        s_wifi_profile_rssi[index] = -127;
     }
-    memset(form, 0, form_size);
-    int received = 0;
-    while (received < request->content_len) {
-        int count = httpd_req_recv(request, form + received, request->content_len - received);
-        if (count <= 0) {
-            httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "Read failed");
-            return false;
+    s_wifi_settings_dirty = true;
+
+    wifi_scan_config_t scan = {0};
+    scan.show_hidden = true;
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    esp_err_t err = esp_wifi_scan_start(&scan, true);
+    if (err == ESP_OK) {
+        uint16_t count = 16;
+        wifi_ap_record_t records[16] = {0};
+        err = esp_wifi_scan_get_ap_records(&count, records);
+        if (err == ESP_OK) {
+            skyorb_config_t config = {0};
+            xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
+            config = s_skyorb_config;
+            xSemaphoreGive(s_skyorb_mutex);
+            for (uint16_t index = 0; index < count; ++index) {
+                for (uint8_t profile = 0; profile < config.wifi_count; ++profile) {
+                    if (strcmp((const char *)records[index].ssid,
+                               config.wifi_profiles[profile].ssid) != 0) continue;
+                    if (!s_wifi_profile_visible[profile] ||
+                        records[index].rssi > s_wifi_profile_rssi[profile]) {
+                        s_wifi_profile_visible[profile] = true;
+                        s_wifi_profile_rssi[profile] = records[index].rssi;
+                        s_wifi_profile_ap[profile] = records[index];
+                        s_wifi_profile_ap_valid[profile] = true;
+                    }
+                    ESP_LOGI(TAG,
+                             "[WIFI-SCAN] saved[%u] SSID=%s BSSID=%02X:%02X:%02X:%02X:%02X:%02X channel=%u auth=%d rssi=%d",
+                             (unsigned)profile, records[index].ssid,
+                             records[index].bssid[0], records[index].bssid[1],
+                             records[index].bssid[2], records[index].bssid[3],
+                             records[index].bssid[4], records[index].bssid[5],
+                             (unsigned)records[index].primary,
+                             (int)records[index].authmode, (int)records[index].rssi);
+                    break;
+                }
+            }
         }
-        received += count;
     }
-    return true;
-}
-
-static esp_err_t skyorb_http_wifi_save(httpd_req_t *request)
-{
-    char form[192];
-    if (!skyorb_http_read_form(request, form, sizeof(form))) return ESP_FAIL;
+    s_wifi_scan_status = err;
+    s_wifi_scan_in_progress = false;
+    s_wifi_settings_dirty = true;
+    unsigned visible_count = 0;
     skyorb_config_t config = {0};
     xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
     config = s_skyorb_config;
     xSemaphoreGive(s_skyorb_mutex);
-    const bool fields_ok = skyorb_form_value(form, "ssid", config.ssid, sizeof(config.ssid)) &&
-                           skyorb_form_value(form, "password", config.password,
-                                              sizeof(config.password));
-    config.wifi_valid = fields_ok && config.ssid[0] != '\0';
-    if (!config.wifi_valid) {
-        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid Wi-Fi details");
-        return ESP_FAIL;
+    for (uint8_t index = 0; index < config.wifi_count; ++index) {
+        if (s_wifi_profile_visible[index]) ++visible_count;
     }
-    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-    s_skyorb_config = config;
-    s_skyorb_range_index = config.range_index;
-    s_skyorb_setup_saved = true;
-    xSemaphoreGive(s_skyorb_mutex);
-    skyorb_save_config(&config);
-    skyorb_mark_dirty();
-    ESP_LOGI(TAG, "SkyOrb: saved home Wi-Fi %s", config.ssid);
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    return httpd_resp_sendstr(request,
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<body style='font:18px system-ui;background:#061526;color:#e7f5ff;padding:24px'>"
-        "Wi-Fi saved. Return from Settings on PACON to join it. "
-        "<a style='color:#76efdc' href='/location'>Radar location and range</a></body>");
-}
-
-static esp_err_t skyorb_http_location(httpd_req_t *request)
-{
-    skyorb_config_t config = {0};
-    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-    config = s_skyorb_config;
-    xSemaphoreGive(s_skyorb_mutex);
-    const float latitude = config.location_valid ? config.latitude : 0.0f;
-    const float longitude = config.location_valid ? config.longitude : 0.0f;
-    char page[1900];
-    snprintf(page, sizeof(page),
-        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<style>body{font:16px system-ui;background:#061526;color:#e7f5ff;margin:24px}"
-        "input,button,select{display:block;width:100%%;box-sizing:border-box;margin:9px 0;padding:12px;"
-        "border-radius:10px;border:1px solid #2f7480;background:#0b2639;color:#fff}"
-        "button{background:#12a58f;font-weight:bold}a{color:#76efdc}</style>"
-        "<h2>Radar location</h2><p>Automatic mode uses the Internet connection's public IP. "
-        "It is usually city-level, so enter coordinates here for precise nearby aircraft.</p>"
-        "<form method=post action=/location/save><label>Latitude</label>"
-        "<input name=lat value='%.6f' required><label>Longitude</label>"
-        "<input name=lon value='%.6f' required><label>Radar range</label>"
-        "<select name=range><option value=0%s>5 km</option><option value=1%s>10 km</option>"
-        "<option value=2%s>15 km</option><option value=3%s>25 km</option></select>"
-        "<button>Save manual location</button></form><form method=post action=/location/auto>"
-        "<button>Use automatic network location</button></form><p><a href='/'>Home Wi-Fi</a></p>",
-        (double)latitude, (double)longitude,
-        config.range_index == 0 ? " selected" : "", config.range_index == 1 ? " selected" : "",
-        config.range_index == 2 ? " selected" : "", config.range_index == 3 ? " selected" : "");
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    return httpd_resp_send(request, page, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t skyorb_http_location_save(httpd_req_t *request)
-{
-    char form[160];
-    if (!skyorb_http_read_form(request, form, sizeof(form))) return ESP_FAIL;
-    char latitude[24] = {0};
-    char longitude[24] = {0};
-    char range[8] = {0};
-    const bool fields_ok = skyorb_form_value(form, "lat", latitude, sizeof(latitude)) &&
-                           skyorb_form_value(form, "lon", longitude, sizeof(longitude)) &&
-                           skyorb_form_value(form, "range", range, sizeof(range));
-    const float lat = strtof(latitude, NULL);
-    const float lon = strtof(longitude, NULL);
-    if (!fields_ok || !isfinite(lat) || !isfinite(lon) || fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) {
-        httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "Invalid location");
-        return ESP_FAIL;
-    }
-    skyorb_config_t config = {0};
-    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-    config = s_skyorb_config;
-    config.latitude = lat;
-    config.longitude = lon;
-    config.range_index = (uint8_t)clamp_int(atoi(range), 0, 3);
-    config.location_valid = true;
-    config.location_auto = false;
-    s_skyorb_config = config;
-    s_skyorb_range_index = config.range_index;
-    xSemaphoreGive(s_skyorb_mutex);
-    skyorb_save_config(&config);
-    skyorb_mark_dirty();
-    ESP_LOGI(TAG, "SkyOrb: saved manual location %.5f, %.5f", (double)lat, (double)lon);
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    return httpd_resp_sendstr(request,
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<body style='font:18px system-ui;background:#061526;color:#e7f5ff;padding:24px'>"
-        "Location saved. Radar updates on its next refresh.</body>");
-}
-
-static esp_err_t skyorb_http_location_auto(httpd_req_t *request)
-{
-    skyorb_config_t config = {0};
-    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-    config = s_skyorb_config;
-    config.location_valid = false;
-    config.location_auto = true;
-    s_skyorb_config = config;
-    s_skyorb_auto_location_attempted = false;
-    xSemaphoreGive(s_skyorb_mutex);
-    skyorb_save_config(&config);
-    skyorb_mark_dirty();
-    httpd_resp_set_type(request, "text/html; charset=utf-8");
-    return httpd_resp_sendstr(request,
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<body style='font:18px system-ui;background:#061526;color:#e7f5ff;padding:24px'>"
-        "Automatic location requested. PACON will resolve it after it joins Wi-Fi.</body>");
-}
-
-static void skyorb_start_http_server(void)
-{
-    if (s_skyorb_http_server != NULL) return;
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 4096;
-    config.max_uri_handlers = 6;
-    if (httpd_start(&s_skyorb_http_server, &config) != ESP_OK) {
-        ESP_LOGE(TAG, "SkyOrb: setup web server failed");
-        return;
-    }
-    const httpd_uri_t root = {.uri = "/", .method = HTTP_GET, .handler = skyorb_http_root};
-    const httpd_uri_t wifi = {.uri = "/wifi", .method = HTTP_POST, .handler = skyorb_http_wifi_save};
-    const httpd_uri_t location = {.uri = "/location", .method = HTTP_GET, .handler = skyorb_http_location};
-    const httpd_uri_t location_save = {.uri = "/location/save", .method = HTTP_POST,
-                                       .handler = skyorb_http_location_save};
-    const httpd_uri_t location_auto = {.uri = "/location/auto", .method = HTTP_POST,
-                                       .handler = skyorb_http_location_auto};
-    (void)httpd_register_uri_handler(s_skyorb_http_server, &root);
-    (void)httpd_register_uri_handler(s_skyorb_http_server, &wifi);
-    (void)httpd_register_uri_handler(s_skyorb_http_server, &location);
-    (void)httpd_register_uri_handler(s_skyorb_http_server, &location_save);
-    (void)httpd_register_uri_handler(s_skyorb_http_server, &location_auto);
+    ESP_LOGI(TAG, "Wi-Fi scan complete: %s saved_visible=%u/%u",
+             esp_err_to_name(err), visible_count, (unsigned)config.wifi_count);
 }
 
 static bool skyorb_network_failure(const char *stage, esp_err_t err)
 {
-    s_skyorb_wifi_enabled = false;
     s_skyorb_network_started = false;
-    s_skyorb_ap_ready = false;
     s_skyorb_network_status = err;
     s_skyorb_fetch_failed = true;
     skyorb_mark_dirty();
-    ESP_LOGE(TAG, "SkyOrb AP: %s failed: %s (0x%X)", stage, esp_err_to_name(err),
+    ESP_LOGE(TAG, "Wi-Fi STA: %s failed: %s (0x%X)", stage, esp_err_to_name(err),
              (unsigned)err);
     return false;
 }
@@ -5446,19 +6350,12 @@ static bool skyorb_start_network(void)
 {
     const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    ESP_LOGI(TAG, "[WIFI-DBG] start begin: started=%d ap_ready=%d connected=%d task_started=%d",
-             (int)s_skyorb_network_started, (int)s_skyorb_ap_ready,
+    ESP_LOGI(TAG, "[WIFI-DBG] start begin: started=%d connected=%d task_started=%d",
+             (int)s_skyorb_network_started,
              (int)s_skyorb_wifi_connected, (int)s_skyorb_network_task_started);
     ESP_LOGI(TAG, "[WIFI-DBG] internal heap before start: free=%u largest=%u",
              (unsigned)internal_free, (unsigned)internal_largest);
-    /* SoftAP needs a contiguous internal beacon buffer. Refuse the request
-     * before esp_wifi_start if the heap is already too fragmented. */
-    if (internal_largest < 4096U) {
-        return skyorb_network_failure("insufficient internal heap for SoftAP", ESP_ERR_NO_MEM);
-    }
-    if (s_skyorb_network_started && s_skyorb_ap_ready) return true;
-    const bool switching_from_station = s_skyorb_network_started;
-    s_skyorb_ap_ready = false;
+    if (s_skyorb_network_started) return true;
     s_skyorb_network_status = ESP_ERR_INVALID_STATE;
     skyorb_mark_dirty();
 
@@ -5474,11 +6371,11 @@ static bool skyorb_start_network(void)
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return skyorb_network_failure("event loop", err);
     }
-    if (s_skyorb_ap_netif == NULL) {
-        ESP_LOGI(TAG, "[WIFI-DBG] creating AP netif");
-        s_skyorb_ap_netif = esp_netif_create_default_wifi_ap();
-        if (s_skyorb_ap_netif == NULL) {
-            return skyorb_network_failure("AP netif creation", ESP_ERR_NO_MEM);
+    if (s_skyorb_sta_netif == NULL) {
+        ESP_LOGI(TAG, "[WIFI-DBG] creating STA netif");
+        s_skyorb_sta_netif = esp_netif_create_default_wifi_sta();
+        if (s_skyorb_sta_netif == NULL) {
+            return skyorb_network_failure("STA netif creation", ESP_ERR_NO_MEM);
         }
     }
     wifi_init_config_t wifi_init = WIFI_INIT_CONFIG_DEFAULT();
@@ -5486,13 +6383,16 @@ static bool skyorb_start_network(void)
      * alive while Wi-Fi is enabled.  The generated defaults are intentionally
      * conservative, but make the values explicit here as well so an older
      * sdkconfig cannot silently restore the 16/32-buffer profile. */
-    wifi_init.static_rx_buf_num = 2;
-    wifi_init.dynamic_rx_buf_num = 2;
-    wifi_init.static_tx_buf_num = 4;
+    /* Two RX buffers were enough to scan but repeatedly lost authentication
+     * exchanges (AUTH_EXPIRE / CONNECTION_FAIL).  Keep this far below the
+     * IDF defaults while allowing a complete WPA handshake. */
+    wifi_init.static_rx_buf_num = 4;
+    wifi_init.dynamic_rx_buf_num = 8;
+    wifi_init.static_tx_buf_num = 6;
     wifi_init.dynamic_tx_buf_num = 0;
-    wifi_init.cache_tx_buf_num = 4;
-    wifi_init.rx_mgmt_buf_num = 2;
-    wifi_init.rx_ba_win = 2;
+    wifi_init.cache_tx_buf_num = 8;
+    wifi_init.rx_mgmt_buf_num = 4;
+    wifi_init.rx_ba_win = 4;
     wifi_init.mgmt_sbuf_num = 6; /* IDF minimum */
     ESP_LOGI(TAG, "[WIFI-DBG] init buffers: static_rx=%d dynamic_rx=%d static_tx=%d cache_tx=%d rx_mgmt=%d ba=%d mgmt_sbuf=%d",
              wifi_init.static_rx_buf_num, wifi_init.dynamic_rx_buf_num,
@@ -5502,17 +6402,9 @@ static bool skyorb_start_network(void)
     ESP_LOGI(TAG, "[WIFI-DBG] initializing Wi-Fi driver");
     err = esp_wifi_init(&wifi_init);
     if (err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "SkyOrb AP: Wi-Fi driver was already initialized; reusing it");
+        ESP_LOGW(TAG, "Wi-Fi STA: driver was already initialized; reusing it");
     } else if (err != ESP_OK) {
         return skyorb_network_failure("Wi-Fi driver init", err);
-    }
-    if (switching_from_station) {
-        (void)esp_wifi_disconnect();
-        err = esp_wifi_stop();
-        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-            return skyorb_network_failure("stop STA for setup AP", err);
-        }
-        s_skyorb_wifi_connected = false;
     }
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (err != ESP_OK) {
@@ -5523,17 +6415,8 @@ static bool skyorb_start_network(void)
         (void)esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, skyorb_wifi_event, NULL);
         s_skyorb_wifi_events_registered = true;
     }
-    wifi_config_t access_point = {0};
-    snprintf((char *)access_point.ap.ssid, sizeof(access_point.ap.ssid), "%s", SKYORB_AP_SSID);
-    snprintf((char *)access_point.ap.password, sizeof(access_point.ap.password), "%s", SKYORB_AP_PASSWORD);
-    access_point.ap.ssid_len = strlen(SKYORB_AP_SSID);
-    /* Channel 6 is the verified compatible broadcast channel on this board. */
-    access_point.ap.channel = 6;
-    access_point.ap.authmode = WIFI_AUTH_WPA2_PSK;
-    access_point.ap.max_connection = 4;
-    /* APSTA makes this board's SoftAP undiscoverable to phones.  Keep a stable
-     * AP for configuration; a submitted home-Wi-Fi setup will later switch to
-     * STA after the HTTP response is sent. */
+    /* The watch-style Wi-Fi page uses STA-only mode. Provisioning is handled
+     * over BLE or from saved profiles on the board. */
     wifi_country_t country = {
         .cc = "CN",
         .schan = 1,
@@ -5543,62 +6426,41 @@ static bool skyorb_start_network(void)
     };
     err = esp_wifi_set_country(&country);
     if (err != ESP_OK) return skyorb_network_failure("set CN RF domain", err);
-    err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) return skyorb_network_failure("set AP mode", err);
-    err = esp_wifi_set_config(WIFI_IF_AP, &access_point);
-    if (err != ESP_OK) return skyorb_network_failure("AP configuration", err);
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return skyorb_network_failure("set STA mode", err);
     err = esp_wifi_start();
     bool driver_already_running = false;
     if (err == ESP_ERR_INVALID_STATE) {
         wifi_mode_t mode = WIFI_MODE_NULL;
-        if (esp_wifi_get_mode(&mode) == ESP_OK && (mode == WIFI_MODE_AP || mode == WIFI_MODE_APSTA)) {
+        if (esp_wifi_get_mode(&mode) == ESP_OK && mode == WIFI_MODE_STA) {
             driver_already_running = true;
             err = ESP_OK;
-            s_skyorb_ap_ready = true;
-            ESP_LOGW(TAG, "SkyOrb AP: Wi-Fi was already started; APSTA configuration reused");
+            ESP_LOGW(TAG, "Wi-Fi STA was already started; reusing driver");
         }
     }
     if (err != ESP_OK) {
-        return skyorb_network_failure("AP start", err);
+        return skyorb_network_failure("STA start", err);
+    }
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        return skyorb_network_failure("disable STA power save", err);
     }
     s_skyorb_network_started = true;
     if (driver_already_running) s_skyorb_network_status = ESP_OK;
     skyorb_load_config();
-    skyorb_start_http_server();
     wifi_mode_t mode = WIFI_MODE_NULL;
-    wifi_config_t checked_ap = {0};
     const esp_err_t mode_err = esp_wifi_get_mode(&mode);
-    const esp_err_t config_err = esp_wifi_get_config(WIFI_IF_AP, &checked_ap);
-    ESP_LOGI(TAG, "SkyOrb AP: start=%s event_ready=%d mode=%s/%d config=%s ssid=%s",
-             driver_already_running ? "already-running" : "requested", (int)s_skyorb_ap_ready,
-             esp_err_to_name(mode_err), (int)mode, esp_err_to_name(config_err),
-             checked_ap.ap.ssid);
-    ESP_LOGI(TAG, "SkyOrb AP: SSID=%s channel=%u WPA2 URL=http://192.168.4.1",
-             SKYORB_AP_SSID, (unsigned)checked_ap.ap.channel);
+    ESP_LOGI(TAG, "Wi-Fi STA: start=%s mode=%s/%d; waiting for scan/selection",
+             driver_already_running ? "already-running" : "requested",
+             esp_err_to_name(mode_err), (int)mode);
     return true;
 }
 
-/* Bring up the saved home network when credentials exist.  The SoftAP is
- * retained only as the fallback provisioning path; it is not the meaning of
- * the Settings Wi-Fi switch. */
+/* Bring up STA-only networking. Provisioning is handled over BLE or the
+ * board's saved-profile settings page. */
 static bool skyorb_start_requested_network(void)
 {
-    if (!skyorb_start_network()) return false;
-
-    skyorb_config_t config = {0};
-    xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-    config = s_skyorb_config;
-    xSemaphoreGive(s_skyorb_mutex);
-    if (!config.wifi_valid) return true;
-
-    if (s_skyorb_http_server != NULL) {
-        (void)httpd_stop(s_skyorb_http_server);
-        s_skyorb_http_server = NULL;
-    }
-    if (!skyorb_connect_saved_station()) {
-        return skyorb_network_failure("saved Wi-Fi connection", s_skyorb_network_status);
-    }
-    return true;
+    return skyorb_start_network();
 }
 
 static float skyorb_json_number(const cJSON *object, const char *name, float fallback)
@@ -5627,11 +6489,20 @@ static bool skyorb_fetch_aircraft(void)
     config = s_skyorb_config;
     const uint8_t range_index = s_skyorb_range_index;
     xSemaphoreGive(s_skyorb_mutex);
-    if (!config.wifi_valid || !config.location_valid || !s_skyorb_wifi_connected) return false;
+    if (!config.wifi_valid || !config.location_valid || !s_skyorb_wifi_connected) {
+        s_skyorb_fetch_failure_stage = "STATE RETRY";
+        ESP_LOGW(TAG, "[SKYORB-FETCH] stage=state wifi_valid=%d location_valid=%d connected=%d",
+                 (int)config.wifi_valid, (int)config.location_valid,
+                 (int)s_skyorb_wifi_connected);
+        return false;
+    }
     const float fetch_km = s_skyorb_ranges_km[range_index] * 1.6f;
     const float fetch_nm = fetch_km / 1.852f;
     char url[160];
-    snprintf(url, sizeof(url), "https://api.airplanes.live/v2/point/%.5f/%.5f/%.1f",
+    /* ADSB.lol exposes the same readsb-compatible `ac` response used by this
+     * parser.  Airplanes.live currently returns a project-approval HTTP 403 to
+     * this deployment, so do not hammer that endpoint with retries. */
+    snprintf(url, sizeof(url), "https://api.adsb.lol/v2/point/%.5f/%.5f/%.1f",
              (double)config.latitude, (double)config.longitude, (double)fetch_nm);
     esp_http_client_config_t http_config = {
         .url = url,
@@ -5640,11 +6511,26 @@ static bool skyorb_fetch_aircraft(void)
         .keep_alive_enable = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
-    if (client == NULL) return false;
+    if (client == NULL) {
+        s_skyorb_fetch_failure_stage = "MEM RETRY";
+        ESP_LOGE(TAG, "[SKYORB-FETCH] stage=client_init free_internal=%u largest_internal=%u free_psram=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        return false;
+    }
+    (void)esp_http_client_set_header(client, "User-Agent",
+                                    "PaconRadar/1.0 (+https://github.com/rmjskhy/Pacon)");
+    (void)esp_http_client_set_header(client, "Accept", "application/json");
     esp_err_t err = esp_http_client_open(client, 0);
     int header_length = err == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
     if (err != ESP_OK || header_length > 65536) {
-        ESP_LOGW(TAG, "SkyOrb: ADS-B open failed: %s", esp_err_to_name(err));
+        s_skyorb_fetch_failure_stage = "NET/TLS RETRY";
+        ESP_LOGW(TAG, "[SKYORB-FETCH] stage=open err=%s(0x%X) headers=%d free_internal=%u largest_internal=%u free_psram=%u url=%s",
+                 esp_err_to_name(err), (unsigned)err, header_length,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT), url);
         esp_http_client_cleanup(client);
         return false;
     }
@@ -5652,6 +6538,8 @@ static bool skyorb_fetch_aircraft(void)
     char *body = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (body == NULL) body = malloc(capacity);
     if (body == NULL) {
+        s_skyorb_fetch_failure_stage = "MEM RETRY";
+        ESP_LOGE(TAG, "[SKYORB-FETCH] stage=body_alloc bytes=%u", (unsigned)capacity);
         esp_http_client_cleanup(client);
         return false;
     }
@@ -5659,6 +6547,9 @@ static bool skyorb_fetch_aircraft(void)
     while (total + 1 < capacity) {
         int read = esp_http_client_read(client, body + total, capacity - total - 1);
         if (read < 0) {
+            s_skyorb_fetch_failure_stage = "READ RETRY";
+            ESP_LOGW(TAG, "[SKYORB-FETCH] stage=body_read err=%d bytes=%u",
+                     read, (unsigned)total);
             total = 0;
             break;
         }
@@ -5670,14 +6561,18 @@ static bool skyorb_fetch_aircraft(void)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     if (status != 200 || total == 0) {
-        ESP_LOGW(TAG, "SkyOrb: ADS-B HTTP=%d body=%u", status, (unsigned)total);
+        s_skyorb_fetch_failure_stage = status == 200 ? "READ RETRY" : "HTTP RETRY";
+        const size_t preview_length = total < 120U ? total : 120U;
+        ESP_LOGW(TAG, "[SKYORB-FETCH] stage=http status=%d body=%u preview=%.*s", status,
+                 (unsigned)total, (int)preview_length, body);
         free(body);
         return false;
     }
     cJSON *root = cJSON_ParseWithLength(body, total);
     free(body);
     if (root == NULL) {
-        ESP_LOGW(TAG, "SkyOrb: ADS-B JSON parse failed");
+        s_skyorb_fetch_failure_stage = "JSON RETRY";
+        ESP_LOGW(TAG, "[SKYORB-FETCH] stage=json_parse bytes=%u", (unsigned)total);
         return false;
     }
     cJSON *list = cJSON_GetObjectItemCaseSensitive(root, "ac");
@@ -5713,6 +6608,7 @@ static bool skyorb_fetch_aircraft(void)
     s_skyorb_aircraft_count = count;
     s_skyorb_demo_mode = false;
     s_skyorb_fetch_failed = false;
+    s_skyorb_fetch_failure_stage = NULL;
     s_skyorb_last_success = xTaskGetTickCount();
     xSemaphoreGive(s_skyorb_mutex);
     skyorb_mark_dirty();
@@ -5725,30 +6621,35 @@ static bool skyorb_fetch_aircraft(void)
  * API key and a third-party Wi-Fi database.  A single HTTPS lookup of the
  * connected network's public IP is key-free and gives a useful city-level
  * fallback.  Manual coordinates always override it. */
-static bool skyorb_locate_from_network_ip(void)
+static skyorb_location_result_t skyorb_try_location_provider(const char *url,
+                                                              bool require_success,
+                                                              float *latitude,
+                                                              float *longitude)
 {
-    if (!s_skyorb_wifi_connected) return false;
     const esp_http_client_config_t http_config = {
-        .url = "https://ipwho.is/",
+        .url = url,
         .timeout_ms = 7000,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .keep_alive_enable = true,
+        .keep_alive_enable = false,
     };
     esp_http_client_handle_t client = esp_http_client_init(&http_config);
-    if (client == NULL) return false;
-    esp_err_t err = esp_http_client_open(client, 0);
+    if (client == NULL) return SKYORB_LOCATION_ERR_CLIENT;
+    (void)esp_http_client_set_header(client, "User-Agent", "PACON/1.0");
+    const esp_err_t err = esp_http_client_open(client, 0);
     const int64_t header_length = err == ESP_OK ? esp_http_client_fetch_headers(client) : -1;
     if (err != ESP_OK || header_length > 8192) {
-        ESP_LOGW(TAG, "SkyOrb: automatic location open failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "SkyOrb: location provider %s open failed: %s", url,
+                 esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        return false;
+        return SKYORB_LOCATION_ERR_OPEN;
     }
     char body[4096];
     size_t total = 0;
+    bool read_failed = false;
     while (total + 1 < sizeof(body)) {
         const int read = esp_http_client_read(client, body + total, sizeof(body) - total - 1);
         if (read < 0) {
-            total = 0;
+            read_failed = true;
             break;
         }
         if (read == 0) break;
@@ -5758,21 +6659,54 @@ static bool skyorb_locate_from_network_ip(void)
     const int status = esp_http_client_get_status_code(client);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (status != 200 || total == 0) {
-        ESP_LOGW(TAG, "SkyOrb: automatic location HTTP=%d", status);
-        return false;
+    if (read_failed || total == 0) {
+        ESP_LOGW(TAG, "SkyOrb: location provider %s returned no body", url);
+        return SKYORB_LOCATION_ERR_RESPONSE;
+    }
+    if (status != 200) {
+        ESP_LOGW(TAG, "SkyOrb: location provider %s HTTP=%d", url, status);
+        return SKYORB_LOCATION_ERR_HTTP;
     }
     cJSON *root = cJSON_ParseWithLength(body, total);
     const cJSON *ok = root == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(root, "success");
-    const float latitude = root == NULL ? NAN : skyorb_json_number(root, "latitude", NAN);
-    const float longitude = root == NULL ? NAN : skyorb_json_number(root, "longitude", NAN);
-    const bool valid = cJSON_IsTrue(ok) && isfinite(latitude) && isfinite(longitude) &&
-                       fabsf(latitude) <= 90.0f && fabsf(longitude) <= 180.0f;
+    const float parsed_latitude = root == NULL ? NAN : skyorb_json_number(root, "latitude", NAN);
+    const float parsed_longitude = root == NULL ? NAN : skyorb_json_number(root, "longitude", NAN);
+    const bool valid = (!require_success || cJSON_IsTrue(ok)) &&
+                       isfinite(parsed_latitude) && isfinite(parsed_longitude) &&
+                       fabsf(parsed_latitude) <= 90.0f && fabsf(parsed_longitude) <= 180.0f;
     cJSON_Delete(root);
     if (!valid) {
-        ESP_LOGW(TAG, "SkyOrb: automatic location response was invalid");
-        return false;
+        ESP_LOGW(TAG, "SkyOrb: location provider %s response was invalid", url);
+        return SKYORB_LOCATION_ERR_PARSE;
     }
+    *latitude = parsed_latitude;
+    *longitude = parsed_longitude;
+    return SKYORB_LOCATION_READY;
+}
+
+static skyorb_location_result_t skyorb_locate_from_network_ip(void)
+{
+    if (!s_skyorb_wifi_connected) return SKYORB_LOCATION_REQUESTED;
+    static const struct {
+        const char *url;
+        bool require_success;
+    } providers[] = {
+        /* ipapi.co documents this key-free HTTPS endpoint for client IP lookup. */
+        {"https://ipapi.co/json/", false},
+        /* ipwhois documents its free endpoint as HTTP; it is a fallback for
+         * networks on which the first provider is unreachable. */
+        {"http://ipwho.is/", true},
+    };
+    float latitude = NAN;
+    float longitude = NAN;
+    skyorb_location_result_t result = SKYORB_LOCATION_ERR_OPEN;
+    for (size_t i = 0; i < sizeof(providers) / sizeof(providers[0]); ++i) {
+        result = skyorb_try_location_provider(providers[i].url,
+                                              providers[i].require_success,
+                                              &latitude, &longitude);
+        if (result == SKYORB_LOCATION_READY) break;
+    }
+    if (result != SKYORB_LOCATION_READY) return result;
     skyorb_config_t config = {0};
     xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
     config = s_skyorb_config;
@@ -5789,7 +6723,7 @@ static bool skyorb_locate_from_network_ip(void)
     skyorb_mark_dirty();
     ESP_LOGI(TAG, "SkyOrb: automatic network location %.4f, %.4f", (double)config.latitude,
              (double)config.longitude);
-    return true;
+    return SKYORB_LOCATION_READY;
 }
 
 static void skyorb_network_task(void *argument)
@@ -5805,8 +6739,8 @@ static void skyorb_network_task(void *argument)
         return;
     }
     ESP_LOGI(TAG, "[WIFI-DBG] network task startup complete; entering service loop");
-    /* Do not call esp_wifi_scan_start() while this SoftAP is active.  On this
-     * board, an active scan makes the AP disappear from phones. */
+    /* Serialize STA scan/connect operations in this task so switching saved
+     * profiles cannot race Wi-Fi event callbacks. */
     while (true) {
         if (!s_skyorb_wifi_enabled) {
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -5823,7 +6757,45 @@ static void skyorb_network_task(void *argument)
                 continue;
             }
         }
+        if (s_wifi_scan_requested &&
+            (!s_skyorb_wifi_connected || s_wifi_connect_after_scan)) {
+            s_wifi_scan_requested = false;
+            if (s_wifi_connect_after_scan) {
+                /* esp_wifi_set_config()+esp_wifi_connect() does not reliably
+                 * switch away from an established AP.  Leave it first and
+                 * allow the disconnect event to settle before scanning. */
+                s_wifi_should_connect = false;
+                const esp_err_t leave = esp_wifi_disconnect();
+                if (leave == ESP_OK) vTaskDelay(pdMS_TO_TICKS(120));
+                ESP_LOGI(TAG, "[WIFI-SWITCH] old link left: %s",
+                         esp_err_to_name(leave));
+            }
+            wifi_scan_saved_network();
+            if (s_wifi_connect_after_scan) {
+                s_wifi_connect_after_scan = false;
+                s_wifi_connect_requested = true;
+                ESP_LOGI(TAG, "[WIFI-SWITCH] fresh scan complete; starting selected profile");
+            }
+        }
+        if (s_wifi_connect_requested) {
+            s_wifi_connect_requested = false;
+            s_wifi_should_connect = true;
+            s_skyorb_disconnect_reason = 0;
+            if (!skyorb_connect_saved_station()) {
+                s_wifi_should_connect = false;
+            }
+            s_wifi_settings_dirty = true;
+        }
         const TickType_t now = xTaskGetTickCount();
+        if (s_wifi_should_connect && !s_skyorb_wifi_connected &&
+            s_wifi_connect_started != 0 &&
+            (int32_t)(now - s_wifi_connect_started) >= pdMS_TO_TICKS(15000)) {
+            s_wifi_should_connect = false;
+            s_wifi_link_state = WIFI_LINK_TIMEOUT;
+            (void)esp_wifi_disconnect();
+            skyorb_mark_dirty();
+            ESP_LOGW(TAG, "[WIFI-LINK] connection timed out after 15 seconds");
+        }
         skyorb_config_t config = {0};
         xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
         config = s_skyorb_config;
@@ -5832,22 +6804,33 @@ static void skyorb_network_task(void *argument)
             (!config.location_valid || config.location_auto)) {
             s_skyorb_auto_location_attempted = true;
             s_skyorb_location_in_progress = true;
-            const bool located = skyorb_locate_from_network_ip();
+            s_skyorb_location_result = SKYORB_LOCATION_IN_PROGRESS;
+            const skyorb_location_result_t located = skyorb_locate_from_network_ip();
+            s_skyorb_location_result = located;
             s_skyorb_location_in_progress = false;
-            if (!located) {
-                s_skyorb_fetch_failed = true;
+            if (located != SKYORB_LOCATION_READY) {
+                /* Location discovery and aircraft-data retrieval are separate
+                 * states.  A blocked IP-location service must lead the user
+                 * to SET LOCATION, not masquerade as an ADS-B data failure. */
                 skyorb_mark_dirty();
             }
         }
-        if (s_skyorb_wifi_connected && !s_skyorb_fetch_in_progress &&
+        const uint32_t fetch_interval_ms = s_skyorb_fetch_failed ?
+                                           SKYORB_FETCH_RETRY_MS : SKYORB_FETCH_PERIOD_MS;
+        if (s_skyorb_wifi_connected && config.location_valid &&
+            !s_skyorb_fetch_in_progress &&
             (s_skyorb_last_fetch == 0 ||
-             (int32_t)(now - s_skyorb_last_fetch) >= pdMS_TO_TICKS(SKYORB_FETCH_PERIOD_MS))) {
+             (int32_t)(now - s_skyorb_last_fetch) >= pdMS_TO_TICKS(fetch_interval_ms))) {
             s_skyorb_fetch_in_progress = true;
             s_skyorb_last_fetch = now;
             const bool success = skyorb_fetch_aircraft();
             if (!success) {
                 s_skyorb_fetch_failed = true;
                 skyorb_mark_dirty();
+                ESP_LOGW(TAG, "[SKYORB-FETCH] failed stage=%s; retry_in=%u_ms",
+                         s_skyorb_fetch_failure_stage != NULL ?
+                         s_skyorb_fetch_failure_stage : "UNKNOWN RETRY",
+                         (unsigned)SKYORB_FETCH_RETRY_MS);
             }
             s_skyorb_fetch_in_progress = false;
         }
@@ -5951,6 +6934,78 @@ static void skyorb_text(const char *text, int origin_x, int line_top,
     skyorb_text_clipped(text, origin_x, line_top, font, colour, NULL);
 }
 
+static int skyorb_text_width(const char *text, const lv_font_t *font)
+{
+    int width = 0;
+    for (size_t index = 0; text[index] != '\0'; ++index) {
+        lv_font_glyph_dsc_t glyph;
+        const uint32_t next = (uint8_t)text[index + 1];
+        if (lv_font_get_glyph_dsc(font, &glyph, (uint8_t)text[index], next)) {
+            width += glyph.adv_w;
+        }
+    }
+    return width;
+}
+
+static void skyorb_text_centered(const char *text, int center_x, int line_top,
+                                 const lv_font_t *font, uint16_t colour)
+{
+    skyorb_text(text, center_x - skyorb_text_width(text, font) / 2,
+                line_top, font, colour);
+}
+
+static bool watch_text_visible_bounds(const char *text, const lv_font_t *font,
+                                      int *visible_left, int *visible_right)
+{
+    if (text == NULL || font == NULL || visible_left == NULL || visible_right == NULL) {
+        return false;
+    }
+
+    int pen_x = 0;
+    int min_x = 0;
+    int max_x = 0;
+    bool found = false;
+    for (size_t index = 0; text[index] != '\0'; ++index) {
+        lv_font_glyph_dsc_t glyph;
+        const uint32_t next = (uint8_t)text[index + 1];
+        if (!lv_font_get_glyph_dsc(font, &glyph, (uint8_t)text[index], next)) {
+            continue;
+        }
+        if (glyph.box_w > 0 && glyph.box_h > 0) {
+            const int left = pen_x + glyph.ofs_x;
+            const int right = left + glyph.box_w;
+            if (!found || left < min_x) {
+                min_x = left;
+            }
+            if (!found || right > max_x) {
+                max_x = right;
+            }
+            found = true;
+        }
+        pen_x += glyph.adv_w;
+    }
+    if (!found) {
+        return false;
+    }
+    *visible_left = min_x;
+    *visible_right = max_x;
+    return true;
+}
+
+static void watch_text_optically_centered(const char *text, int center_x, int line_top,
+                                          const lv_font_t *font, uint16_t colour)
+{
+    int visible_left = 0;
+    int visible_right = 0;
+    if (!watch_text_visible_bounds(text, font, &visible_left, &visible_right)) {
+        skyorb_text_centered(text, center_x, line_top, font, colour);
+        return;
+    }
+
+    const int origin_x = (2 * center_x - visible_left - visible_right + 1) / 2;
+    skyorb_text(text, origin_x, line_top, font, colour);
+}
+
 static void skyorb_draw_plane(int x, int y, float heading, float track, float speed,
                                uint16_t plane_colour, uint16_t vector_colour)
 {
@@ -5976,6 +7031,13 @@ static void skyorb_draw_plane(int x, int y, float heading, float track, float sp
 static void skyorb_snapshot_aircraft(skyorb_aircraft_t *aircraft, size_t *count,
                                      skyorb_config_t *config, bool *demo_mode)
 {
+    if (s_skyorb_mutex == NULL) {
+        *count = s_skyorb_aircraft_count;
+        memcpy(aircraft, s_skyorb_aircraft, *count * sizeof(aircraft[0]));
+        *config = s_skyorb_config;
+        *demo_mode = s_skyorb_demo_mode;
+        return;
+    }
     xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
     *count = s_skyorb_aircraft_count;
     memcpy(aircraft, s_skyorb_aircraft, *count * sizeof(aircraft[0]));
@@ -5987,8 +7049,8 @@ static void skyorb_snapshot_aircraft(skyorb_aircraft_t *aircraft, size_t *count,
 static void skyorb_compose_canvas(void)
 {
     const int center_x = LCD_WIDTH / 2;
-    const int center_y = 247;
-    const int radar_radius = 204;
+    const int center_y = LCD_HEIGHT / 2;
+    const int radar_radius = 230;
     const int radar_radius2 = radar_radius * radar_radius;
     const uint16_t background = rgb565(2, 10, 25);
     const uint16_t grid = rgb565(20, 115, 75);
@@ -6038,18 +7100,23 @@ static void skyorb_compose_canvas(void)
     size_t count = 0;
     skyorb_snapshot_aircraft(aircraft, &count, &config, &demo);
     const float outer_km = s_skyorb_ranges_km[s_skyorb_range_index];
-    if (demo) {
+    const bool show_aircraft = s_skyorb_wifi_connected;
+    if (show_aircraft && demo) {
         const float phase = (float)s_skyorb_sweep_angle * 0.01745329252f;
         const float demo_angle[] = {0.3f, 1.7f, 2.65f, 3.85f, 5.0f, 5.65f};
-        const float demo_radius[] = {0.24f, 0.45f, 0.63f, 0.80f, 1.12f, 1.35f};
+        /* Physical distances make all six range choices visibly different. */
+        const float demo_distance_km[] = {2.2f, 7.4f, 14.0f, 23.0f, 36.0f, 47.0f};
         const char *names[] = {"PAC101", "MU512", "CA439", "CES288", "JD613", "HU721"};
         count = 6;
         for (size_t index = 0; index < count; ++index) {
             const float angle = demo_angle[index] + phase * (0.014f + (float)index * 0.002f);
-            const float radius = demo_radius[index] * radar_radius;
+            const bool inside_range = demo_distance_km[index] <= outer_km;
+            const float radius = inside_range
+                ? demo_distance_km[index] * (float)radar_radius / outer_km
+                : (float)(radar_radius - 5);
             const int px = center_x + (int)lroundf(cosf(angle) * radius);
             const int py = center_y + (int)lroundf(sinf(angle) * radius);
-            if (demo_radius[index] <= 1.0f) {
+            if (inside_range) {
                 skyorb_draw_plane(px, py, angle * 57.3f + 90.0f, angle * 57.3f + 110.0f,
                                   180.0f + (float)index * 22.0f, plane_colour, vector_colour);
                 skyorb_text(names[index], px + (px < center_x ? 12 : -48), py - 19,
@@ -6058,7 +7125,7 @@ static void skyorb_compose_canvas(void)
                 skyorb_circle_dot(px, py, 4, plane_colour);
             }
         }
-    } else {
+    } else if (show_aircraft) {
         for (size_t index = 0; index < count; ++index) {
             const float latitude_scale = cosf(config.latitude * 0.01745329252f);
             const float dx_km = (aircraft[index].lon - config.longitude) * 111.0f * latitude_scale;
@@ -6082,44 +7149,68 @@ static void skyorb_compose_canvas(void)
         }
     }
     skyorb_circle_dot(center_x, center_y, 4, rgb565(235, 255, 247));
-    skyorb_text("N", center_x - 6, 48, &lv_font_montserrat_14, rgb565(231, 250, 243));
-    skyorb_text("S", center_x - 5, 430, &lv_font_montserrat_14, rgb565(231, 250, 243));
-    skyorb_text("W", 34, center_y - 8, &lv_font_montserrat_14, rgb565(231, 250, 243));
-    skyorb_text("E", 426, center_y - 8, &lv_font_montserrat_14, rgb565(231, 250, 243));
-    skyorb_text("SKY", 171, 18, &lv_font_montserrat_18, rgb565(120, 248, 194));
-    char range_label[10];
-    snprintf(range_label, sizeof(range_label), "%uKM", (unsigned)(s_skyorb_range_index == 0 ? 5 :
-             s_skyorb_range_index == 1 ? 10 : s_skyorb_range_index == 2 ? 15 : 25));
-    skyorb_text(range_label, 365, 392, &lv_font_montserrat_14, rgb565(117, 234, 176));
-    /* Circular icon-only controls follow the watch navigation convention
-     * while retaining the large invisible corner hit regions. */
-    skyorb_circle_dot(68, 68, 24, rgb565(28, 28, 30));
-    skyorb_line(76, 54, 62, 68, rgb565(245, 245, 247), 255);
-    skyorb_line(62, 68, 76, 82, rgb565(245, 245, 247), 255);
-    skyorb_circle_dot(405, 68, 24, rgb565(28, 28, 30));
-    skyorb_line(394, 59, 416, 59, rgb565(245, 245, 247), 245);
-    skyorb_line(394, 68, 416, 68, rgb565(245, 245, 247), 245);
-    skyorb_line(394, 77, 416, 77, rgb565(245, 245, 247), 245);
-    skyorb_circle_dot(400, 59, 3, rgb565(10, 132, 255));
-    skyorb_circle_dot(410, 68, 3, rgb565(10, 132, 255));
-    skyorb_circle_dot(402, 77, 3, rgb565(10, 132, 255));
-    if (!config.wifi_valid) {
-        skyorb_text("WI-FI SETUP", 155, 111, &lv_font_montserrat_18, rgb565(255, 218, 100));
-        skyorb_text("TAP THE GEAR", 157, 138, &lv_font_montserrat_14, rgb565(220, 239, 255));
-    } else if (!config.location_valid) {
-        skyorb_text(s_skyorb_location_in_progress ? "LOCATING" : "AUTO LOCATION", 141, 111,
-                     &lv_font_montserrat_18, rgb565(255, 218, 100));
-        skyorb_text("NETWORK IP", 171, 138, &lv_font_montserrat_14, rgb565(220, 239, 255));
+    skyorb_text("N", center_x - 6, 12, &lv_font_montserrat_14, rgb565(231, 250, 243));
+    skyorb_text("S", center_x - 5, 440, &lv_font_montserrat_14, rgb565(231, 250, 243));
+    skyorb_text("W", 12, center_y - 8, &lv_font_montserrat_14, rgb565(231, 250, 243));
+    skyorb_text("E", 449, center_y - 8, &lv_font_montserrat_14, rgb565(231, 250, 243));
+    char ring_label[12];
+    snprintf(ring_label, sizeof(ring_label), "%.1f KM", (double)(outer_km * 0.5f));
+    skyorb_text(ring_label, center_x + ring_2 + 8, center_y + 8,
+                &lv_font_montserrat_14, rgb565(94, 188, 143));
+    char range_label[20];
+    snprintf(range_label, sizeof(range_label), "RADIUS %u KM", (unsigned)outer_km);
+    skyorb_text_centered(range_label, center_x, 390, &lv_font_montserrat_18,
+                         rgb565(117, 234, 176));
+    if (!s_skyorb_wifi_enabled) {
+        skyorb_text_centered("OFFLINE", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(255, 190, 96));
+        skyorb_text_centered("NO NETWORK", center_x, 138, &lv_font_montserrat_14,
+                             rgb565(205, 214, 225));
+    } else if (s_wifi_link_state == WIFI_LINK_AUTH_FAILED) {
+        skyorb_text_centered("AUTH FAILED", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(255, 126, 118));
+        skyorb_text_centered("CHECK PASSWORD", center_x, 138, &lv_font_montserrat_14,
+                             rgb565(225, 214, 220));
+    } else if (s_wifi_link_state == WIFI_LINK_NO_AP) {
+        skyorb_text_centered("AP NOT FOUND", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(255, 178, 105));
+    } else if (s_wifi_link_state == WIFI_LINK_TIMEOUT) {
+        skyorb_text_centered("TIMEOUT", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(255, 178, 105));
+        skyorb_text_centered("TAP NETWORK AGAIN", center_x, 138, &lv_font_montserrat_14,
+                             rgb565(225, 214, 220));
+    } else if (!s_skyorb_wifi_connected && !s_wifi_should_connect) {
+        skyorb_text_centered("WI-FI ON", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(100, 210, 255));
+        skyorb_text_centered("NOT CONNECTED", center_x, 138, &lv_font_montserrat_14,
+                             rgb565(205, 214, 225));
     } else if (!s_skyorb_wifi_connected) {
-        skyorb_text("CONNECTING", 151, 111, &lv_font_montserrat_18, rgb565(255, 218, 100));
+        skyorb_text_centered(s_wifi_link_state == WIFI_LINK_ASSOCIATED ?
+                             "GETTING IP" : "CONNECTING", center_x, 111,
+                             &lv_font_montserrat_18, rgb565(255, 218, 100));
+    } else if (!config.location_valid) {
+        skyorb_text_centered("ONLINE", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(137, 239, 203));
+        skyorb_text_centered("SET LOCATION", center_x, 420, &lv_font_montserrat_14,
+                             rgb565(205, 214, 225));
     } else if (s_skyorb_fetch_in_progress) {
-        skyorb_text("UPDATING", 175, 111, &lv_font_montserrat_14, rgb565(137, 239, 203));
+        skyorb_text_centered("UPDATING", center_x, 111, &lv_font_montserrat_14,
+                             rgb565(137, 239, 203));
     } else if (s_skyorb_fetch_failed) {
-        skyorb_text("DATA RETRY", 164, 111, &lv_font_montserrat_14, rgb565(255, 161, 148));
+        skyorb_text_centered(s_skyorb_fetch_failure_stage != NULL ?
+                             s_skyorb_fetch_failure_stage : "DATA RETRY",
+                             center_x, 111, &lv_font_montserrat_14,
+                             rgb565(255, 161, 148));
+    } else if (count == 0 && s_skyorb_last_success != 0) {
+        skyorb_text_centered("NO AIRCRAFT", center_x, 105, &lv_font_montserrat_18,
+                             rgb565(137, 239, 203));
+        skyorb_text_centered("IN SELECTED RANGE", center_x, 132, &lv_font_montserrat_14,
+                             rgb565(205, 224, 218));
     } else {
         char live[24];
         snprintf(live, sizeof(live), "LIVE %u", (unsigned)count);
-        skyorb_text(live, 185, 111, &lv_font_montserrat_14, rgb565(137, 239, 203));
+        skyorb_text_centered(live, center_x, 111, &lv_font_montserrat_14,
+                             rgb565(137, 239, 203));
     }
     (void)background;
 }
@@ -6129,8 +7220,319 @@ static void skyorb_render_frame(void)
     if (s_lcd_canvas == NULL) return;
     skyorb_compose_canvas();
     const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
-    (void)flush_canvas_rect(&full);
+    const bool flushed = flush_canvas_rect(&full);
+    static TickType_t last_diagnostic;
+    const TickType_t now = xTaskGetTickCount();
+    if (!flushed || last_diagnostic == 0 ||
+        (int32_t)(now - last_diagnostic) >= (int32_t)pdMS_TO_TICKS(10000)) {
+        ESP_LOGI(TAG,
+                 "[SKYORB-RENDER] flush=%d wifi=%d connected=%d count=%u "
+                 "location=%d fetching=%d failed=%d sleeping=%d",
+                 flushed, s_skyorb_wifi_enabled, s_skyorb_wifi_connected,
+                 (unsigned)s_skyorb_aircraft_count, s_skyorb_config.location_valid,
+                 s_skyorb_fetch_in_progress, s_skyorb_fetch_failed, s_display_sleeping);
+        last_diagnostic = now;
+    }
     s_skyorb_dirty = false;
+}
+
+static clock_time_t watch_read_time(void)
+{
+    clock_time_t time = s_clock_cached_time;
+    if (!time.valid) {
+        const uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000LL);
+        time.second = (int)(uptime % 60U);
+        time.minute = (int)((uptime / 60U) % 60U);
+        time.hour = (int)((uptime / 3600U) % 24U);
+        time.day = 1;
+        time.month = 1;
+        time.year = 2000;
+    }
+    return time;
+}
+
+static uint16_t watch_blob_u16(const uint8_t *bytes)
+{
+    return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+}
+
+static int16_t watch_blob_i16(const uint8_t *bytes)
+{
+    return (int16_t)watch_blob_u16(bytes);
+}
+
+static void watch_draw_asset_layer(const uint8_t *asset_start,
+                                   const uint8_t *asset_end,
+                                   float clockwise_angle)
+{
+    const size_t asset_size = (size_t)(asset_end - asset_start);
+    if (asset_size < 12U || memcmp(asset_start, "PCA1", 4) != 0) return;
+
+    const int source_x = watch_blob_i16(asset_start + 4);
+    const int source_y = watch_blob_i16(asset_start + 6);
+    const int width = watch_blob_u16(asset_start + 8);
+    const int height = watch_blob_u16(asset_start + 10);
+    const size_t required = 12U + (size_t)width * (size_t)height * 3U;
+    if (width <= 0 || height <= 0 || required > asset_size) return;
+
+    const int canvas_x = (LCD_WIDTH - WATCH_SOURCE_SIZE) / 2;
+    const int canvas_y = (LCD_HEIGHT - WATCH_SOURCE_SIZE) / 2;
+    const uint8_t *pixels = asset_start + 12;
+    const float sine = sinf(clockwise_angle);
+    const float cosine = cosf(clockwise_angle);
+    const bool unrotated = fabsf(clockwise_angle) < 0.0001f;
+
+    const int first_x = unrotated ? source_x : 0;
+    const int first_y = unrotated ? source_y : 0;
+    const int last_x = unrotated ? source_x + width : WATCH_SOURCE_SIZE;
+    const int last_y = unrotated ? source_y + height : WATCH_SOURCE_SIZE;
+    for (int dy = first_y; dy < last_y; ++dy) {
+        const int y = canvas_y + dy;
+        if (y < 0 || y >= LCD_HEIGHT) continue;
+        uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
+        for (int dx = first_x; dx < last_x; ++dx) {
+            int sx = dx;
+            int sy = dy;
+            if (!unrotated) {
+                const float centered_x = (float)dx - WATCH_SOURCE_SIZE / 2.0f;
+                const float centered_y = (float)dy - WATCH_SOURCE_SIZE / 2.0f;
+                sx = (int)lroundf(cosine * centered_x + sine * centered_y +
+                                  WATCH_SOURCE_SIZE / 2.0f);
+                sy = (int)lroundf(-sine * centered_x + cosine * centered_y +
+                                  WATCH_SOURCE_SIZE / 2.0f);
+            }
+            if (sx < source_x || sx >= source_x + width ||
+                sy < source_y || sy >= source_y + height) continue;
+            const int x = canvas_x + dx;
+            if (x < 0 || x >= LCD_WIDTH) continue;
+            const uint8_t *pixel = pixels +
+                ((size_t)(sy - source_y) * width + (size_t)(sx - source_x)) * 3U;
+            const uint8_t alpha = pixel[2];
+            if (alpha == 0) continue;
+            const uint16_t foreground = watch_blob_u16(pixel);
+            line[x] = alpha == 255 ? foreground :
+                      rgb565_blend(line[x], foreground, alpha);
+        }
+    }
+}
+
+static void watch_draw_character_layer(void)
+{
+    watch_draw_asset_layer(kkd1_character_start, kkd1_character_end, 0.0f);
+}
+
+static void watch_draw_time_dials(const clock_time_t *display_time)
+{
+    const float tau = 6.28318531f;
+    const float minute_rotation = WATCH_MINUTE_POINTER_ANGLE +
+                                  (float)display_time->minute * tau / 60.0f;
+    const float hour_rotation = WATCH_HOUR_POINTER_ANGLE -
+                                (float)(display_time->hour % 12) * tau / 12.0f;
+    const float second_rotation = (float)display_time->second * tau / 60.0f;
+
+    /* Exact APK layer order and transforms: minute scale, seconds scale,
+     * Roman-hour scale, then the static mechanical centre. */
+    watch_draw_asset_layer(kkd1_minute_dial_start, kkd1_minute_dial_end,
+                           minute_rotation);
+    watch_draw_asset_layer(kkd1_second_dial_start, kkd1_second_dial_end,
+                           second_rotation);
+    watch_draw_asset_layer(kkd1_hour_dial_start, kkd1_hour_dial_end,
+                           hour_rotation);
+    watch_draw_asset_layer(kkd1_mechanism_start, kkd1_mechanism_end, 0.0f);
+}
+
+#define WATCH_KKD1_COMPLICATION_CENTER_X 161
+#define WATCH_KKD1_TIME_TOP 160
+#define WATCH_KKD1_DATE_TOP 187
+#define WATCH_KKD2_COMPLICATION_CENTER_X 161
+#define WATCH_KKD2_TIME_TOP 162
+#define WATCH_KKD2_DATE_TOP 188
+
+static void watch_compose_kkd2(const clock_time_t *time)
+{
+    memset(s_lcd_canvas, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+    const float tau = 6.28318531f;
+    /* Match the original KKD2 XML exactly: HOUR_0_23 * 30.  The source face
+     * advances the complete-character layer once per hour and does not add
+     * minute interpolation to it. */
+    const float hour_rotation = (float)(time->hour % 12) * tau / 12.0f;
+    const float minute_rotation = (float)time->minute * tau / 60.0f;
+
+    /* Preserve the APK scene order. The complete-character hour layer provides
+     * the body, while the separate minute arm is a foreground limb. Drawing
+     * the body after the arm hides its proximal section and makes it look cut
+     * off even when the pivot coordinates are correct. */
+    watch_draw_asset_layer(kkd2_background_start, kkd2_background_end, 0.0f);
+    watch_draw_asset_layer(kkd2_complication_start, kkd2_complication_end, 0.0f);
+    watch_draw_asset_layer(kkd2_hour_start, kkd2_hour_end, hour_rotation);
+    watch_draw_asset_layer(kkd2_minute_start, kkd2_minute_end, minute_rotation);
+
+    char digital[12];
+    char date[12];
+    snprintf(digital, sizeof(digital), "%02u:%02u",
+             (unsigned)time->hour % 24U, (unsigned)time->minute % 60U);
+    watch_text_optically_centered(digital,
+                         WATCH_KKD2_COMPLICATION_CENTER_X,
+                         WATCH_KKD2_TIME_TOP, &lv_font_montserrat_18,
+                         rgb565(255, 246, 221));
+    snprintf(date, sizeof(date), "%02d/%02d", time->month, time->day);
+    watch_text_optically_centered(date,
+                         WATCH_KKD2_COMPLICATION_CENTER_X,
+                         WATCH_KKD2_DATE_TOP, &lv_font_montserrat_14,
+                         rgb565(178, 162, 138));
+    if (s_alarm_enabled) {
+        char alarm[16];
+        snprintf(alarm, sizeof(alarm), "A %02u:%02u", s_alarm_hour, s_alarm_minute);
+        skyorb_text_centered(alarm, LCD_WIDTH / 2, 432, &lv_font_montserrat_14,
+                             s_alarm_ringing ? rgb565(255, 69, 58) : rgb565(116, 45, 22));
+    }
+}
+
+static int32_t watch_advance_display_time(int32_t displayed, int32_t target,
+                                          bool *catch_up_pending)
+{
+    if (catch_up_pending != NULL) *catch_up_pending = false;
+    if (target < 0 || target >= 24 * 60 * 60) return displayed;
+    if (displayed < 0 || displayed >= 24 * 60 * 60) return target;
+
+    int32_t delta = target - displayed;
+    if (delta > 12 * 60 * 60) delta -= 24 * 60 * 60;
+    else if (delta < -12 * 60 * 60) delta += 24 * 60 * 60;
+
+    if (delta > 0 && delta <= 10) {
+        displayed = (displayed + 1) % (24 * 60 * 60);
+        if (catch_up_pending != NULL) *catch_up_pending = delta > 1;
+        return displayed;
+    }
+    if (delta == -1) {
+        /* RTC cache sampling may briefly trail a frame at a second boundary.
+         * Never move the visible dial backwards for that transient. */
+        return displayed;
+    }
+    return delta == 0 ? displayed : target;
+}
+
+static void watch_compose_kkd1(const clock_time_t *time)
+{
+    /* Every visible KKD1 dial element already comes from the APK layers.
+     * Starting from a clean frame prevents the old procedural gold face from
+     * appearing underneath those layers as a second, overlapping watch face. */
+    memset(s_lcd_canvas, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+    const int center_x = LCD_WIDTH / 2;
+    const uint16_t deep_gold = rgb565(124, 54, 20);
+
+    watch_draw_time_dials(time);
+
+    /* XML PartImage wfs_6: x=106, y=121, width=110, height=110.  Keep the
+     * original ornate bezel instead of replacing it with a larger synthetic
+     * panel, otherwise the upper-left centre looks like a second face. */
+    watch_draw_asset_layer(kkd1_complication_start, kkd1_complication_end, 0.0f);
+    char digital[12];
+    const unsigned display_hour = (unsigned)time->hour % 24U;
+    const unsigned display_minute = (unsigned)time->minute % 60U;
+    snprintf(digital, sizeof(digital), "%02u:%02u", display_hour, display_minute);
+    watch_text_optically_centered(digital,
+                         WATCH_KKD1_COMPLICATION_CENTER_X,
+                         WATCH_KKD1_TIME_TOP, &lv_font_montserrat_18,
+                         rgb565(255, 255, 255));
+    char date[12];
+    snprintf(date, sizeof(date), "%02d/%02d", time->month, time->day);
+    watch_text_optically_centered(date,
+                         WATCH_KKD1_COMPLICATION_CENTER_X,
+                         WATCH_KKD1_DATE_TOP, &lv_font_montserrat_14,
+                         rgb565(173, 173, 173));
+
+    watch_draw_character_layer();
+    if (s_alarm_enabled) {
+        char alarm[16];
+        snprintf(alarm, sizeof(alarm), "A %02u:%02u", s_alarm_hour, s_alarm_minute);
+        skyorb_text_centered(alarm, center_x, 422, &lv_font_montserrat_14,
+                             s_alarm_ringing ? rgb565(255, 69, 58) : deep_gold);
+    } else if (!time->valid) {
+        skyorb_text_centered("RTC SET", center_x, 421, &lv_font_montserrat_14,
+                             rgb565(255, 159, 10));
+    }
+}
+
+static void watch_compose_canvas(const clock_time_t *time)
+{
+    if (s_watch_style == 1U) {
+        watch_compose_kkd2(time);
+    } else {
+        watch_compose_kkd1(time);
+    }
+}
+
+static void watch_render_frame(void)
+{
+    if (s_lcd_canvas == NULL) return;
+
+    if (s_watch_rendered_style != s_watch_style) {
+        /* Do not rely on the panel retaining or replacing an old face during
+         * a style transition.  Flush an explicit black full frame first, then
+         * compose exactly one requested APK face below.  This happens only
+         * once per style change, so normal one-second animation is unaffected. */
+        memset(s_lcd_canvas, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
+        const dirty_rect_t clear = {
+            .x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT
+        };
+        (void)flush_canvas_rect(&clear);
+        s_watch_rendered_style = s_watch_style;
+        ESP_LOGI(TAG, "Watch renderer switched to %s (%u); previous frame cleared",
+                 s_watch_style == 1U ? "KKD2" : "KKD1",
+                 (unsigned)s_watch_style);
+    }
+
+    const clock_time_t time = watch_read_time();
+    const int32_t target_seconds = time.hour * 3600 + time.minute * 60 + time.second;
+    bool catch_up_pending = false;
+    s_watch_display_seconds = watch_advance_display_time(
+        s_watch_display_seconds, target_seconds, &catch_up_pending);
+
+    clock_time_t display_time = time;
+    if (s_watch_display_seconds >= 0 && s_watch_display_seconds < 24 * 60 * 60) {
+        display_time.hour = s_watch_display_seconds / 3600;
+        display_time.minute = (s_watch_display_seconds / 60) % 60;
+        display_time.second = s_watch_display_seconds % 60;
+    }
+    watch_compose_canvas(&display_time);
+    const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
+    (void)flush_canvas_rect(&full);
+    s_watch_dirty = catch_up_pending;
+}
+
+static void watch_enter(void)
+{
+    s_ui_screen = UI_SCREEN_WATCH;
+    s_watch_dirty = true;
+    s_watch_last_frame = 0;
+    s_watch_display_seconds = -1;
+    /* Re-entering the app is also a hard visual boundary. */
+    s_watch_rendered_style = UINT8_MAX;
+    s_apps_canvas_valid = false;
+    s_apps_home_transition_frame = NULL;
+    block_touch_until_release();
+    ESP_LOGI(TAG, "Apps: entered mechanical Watch");
+}
+
+static void watch_handle_touch(int x, int y)
+{
+    if (s_alarm_ringing) {
+        alarm_stop();
+        block_touch_until_release();
+        ESP_LOGI(TAG, "Watch: alarm dismissed by touch");
+        return;
+    }
+    if (x < 104 && y < 104) {
+        s_ui_screen = UI_SCREEN_HOME;
+        s_home_dirty = true;
+        block_touch_until_release();
+        ESP_LOGI(TAG, "Watch: returned home");
+        return;
+    }
+    /* Watch style is selected explicitly from the phone settings.  An ordinary
+     * touch must not silently flip the persisted KKD1/KKD2 choice. */
+    block_touch_until_release();
 }
 
 static void skyorb_start_network_task(void)
@@ -6173,8 +7575,8 @@ static void settings_switch(int y, bool enabled, uint16_t accent)
 {
     const int screen_y = settings_screen_y(y);
     const dirty_rect_t clip = {.x1 = 54, .y1 = 92, .x2 = 421, .y2 = 448};
-    fill_canvas_rect(358, screen_y, 407, screen_y + 30,
-                     enabled ? accent : rgb565(74, 74, 78), &clip);
+    fill_canvas_round_rect(358, screen_y, 407, screen_y + 30, 15,
+                           enabled ? accent : rgb565(74, 74, 78), &clip);
     skyorb_circle_dot(enabled ? 392 : 373, screen_y + 15, 11,
                       rgb565(250, 250, 250));
 }
@@ -6210,7 +7612,7 @@ static void device_settings_compose_canvas(bool full_refresh)
     }
 
     /* Scrollable watchOS-style cards. */
-    const int cards[][2] = {{104, 142}, {260, 132}, {408, 126}, {550, 108}};
+    const int cards[][2] = {{104, 172}, {292, 132}, {440, 126}, {582, 108}};
     for (size_t i = 0; i < sizeof(cards) / sizeof(cards[0]); ++i) {
         const int top = settings_screen_y(cards[i][0]);
         fill_canvas_rect(54, top, 421, top + cards[i][1], panel, &viewport);
@@ -6234,33 +7636,39 @@ static void device_settings_compose_canvas(bool full_refresh)
                   270, 208, &lv_font_montserrat_14,
                   ble_pacon_is_enabled() ? green : secondary);
     settings_switch(200, ble_pacon_is_enabled(), rgb565(90, 200, 250));
+    settings_text("Camera shutter", 86, 249, &lv_font_montserrat_14, white);
+    const bool camera_ready = ble_pacon_is_enabled() && ble_pacon_is_connected() &&
+                              ble_pacon_is_camera_remote_enabled();
+    settings_text(camera_ready ? "READY" : "CONNECT",
+                  315, 253, &lv_font_montserrat_14,
+                  camera_ready ? green : secondary);
 
-    settings_text("DISPLAY", 86, 280, &lv_font_montserrat_18, white);
-    settings_text("Brightness", 86, 320, &lv_font_montserrat_14, white);
+    settings_text("DISPLAY", 86, 308, &lv_font_montserrat_18, white);
+    settings_text("Brightness", 86, 348, &lv_font_montserrat_14, white);
     char brightness[12];
     snprintf(brightness, sizeof(brightness), "%u%%",
              (unsigned)(((uint16_t)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 100U) /
                         (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)));
-    settings_text(brightness, 350, 320, &lv_font_montserrat_14, orange);
-    const int slider_y = settings_screen_y(358);
+    settings_text(brightness, 350, 348, &lv_font_montserrat_14, orange);
+    const int slider_y = settings_screen_y(386);
     fill_canvas_rect(92, slider_y, 382, slider_y + 8, rgb565(74, 74, 78), &viewport);
     const int knob_x = 92 + ((int)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 290) /
                               (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN);
     fill_canvas_rect(92, slider_y, knob_x, slider_y + 8, orange, &viewport);
     skyorb_circle_dot(knob_x, slider_y + 4, 12, white);
 
-    skyorb_circle_dot(84, settings_screen_y(438), 16, rgb565(110, 80, 220));
-    settings_text("SKYORB", 110, 422, &lv_font_montserrat_18, white);
-    settings_text("BLE app config; AP is transitional", 86, 462,
+    skyorb_circle_dot(84, settings_screen_y(466), 16, rgb565(110, 80, 220));
+    settings_text("SKYORB", 110, 450, &lv_font_montserrat_18, white);
+    settings_text("BLE app config; AP is transitional", 86, 490,
                   &lv_font_montserrat_14, secondary);
     settings_text(s_skyorb_config.location_valid ? "LOCATION READY" : "LOCATION NOT SET",
-                  86, 494, &lv_font_montserrat_14,
+                  86, 522, &lv_font_montserrat_14,
                   s_skyorb_config.location_valid ? green : orange);
 
-    settings_text("SYSTEM", 86, 566, &lv_font_montserrat_18, white);
-    settings_text("USB media and battery status", 86, 607,
+    settings_text("SYSTEM", 86, 594, &lv_font_montserrat_18, white);
+    settings_text("USB media and battery status", 86, 635,
                   &lv_font_montserrat_14, secondary);
-    settings_text(s_vbus_present ? "USB POWER" : "BATTERY POWER", 86, 636,
+    settings_text(s_vbus_present ? "USB POWER" : "BATTERY POWER", 86, 664,
                   &lv_font_montserrat_14, s_vbus_present ? green : secondary);
 
     /* Repaint the fixed header so scrolled cards cannot cover it. */
@@ -6297,6 +7705,227 @@ static void render_device_settings_frame(void)
     s_device_settings_dirty = false;
 }
 
+static void wifi_settings_compose_canvas(void)
+{
+    const uint16_t black = rgb565(0, 0, 0);
+    const uint16_t panel = rgb565(28, 28, 30);
+    const uint16_t white = rgb565(245, 245, 247);
+    const uint16_t secondary = rgb565(174, 174, 178);
+    const uint16_t blue = rgb565(10, 132, 255);
+    const uint16_t green = rgb565(48, 209, 88);
+    const uint16_t orange = rgb565(255, 159, 10);
+    const int center = LCD_WIDTH / 2;
+
+    for (int y = 0; y < LCD_HEIGHT; ++y) {
+        uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
+        for (int x = 0; x < LCD_WIDTH; ++x) {
+            const int dx = x - center, dy = y - center;
+            line[x] = dx * dx + dy * dy <= 230 * 230 ? black : 0;
+        }
+    }
+
+    skyorb_line(84, 62, 70, 76, white, 255);
+    skyorb_line(70, 76, 84, 90, white, 255);
+    skyorb_text("WI-FI", 190, 48, &lv_font_montserrat_18, white);
+
+    fill_canvas_rect(54, 104, 421, 169, panel, NULL);
+    skyorb_text("Wi-Fi", 84, 123, &lv_font_montserrat_18, white);
+    fill_canvas_round_rect(348, 120, 407, 153, 16,
+                           s_skyorb_wifi_enabled ? green : rgb565(74, 74, 78), NULL);
+    skyorb_circle_dot(s_skyorb_wifi_enabled ? 391 : 365, 136, 12, white);
+
+    if (!s_skyorb_wifi_enabled) {
+        skyorb_text("Wi-Fi is off", 169, 211, &lv_font_montserrat_18, secondary);
+        skyorb_text("Turn it on to scan networks", 124, 245,
+                    &lv_font_montserrat_14, secondary);
+        return;
+    }
+
+    skyorb_text("SAVED NETWORKS", 70, 181, &lv_font_montserrat_14, secondary);
+    skyorb_config_t config = {0};
+    if (s_skyorb_mutex != NULL) {
+        xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
+        config = s_skyorb_config;
+        xSemaphoreGive(s_skyorb_mutex);
+    } else {
+        config = s_skyorb_config;
+    }
+    if (config.wifi_count == 0) {
+        fill_canvas_rect(54, 202, 421, 292, panel, NULL);
+        skyorb_text("No saved networks", 84, 224, &lv_font_montserrat_18, white);
+        skyorb_text("Add one with the PACON BLE app", 84, 258,
+                    &lv_font_montserrat_14, secondary);
+    } else {
+        for (uint8_t index = 0; index < config.wifi_count; ++index) {
+            const int row_y = 202 + index * 50;
+            const bool selected = index == config.wifi_selected;
+            fill_canvas_rect(54, row_y, 421, row_y + 45, panel, NULL);
+            skyorb_circle_dot(72, row_y + 22, selected ? 5 : 3,
+                              selected ? blue : rgb565(72, 72, 74));
+            skyorb_text(config.wifi_profiles[index].ssid, 86, row_y + 5,
+                        &lv_font_montserrat_14, white);
+            const char *state = s_wifi_scan_in_progress ? "SCANNING" :
+                                (s_wifi_profile_visible[index] ? "IN RANGE" : "SAVED");
+            uint16_t state_colour = s_wifi_profile_visible[index] ? blue : secondary;
+            if (selected && s_skyorb_wifi_connected) {
+                state = "CONNECTED";
+                state_colour = green;
+            } else if (selected && s_wifi_should_connect) {
+                static const char *dots[] = {"CONNECTING", "CONNECTING.",
+                                             "CONNECTING..", "CONNECTING..."};
+                state = s_wifi_link_state == WIFI_LINK_ASSOCIATED ? "GETTING IP..." :
+                    dots[(xTaskGetTickCount() / pdMS_TO_TICKS(350)) & 3U];
+                state_colour = orange;
+            } else if (selected && s_wifi_link_state == WIFI_LINK_AUTH_FAILED) {
+                state = "AUTH FAILED";
+                state_colour = rgb565(255, 105, 97);
+            } else if (selected && s_wifi_link_state == WIFI_LINK_TIMEOUT) {
+                state = "TIMEOUT";
+                state_colour = orange;
+            }
+            skyorb_text(state, 86, row_y + 25, &lv_font_montserrat_14, state_colour);
+            if (s_wifi_delete_profile == index) {
+                fill_canvas_rect(326, row_y + 7, 405, row_y + 38,
+                                 rgb565(90, 24, 28), NULL);
+                skyorb_text("DELETE", 338, row_y + 14, &lv_font_montserrat_14,
+                            rgb565(255, 105, 97));
+            } else if (s_wifi_profile_visible[index]) {
+                char rssi[16];
+                snprintf(rssi, sizeof(rssi), "%d dBm", (int)s_wifi_profile_rssi[index]);
+                skyorb_text(rssi, 344, row_y + 14, &lv_font_montserrat_14, secondary);
+            }
+        }
+    }
+}
+
+static void render_wifi_settings_frame(void)
+{
+    if (s_lcd_canvas == NULL) return;
+    wifi_settings_compose_canvas();
+    const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
+    (void)flush_canvas_rect(&full);
+    s_wifi_settings_dirty = false;
+    s_wifi_settings_last_frame = xTaskGetTickCount();
+}
+
+static void wifi_settings_enter(void)
+{
+    s_ui_screen = UI_SCREEN_WIFI_SETTINGS;
+    s_wifi_settings_dirty = true;
+    s_wifi_delete_profile = -1;
+    s_wifi_touch_profile = -1;
+    if (s_skyorb_wifi_enabled && !s_wifi_scan_in_progress) s_wifi_scan_requested = true;
+    block_touch_until_release();
+    ESP_LOGI(TAG, "Settings: entered Wi-Fi detail page");
+}
+
+static int wifi_settings_profile_at_y(int y, uint8_t count)
+{
+    if (y < 202) return -1;
+    const int index = (y - 202) / 50;
+    if (index < 0 || index >= count || y > 202 + index * 50 + 45) return -1;
+    return index;
+}
+
+static void wifi_settings_select_profile(uint8_t index)
+{
+    (void)wifi_request_profile_connection(index);
+}
+
+static void wifi_settings_delete_profile(uint8_t index)
+{
+    skyorb_config_t config = {0};
+    ble_snapshot_skyorb_config(&config);
+    if (index >= config.wifi_count) return;
+    const bool deleted_active = index == config.wifi_selected;
+    char deleted_ssid[33];
+    snprintf(deleted_ssid, sizeof(deleted_ssid), "%s", config.wifi_profiles[index].ssid);
+    (void)wifi_config_delete_profile(&config, index);
+    ble_store_skyorb_config(&config);
+    if (deleted_active) {
+        s_wifi_should_connect = false;
+        s_wifi_connect_requested = false;
+        if (s_skyorb_wifi_connected) (void)esp_wifi_disconnect();
+        s_wifi_link_state = WIFI_LINK_IDLE;
+    }
+    memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
+    memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
+    s_wifi_delete_profile = -1;
+    s_wifi_scan_requested = s_skyorb_wifi_enabled;
+    s_wifi_settings_dirty = true;
+    ESP_LOGI(TAG, "Wi-Fi page: deleted saved profile %u (%s)",
+             (unsigned)index, deleted_ssid);
+}
+
+static void wifi_settings_handle_touch(int x, int y)
+{
+    if (x < 128 && y < 100) {
+        settings_enter();
+        return;
+    }
+    if (y >= 104 && y <= 174) {
+        if (s_skyorb_wifi_enabled) {
+            skyorb_disable_network();
+        } else {
+            skyorb_start_network_task();
+            s_wifi_scan_requested = true;
+        }
+        s_wifi_settings_dirty = true;
+        block_touch_until_release();
+        return;
+    }
+    skyorb_config_t config = {0};
+    ble_snapshot_skyorb_config(&config);
+    const int profile = wifi_settings_profile_at_y(y, config.wifi_count);
+    if (s_skyorb_wifi_enabled && profile >= 0) {
+        if (s_wifi_delete_profile == profile && x >= 315) {
+            wifi_settings_delete_profile((uint8_t)profile);
+            block_touch_until_release();
+            return;
+        }
+        s_wifi_touch_profile = profile;
+        s_wifi_touch_started_us = esp_timer_get_time();
+        s_wifi_touch_long_handled = false;
+        if (s_wifi_delete_profile >= 0 && s_wifi_delete_profile != profile) {
+            s_wifi_delete_profile = -1;
+            s_wifi_settings_dirty = true;
+        }
+        return;
+    }
+    if (s_wifi_delete_profile >= 0) {
+        s_wifi_delete_profile = -1;
+        s_wifi_settings_dirty = true;
+    }
+}
+
+static void wifi_settings_update_touch(int x, int y)
+{
+    (void)x;
+    if (s_wifi_touch_profile < 0 || s_wifi_touch_long_handled) return;
+    skyorb_config_t config = {0};
+    ble_snapshot_skyorb_config(&config);
+    if (wifi_settings_profile_at_y(y, config.wifi_count) != s_wifi_touch_profile) {
+        s_wifi_touch_profile = -1;
+        return;
+    }
+    if (esp_timer_get_time() - s_wifi_touch_started_us >= 700000LL) {
+        s_wifi_delete_profile = s_wifi_touch_profile;
+        s_wifi_touch_long_handled = true;
+        s_wifi_settings_dirty = true;
+        ESP_LOGI(TAG, "Wi-Fi page: delete action revealed for profile %d",
+                 s_wifi_delete_profile);
+    }
+}
+
+static void wifi_settings_handle_release(void)
+{
+    if (s_wifi_touch_profile >= 0 && !s_wifi_touch_long_handled) {
+        wifi_settings_select_profile((uint8_t)s_wifi_touch_profile);
+    }
+    s_wifi_touch_profile = -1;
+    s_wifi_touch_long_handled = false;
+}
+
 static void settings_enter(void)
 {
     s_ui_screen = UI_SCREEN_SETTINGS;
@@ -6324,6 +7953,18 @@ static void settings_handle_touch(int x, int y)
     }
     const int content_y = y + s_settings_scroll_y;
     if (content_y >= 136 && content_y <= 188 && !s_settings_touch_dragging) {
+        if (x < 330) {
+            wifi_settings_enter();
+            return;
+        }
+        const TickType_t now = xTaskGetTickCount();
+        if (s_settings_wifi_last_toggle != 0 &&
+            (int32_t)(now - s_settings_wifi_last_toggle) < pdMS_TO_TICKS(700)) {
+            ESP_LOGW(TAG, "[WIFI-DBG] Settings Wi-Fi duplicate touch ignored");
+            block_touch_until_release();
+            return;
+        }
+        s_settings_wifi_last_toggle = now;
         const bool enable = !s_skyorb_wifi_enabled;
         if (enable) {
             ESP_LOGI(TAG, "[WIFI-DBG] Settings Wi-Fi ON requested; queueing dedicated network task");
@@ -6333,16 +7974,29 @@ static void settings_handle_touch(int x, int y)
             skyorb_disable_network();
         }
         s_device_settings_dirty = true;
+        block_touch_until_release();
         return;
     }
-    if (content_y >= 190 && content_y <= 242 && !s_settings_touch_dragging) {
+    if (content_y >= 190 && content_y <= 234 && !s_settings_touch_dragging) {
         (void)ble_pacon_set_enabled(!ble_pacon_is_enabled());
         s_settings_header_dirty = true;
         s_device_settings_dirty = true;
         ESP_LOGI(TAG, "Settings: Bluetooth %s", ble_pacon_is_enabled() ? "enabled" : "disabled");
         return;
     }
-    if (content_y >= 330 && content_y <= 390 && !s_settings_touch_dragging) {
+    if (content_y >= 235 && content_y <= 282 && !s_settings_touch_dragging) {
+        const esp_err_t shutter_err = ble_pacon_camera_shutter();
+        if (shutter_err == ESP_OK) {
+            ESP_LOGI(TAG, "Settings: camera shutter requested");
+        } else {
+            ESP_LOGW(TAG, "Settings: camera shutter unavailable (%s)",
+                     esp_err_to_name(shutter_err));
+        }
+        s_device_settings_dirty = true;
+        block_touch_until_release();
+        return;
+    }
+    if (content_y >= 360 && content_y <= 420 && !s_settings_touch_dragging) {
         const int slider = clamp_int(x, 92, 382);
         s_user_brightness = (uint8_t)(SETTINGS_BRIGHTNESS_MIN +
             ((slider - 92) * (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)) / 290);
@@ -6359,36 +8013,76 @@ static void skyorb_enter(void)
     s_ui_screen = UI_SCREEN_SKYORB;
     s_skyorb_dirty = true;
     s_skyorb_last_frame = 0;
+    s_skyorb_rotate_active = false;
+    s_skyorb_rotate_accumulated = 0.0f;
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
     block_touch_until_release();
-    skyorb_start_network_task();
-    ESP_LOGI(TAG, "Apps: entered Sky Radar");
+    if (s_skyorb_wifi_enabled) {
+        skyorb_start_network_task();
+        ESP_LOGI(TAG, "Apps: entered Sky Radar; Wi-Fi remains enabled");
+    } else {
+        ESP_LOGI(TAG, "Apps: entered Sky Radar in offline/demo mode; Wi-Fi remains disabled");
+    }
 }
 
 static void skyorb_handle_touch(int x, int y)
 {
-    if (x < 128 && y < 120) {
+    /* The top-left corner is deliberately invisible so the radar can occupy
+     * the complete round face without a floating navigation control. */
+    if (x < 104 && y < 104) {
         s_ui_screen = UI_SCREEN_HOME;
         s_home_dirty = true;
+        block_touch_until_release();
         ESP_LOGI(TAG, "SkyOrb: returned home");
         return;
     }
-    if (x > 340 && y < 120) {
-        settings_enter();
-        return;
+    const float dx = (float)x - (float)LCD_WIDTH * 0.5f;
+    const float dy = (float)y - (float)LCD_HEIGHT * 0.5f;
+    s_skyorb_rotate_active = dx * dx + dy * dy >= 4900.0f;
+    s_skyorb_rotate_last_angle = atan2f(dy, dx);
+    s_skyorb_rotate_accumulated = 0.0f;
+}
+
+static void skyorb_handle_touch_move(int x, int y)
+{
+    if (!s_skyorb_rotate_active) return;
+    const float dx = (float)x - (float)LCD_WIDTH * 0.5f;
+    const float dy = (float)y - (float)LCD_HEIGHT * 0.5f;
+    if (dx * dx + dy * dy < 3600.0f) return;
+    const float angle = atan2f(dy, dx);
+    float delta = angle - s_skyorb_rotate_last_angle;
+    if (delta > 3.14159265f) delta -= 6.28318531f;
+    if (delta < -3.14159265f) delta += 6.28318531f;
+    s_skyorb_rotate_accumulated += delta;
+    s_skyorb_rotate_last_angle = angle;
+}
+
+static void skyorb_handle_touch_release(void)
+{
+    if (!s_skyorb_rotate_active) return;
+    s_skyorb_rotate_active = false;
+    if (fabsf(s_skyorb_rotate_accumulated) < 0.40f) return;
+
+    /* Screen-space positive rotation is clockwise. */
+    if (s_skyorb_rotate_accumulated > 0.0f) {
+        s_skyorb_range_index = (uint8_t)((s_skyorb_range_index + 1U) %
+                                          SKYORB_RANGE_COUNT);
+    } else {
+        s_skyorb_range_index = (uint8_t)((s_skyorb_range_index +
+                                          SKYORB_RANGE_COUNT - 1U) %
+                                          SKYORB_RANGE_COUNT);
     }
-    if (y > 360) {
-        s_skyorb_range_index = (uint8_t)((s_skyorb_range_index + 1U) % 4U);
-        if (s_skyorb_mutex != NULL) {
-            xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
-            s_skyorb_config.range_index = s_skyorb_range_index;
-            xSemaphoreGive(s_skyorb_mutex);
-        }
-        skyorb_save_range();
-        skyorb_mark_dirty();
-        ESP_LOGI(TAG, "SkyOrb: range set to index %u", (unsigned)s_skyorb_range_index);
+    if (s_skyorb_mutex != NULL) {
+        xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
+        s_skyorb_config.range_index = s_skyorb_range_index;
+        xSemaphoreGive(s_skyorb_mutex);
     }
+    skyorb_save_range();
+    skyorb_mark_dirty();
+    ESP_LOGI(TAG, "SkyOrb: %s rotation set range index %u",
+             s_skyorb_rotate_accumulated > 0.0f ? "clockwise" : "counter-clockwise",
+             (unsigned)s_skyorb_range_index);
 }
 
 static void render_home_frame(void)
@@ -6890,20 +8584,32 @@ void app_main(void)
     ESP_LOGI(TAG, "Fluid uses tilt and touch; 0u0 reacts to eyes, forehead and cheeks.");
     ESP_LOGI(TAG, "Home media: NAND carousel with Miku-teal fallback");
 
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK && err != ESP_ERR_NVS_INVALID_STATE) {
+        ESP_LOGW(TAG, "NVS initialization failed: %s", esp_err_to_name(err));
+    }
+
     /* Load UI preferences before the panel is powered.  BLE is deliberately
      * started after the LCD DMA buffers have been allocated: the NimBLE
      * controller consumes internal RAM, while this board needs two large
      * internal-DMA stripes for the SH8601. */
     settings_load_preferences();
+    clock_load_preferences();
 
     /* Bring up the shared I2C bus and PMIC first.  The panel power gate stays
      * low until init_lcd(), so its OLED matrix cannot light during rail setup. */
-    esp_err_t err = init_i2c();
+    err = lcd_hold_power_off();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "LCD power hold-off failed: %s", esp_err_to_name(err));
+        return;
+    }
+    err = init_i2c();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "I2C initialization failed: %s", esp_err_to_name(err));
         return;
     }
     probe_axp2101();
+    s_clock_cached_time = clock_read_rtc();
     vTaskDelay(pdMS_TO_TICKS(20));
 
     err = init_lcd();
@@ -6938,6 +8644,7 @@ void app_main(void)
     while (true) {
         TickType_t now = xTaskGetTickCount();
         apply_ble_brightness_if_pending();
+        clock_service(now);
         apply_home_media_rescan_if_pending();
         home_update_burnin_offsets(now);
         display_update_idle(now);
@@ -7016,10 +8723,31 @@ void app_main(void)
                 skyorb_render_frame();
                 s_skyorb_last_frame = xTaskGetTickCount();
             }
+        } else if (s_ui_screen == UI_SCREEN_WATCH) {
+            poll_touch();
+            if (s_ui_screen == UI_SCREEN_WATCH &&
+                (s_watch_dirty || s_watch_last_frame == 0 ||
+                 (int32_t)(now - s_watch_last_frame) >=
+                    (int32_t)pdMS_TO_TICKS(1000))) {
+                /* Anchor the cadence at frame start.  Anchoring after the
+                 * expensive layered render adds its duration to every second. */
+                s_watch_last_frame = now;
+                watch_render_frame();
+            }
         } else if (s_ui_screen == UI_SCREEN_SETTINGS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_SETTINGS && s_device_settings_dirty) {
                 render_device_settings_frame();
+            }
+        } else if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS) {
+            poll_touch();
+            now = xTaskGetTickCount();
+            if (s_wifi_should_connect && !s_skyorb_wifi_connected &&
+                (int32_t)(now - s_wifi_settings_last_frame) >= pdMS_TO_TICKS(350)) {
+                s_wifi_settings_dirty = true;
+            }
+            if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS && s_wifi_settings_dirty) {
+                render_wifi_settings_frame();
             }
         } else {
             int64_t physics_start_us = esp_timer_get_time();

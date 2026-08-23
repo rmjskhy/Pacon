@@ -24,7 +24,9 @@ import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.drawable.GradientDrawable;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -32,7 +34,10 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.WindowInsets;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.ArrayAdapter;
@@ -70,9 +75,22 @@ public class MainActivity extends Activity {
     private static final int LCD_FRAME_BYTES = LCD_WIDTH * LCD_HEIGHT * 2;
     private static final int MAX_MEDIA_HEX_CHARS = 216; // legacy compatibility path
     private static final int MAX_MEDIA_FPS = 12;
+    private static final int[] RADAR_RANGE_KM = {5, 10, 15, 25, 35, 50};
+    private static final int[] SCREEN_TIMEOUT_SECONDS = {15, 30, 60, 120, 300, 0};
+    private static final String[] SCREEN_TIMEOUT_LABELS = {
+            "15 秒", "30 秒", "1 分钟", "2 分钟", "5 分钟", "永不关闭（仍会降亮）"
+    };
     private static final int MEDIA_BINARY_HEADER_BYTES = 4;
     private static final int MEDIA_BINARY_WINDOW_PACKETS = 8;
     private static final int MEDIA_BINARY_ACK_TIMEOUT_MS = 8000;
+    /* Some phones still schedule scan radio work briefly after stopScan().
+     * Give the CCCD transaction time to settle before the automatic catalog
+     * request, and keep every control request on mediaExecutor. */
+    private static final long AUTO_MEDIA_REFRESH_DELAY_MS = 1200L;
+    /* Diagnostic A/B build: keep the freshly established GATT link completely
+     * idle.  The user can still request PING, status, or the media catalog
+     * manually after confirming that the connection itself stays alive. */
+    private static final boolean AUTO_MEDIA_REFRESH_ON_CONNECT = false;
     /* NAND directory/stat operations can briefly wait behind the display
      * reader, so catalog queries need more time than a small control command. */
     private static final long MEDIA_CATALOG_TIMEOUT_MS = 15000L;
@@ -96,6 +114,8 @@ public class MainActivity extends Activity {
     private BluetoothGattCharacteristic responseCharacteristic;
     private BluetoothGattCharacteristic mediaDataCharacteristic;
     private boolean scanning;
+    private boolean bleConnecting;
+    private boolean bleConnected;
     private int negotiatedMtu = 23;
     private volatile boolean mediaUploading;
     private volatile boolean mediaCancelRequested;
@@ -110,7 +130,13 @@ public class MainActivity extends Activity {
     private String pendingMediaAck;
 
     private TextView deviceText;
+    private TextView connectionStatus;
     private TextView logText;
+    private Button scanButton;
+    private Button connectButton;
+    private Button disconnectButton;
+    private ScrollView pageScroll;
+    private ScrollView logScroll;
     private EditText commandEdit;
     private Button uploadButton;
     private Button mediaListButton;
@@ -121,8 +147,12 @@ public class MainActivity extends Activity {
     private ListView mediaListView;
     private ArrayAdapter<MediaEntry> mediaAdapter;
     private LinearLayout settingsPanel;
+    private LinearLayout wifiSettingsPanel;
+    private LinearLayout radarSettingsPanel;
+    private LinearLayout clockSettingsPanel;
     private SeekBar brightnessSeek;
     private TextView brightnessValue;
+    private Spinner screenTimeoutSpinner;
     private SeekBar rangeSeek;
     private TextView rangeValue;
     private EditText latitudeEdit;
@@ -130,8 +160,20 @@ public class MainActivity extends Activity {
     private EditText wifiSsidEdit;
     private EditText wifiPasswordEdit;
     private TextView settingsStatus;
+    private TextView wifiSettingsStatus;
+    private TextView radarSettingsStatus;
+    private TextView clockSettingsStatus;
+    private EditText customDateEdit;
+    private EditText customTimeEdit;
+    private EditText alarmTimeEdit;
+    private Spinner watchStyleSpinner;
+    private ListView wifiListView;
+    private ArrayAdapter<WifiEntry> wifiAdapter;
+    private final ArrayList<WifiEntry> wifiEntries = new ArrayList<>();
     private final ArrayList<MediaEntry> mediaEntries = new ArrayList<>();
     private Uri lastMediaUri;
+    private byte[] lastPreparedMedia;
+    private String lastPreparedDisplayName;
     private volatile String currentMediaName;
 
     private static final class MediaEntry {
@@ -167,9 +209,26 @@ public class MainActivity extends Activity {
         }
     }
 
+    private static final class WifiEntry {
+        final int index;
+        final String ssid;
+        final boolean selected;
+
+        WifiEntry(int index, String ssid, boolean selected) {
+            this.index = index;
+            this.ssid = ssid;
+            this.selected = selected;
+        }
+
+        @Override public String toString() {
+            return (selected ? "●  " : "○  ") + ssid;
+        }
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
 
         BluetoothManager manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         bluetoothAdapter = manager == null ? null : manager.getAdapter();
@@ -182,6 +241,9 @@ public class MainActivity extends Activity {
     }
 
     private void buildUi() {
+        pageScroll = new ScrollView(this);
+        pageScroll.setFillViewport(true);
+        pageScroll.setClipToPadding(false);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(18), dp(18), dp(18), dp(20));
@@ -200,10 +262,14 @@ public class MainActivity extends Activity {
         deviceText.setTextColor(Color.rgb(224, 230, 245));
         root.addView(deviceText, new LinearLayout.LayoutParams(-1, -2));
 
+        connectionStatus = label("● 未连接");
+        connectionStatus.setTextSize(15);
+        root.addView(connectionStatus, new LinearLayout.LayoutParams(-1, dp(34)));
+
         LinearLayout scanRow = new LinearLayout(this);
-        Button scanButton = button("扫描 PACON");
-        Button connectButton = button("连接");
-        Button disconnectButton = button("断开");
+        scanButton = button("扫描 PACON");
+        connectButton = button("连接");
+        disconnectButton = button("断开");
         scanRow.addView(scanButton, weightParams());
         scanRow.addView(connectButton, weightParams());
         scanRow.addView(disconnectButton, weightParams());
@@ -216,7 +282,7 @@ public class MainActivity extends Activity {
         testRow.addView(statusButton, weightParams());
         root.addView(testRow);
 
-        Button settingsToggle = button("设备设置");
+        Button settingsToggle = button("设备与显示");
         root.addView(settingsToggle, new LinearLayout.LayoutParams(-1, -2));
         settingsPanel = new LinearLayout(this);
         settingsPanel.setOrientation(LinearLayout.VERTICAL);
@@ -236,29 +302,99 @@ public class MainActivity extends Activity {
         brightnessRow.addView(brightnessValue, new LinearLayout.LayoutParams(dp(48), -2));
         settingsPanel.addView(brightnessRow);
 
+        LinearLayout timeoutRow = new LinearLayout(this);
+        timeoutRow.setGravity(Gravity.CENTER_VERTICAL);
+        timeoutRow.addView(label("自动息屏"), new LinearLayout.LayoutParams(dp(88), -2));
+        screenTimeoutSpinner = new Spinner(this);
+        ArrayAdapter<String> timeoutAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, SCREEN_TIMEOUT_LABELS);
+        timeoutAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        screenTimeoutSpinner.setAdapter(timeoutAdapter);
+        screenTimeoutSpinner.setSelection(screenTimeoutIndex(60));
+        timeoutRow.addView(screenTimeoutSpinner, weightParams());
+        Button applyTimeoutButton = button("应用");
+        timeoutRow.addView(applyTimeoutButton,
+                new LinearLayout.LayoutParams(dp(76), dp(46)));
+        settingsPanel.addView(timeoutRow);
+
+        settingsStatus = label("未读取设备设置");
+        settingsStatus.setTextColor(Color.rgb(166, 176, 202));
+        settingsPanel.addView(settingsStatus);
+        settingsPanel.setVisibility(View.GONE);
+        root.addView(settingsPanel, new LinearLayout.LayoutParams(-1, -2));
+
+        Button wifiSettingsToggle = button("Wi-Fi 管理");
+        root.addView(wifiSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        wifiSettingsPanel = new LinearLayout(this);
+        wifiSettingsPanel.setOrientation(LinearLayout.VERTICAL);
+        wifiSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
+        wifiSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+
+        wifiListView = new ListView(this);
+        wifiAdapter = new ArrayAdapter<WifiEntry>(this,
+                android.R.layout.simple_list_item_1, wifiEntries) {
+            @Override public View getView(int position, View convertView,
+                                          android.view.ViewGroup parent) {
+                WifiEntry entry = getItem(position);
+                TextView text = convertView instanceof TextView
+                        ? (TextView) convertView : new TextView(MainActivity.this);
+                text.setText(entry == null ? "" : entry.toString());
+                text.setTextColor(entry != null && entry.selected
+                        ? Color.rgb(10, 132, 255) : Color.rgb(226, 231, 244));
+                text.setTextSize(15);
+                text.setGravity(Gravity.CENTER_VERTICAL);
+                text.setPadding(dp(14), dp(8), dp(14), dp(8));
+                text.setMinHeight(dp(48));
+                text.setBackground(roundBackground(Color.rgb(25, 32, 52), 10));
+                return text;
+            }
+        };
+        wifiListView.setAdapter(wifiAdapter);
+        wifiListView.setBackgroundColor(Color.TRANSPARENT);
+        wifiSettingsPanel.addView(wifiListView,
+                new LinearLayout.LayoutParams(-1, dp(210)));
+
+        wifiSsidEdit = settingsEdit("新增 Wi-Fi 名称");
+        wifiPasswordEdit = settingsEdit("Wi-Fi 密码（开放网络可留空）");
+        wifiPasswordEdit.setInputType(InputType.TYPE_CLASS_TEXT
+                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        wifiSettingsPanel.addView(wifiSsidEdit);
+        wifiSettingsPanel.addView(wifiPasswordEdit);
+        LinearLayout wifiButtons = new LinearLayout(this);
+        Button refreshWifiButton = button("刷新列表");
+        Button saveWifiButton = button("保存网络");
+        wifiButtons.addView(refreshWifiButton, weightParams());
+        wifiButtons.addView(saveWifiButton, weightParams());
+        wifiSettingsPanel.addView(wifiButtons);
+        wifiSettingsStatus = label("点击网络连接，长按删除");
+        wifiSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
+        wifiSettingsPanel.addView(wifiSettingsStatus);
+        wifiSettingsPanel.setVisibility(View.GONE);
+        root.addView(wifiSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
+
+        Button radarSettingsToggle = button("雷达设置");
+        root.addView(radarSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        radarSettingsPanel = new LinearLayout(this);
+        radarSettingsPanel.setOrientation(LinearLayout.VERTICAL);
+        radarSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
+        radarSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+
         LinearLayout rangeRow = new LinearLayout(this);
         rangeRow.setGravity(Gravity.CENTER_VERTICAL);
-        rangeRow.addView(label("SkyOrb 量程"), new LinearLayout.LayoutParams(dp(88), -2));
+        rangeRow.addView(label("雷达半径"), new LinearLayout.LayoutParams(dp(88), -2));
         rangeSeek = new SeekBar(this);
-        rangeSeek.setMax(3);
+        rangeSeek.setMax(RADAR_RANGE_KM.length - 1);
         rangeSeek.setProgress(3);
         rangeRow.addView(rangeSeek, weightParams());
-        rangeValue = label("3");
+        rangeValue = label(RADAR_RANGE_KM[3] + " km");
         rangeValue.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
-        rangeRow.addView(rangeValue, new LinearLayout.LayoutParams(dp(48), -2));
-        settingsPanel.addView(rangeRow);
+        rangeRow.addView(rangeValue, new LinearLayout.LayoutParams(dp(64), -2));
+        radarSettingsPanel.addView(rangeRow);
 
         latitudeEdit = settingsEdit("纬度");
         longitudeEdit = settingsEdit("经度");
-        settingsPanel.addView(latitudeEdit);
-        settingsPanel.addView(longitudeEdit);
-
-        wifiSsidEdit = settingsEdit("Wi-Fi 名称");
-        wifiPasswordEdit = settingsEdit("Wi-Fi 密码");
-        wifiPasswordEdit.setInputType(InputType.TYPE_CLASS_TEXT
-                | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        settingsPanel.addView(wifiSsidEdit);
-        settingsPanel.addView(wifiPasswordEdit);
+        radarSettingsPanel.addView(latitudeEdit);
+        radarSettingsPanel.addView(longitudeEdit);
 
         LinearLayout settingsButtons = new LinearLayout(this);
         Button refreshSettingsButton = button("读取");
@@ -267,12 +403,70 @@ public class MainActivity extends Activity {
         settingsButtons.addView(refreshSettingsButton, weightParams());
         settingsButtons.addView(autoLocationButton, weightParams());
         settingsButtons.addView(saveSettingsButton, weightParams());
-        settingsPanel.addView(settingsButtons);
-        settingsStatus = label("未读取设置");
-        settingsStatus.setTextColor(Color.rgb(166, 176, 202));
-        settingsPanel.addView(settingsStatus);
-        settingsPanel.setVisibility(View.GONE);
-        root.addView(settingsPanel, new LinearLayout.LayoutParams(-1, -2));
+        radarSettingsPanel.addView(settingsButtons);
+        radarSettingsStatus = label("未读取雷达设置");
+        radarSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
+        radarSettingsPanel.addView(radarSettingsStatus);
+        radarSettingsPanel.setVisibility(View.GONE);
+        root.addView(radarSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
+
+        Button clockSettingsToggle = button("时钟与闹钟");
+        root.addView(clockSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        clockSettingsPanel = new LinearLayout(this);
+        clockSettingsPanel.setOrientation(LinearLayout.VERTICAL);
+        clockSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
+        clockSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+
+        clockSettingsStatus = label("未读取时钟状态");
+        clockSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
+        clockSettingsPanel.addView(clockSettingsStatus);
+        customDateEdit = settingsEdit("自定义日期 YYYY-MM-DD");
+        customTimeEdit = settingsEdit("自定义时间 HH:MM:SS");
+        clockSettingsPanel.addView(customDateEdit);
+        clockSettingsPanel.addView(customTimeEdit);
+        LinearLayout clockReadWriteRow = new LinearLayout(this);
+        Button refreshClockButton = button("读取时钟");
+        Button setCustomClockButton = button("写入自定义");
+        clockReadWriteRow.addView(refreshClockButton, weightParams());
+        clockReadWriteRow.addView(setCustomClockButton, weightParams());
+        clockSettingsPanel.addView(clockReadWriteRow);
+        LinearLayout syncRow = new LinearLayout(this);
+        Button syncBleClockButton = button("蓝牙校时");
+        Button syncWifiClockButton = button("Wi-Fi 校时");
+        syncRow.addView(syncBleClockButton, weightParams());
+        syncRow.addView(syncWifiClockButton, weightParams());
+        clockSettingsPanel.addView(syncRow);
+
+        alarmTimeEdit = settingsEdit("每日闹钟 HH:MM");
+        clockSettingsPanel.addView(alarmTimeEdit);
+        LinearLayout alarmRow = new LinearLayout(this);
+        Button setAlarmButton = button("设置闹钟");
+        Button disableAlarmButton = button("关闭闹钟");
+        Button stopAlarmButton = button("停止响铃");
+        alarmRow.addView(setAlarmButton, weightParams());
+        alarmRow.addView(disableAlarmButton, weightParams());
+        alarmRow.addView(stopAlarmButton, weightParams());
+        clockSettingsPanel.addView(alarmRow);
+        Button testAlarmButton = button("测试响铃");
+        clockSettingsPanel.addView(testAlarmButton,
+                new LinearLayout.LayoutParams(-1, dp(44)));
+
+        LinearLayout watchStyleRow = new LinearLayout(this);
+        watchStyleRow.setGravity(Gravity.CENTER_VERTICAL);
+        watchStyleRow.addView(label("表盘样式"), new LinearLayout.LayoutParams(dp(88), -2));
+        watchStyleSpinner = new Spinner(this);
+        ArrayAdapter<String> styleAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item,
+                new String[]{"KKD1 · 狂三双臂指针", "KKD2 · 旋转人物表盘"});
+        styleAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        watchStyleSpinner.setAdapter(styleAdapter);
+        watchStyleRow.addView(watchStyleSpinner, weightParams());
+        Button applyWatchStyleButton = button("应用");
+        watchStyleRow.addView(applyWatchStyleButton,
+                new LinearLayout.LayoutParams(dp(74), dp(44)));
+        clockSettingsPanel.addView(watchStyleRow);
+        clockSettingsPanel.setVisibility(View.GONE);
+        root.addView(clockSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
 
         commandEdit = new EditText(this);
         commandEdit.setSingleLine(true);
@@ -333,14 +527,68 @@ public class MainActivity extends Activity {
         mediaListView.setAdapter(mediaAdapter);
         root.addView(mediaListView, new LinearLayout.LayoutParams(-1, 240));
 
-        ScrollView scroll = new ScrollView(this);
+        TextView logTitle = label("运行日志");
+        logTitle.setTextSize(15);
+        logTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        LinearLayout.LayoutParams logTitleParams = new LinearLayout.LayoutParams(-1, -2);
+        logTitleParams.topMargin = dp(12);
+        root.addView(logTitle, logTitleParams);
+
+        logScroll = new ScrollView(this);
+        logScroll.setFillViewport(true);
+        logScroll.setNestedScrollingEnabled(true);
+        logScroll.setVerticalScrollBarEnabled(true);
+        logScroll.setScrollbarFadingEnabled(false);
+        logScroll.setBackground(roundBackground(Color.rgb(16, 23, 41), 12));
+        logScroll.setOnTouchListener((view, event) -> {
+            boolean dragging = event.getActionMasked() == MotionEvent.ACTION_DOWN
+                    || event.getActionMasked() == MotionEvent.ACTION_MOVE;
+            view.getParent().requestDisallowInterceptTouchEvent(dragging);
+            return false;
+        });
         logText = new TextView(this);
         logText.setTextSize(13);
         logText.setTextColor(Color.rgb(166, 176, 202));
-        scroll.addView(logText);
-        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        logText.setTextIsSelectable(true);
+        logText.setPadding(dp(12), dp(10), dp(12), dp(18));
+        logScroll.addView(logText, new ScrollView.LayoutParams(-1, -2));
+        root.addView(logScroll, new LinearLayout.LayoutParams(-1, dp(300)));
         styleUi(root);
-        setContentView(root);
+        pageScroll.addView(root, new ScrollView.LayoutParams(-1, -2));
+        setContentView(pageScroll);
+        pageScroll.setOnApplyWindowInsetsListener((view, insets) -> {
+            int topInset;
+            int bottomInset;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars());
+                topInset = bars.top;
+                bottomInset = bars.bottom;
+            } else {
+                topInset = insets.getSystemWindowInsetTop();
+                bottomInset = insets.getSystemWindowInsetBottom();
+            }
+            root.setPadding(dp(18), dp(18) + topInset,
+                    dp(18), dp(20) + bottomInset);
+            return insets;
+        });
+        pageScroll.requestApplyInsets();
+        updateConnectionUi("未连接", false, false);
+
+        View.OnFocusChangeListener revealEditor = (view, hasFocus) -> {
+            if (!hasFocus || pageScroll == null) return;
+            pageScroll.postDelayed(() -> {
+                int target = Math.max(0, view.getBottom() + ((View)view.getParent()).getTop()
+                        - pageScroll.getHeight() / 3);
+                pageScroll.smoothScrollTo(0, target);
+                view.requestRectangleOnScreen(new android.graphics.Rect(
+                        0, 0, view.getWidth(), view.getHeight()), true);
+            }, 280L);
+        };
+        wifiSsidEdit.setOnFocusChangeListener(revealEditor);
+        wifiPasswordEdit.setOnFocusChangeListener(revealEditor);
+        customDateEdit.setOnFocusChangeListener(revealEditor);
+        customTimeEdit.setOnFocusChangeListener(revealEditor);
+        alarmTimeEdit.setOnFocusChangeListener(revealEditor);
 
         scanButton.setOnClickListener(v -> startScan());
         connectButton.setOnClickListener(v -> connectSelected());
@@ -350,7 +598,34 @@ public class MainActivity extends Activity {
         settingsToggle.setOnClickListener(v -> {
             boolean visible = settingsPanel.getVisibility() == View.VISIBLE;
             settingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
-            if (!visible) refreshSettings();
+            wifiSettingsPanel.setVisibility(View.GONE);
+            radarSettingsPanel.setVisibility(View.GONE);
+            clockSettingsPanel.setVisibility(View.GONE);
+            if (!visible) refreshDeviceSettings();
+        });
+        wifiSettingsToggle.setOnClickListener(v -> {
+            boolean visible = wifiSettingsPanel.getVisibility() == View.VISIBLE;
+            settingsPanel.setVisibility(View.GONE);
+            radarSettingsPanel.setVisibility(View.GONE);
+            clockSettingsPanel.setVisibility(View.GONE);
+            wifiSettingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
+            if (!visible) refreshWifiProfiles();
+        });
+        radarSettingsToggle.setOnClickListener(v -> {
+            boolean visible = radarSettingsPanel.getVisibility() == View.VISIBLE;
+            settingsPanel.setVisibility(View.GONE);
+            wifiSettingsPanel.setVisibility(View.GONE);
+            clockSettingsPanel.setVisibility(View.GONE);
+            radarSettingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
+            if (!visible) refreshRadarSettings();
+        });
+        clockSettingsToggle.setOnClickListener(v -> {
+            boolean visible = clockSettingsPanel.getVisibility() == View.VISIBLE;
+            settingsPanel.setVisibility(View.GONE);
+            wifiSettingsPanel.setVisibility(View.GONE);
+            radarSettingsPanel.setVisibility(View.GONE);
+            clockSettingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
+            if (!visible) refreshClockSettings();
         });
         brightnessSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
@@ -361,9 +636,13 @@ public class MainActivity extends Activity {
                 setDeviceBrightness(seekBar.getProgress());
             }
         });
+        applyTimeoutButton.setOnClickListener(v -> setScreenTimeout());
         rangeSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                if (rangeValue != null) rangeValue.setText(String.valueOf(progress));
+                if (rangeValue != null) {
+                    int index = Math.max(0, Math.min(RADAR_RANGE_KM.length - 1, progress));
+                    rangeValue.setText(RADAR_RANGE_KM[index] + " km");
+                }
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) { }
             @Override public void onStopTrackingTouch(SeekBar seekBar) {
@@ -371,19 +650,37 @@ public class MainActivity extends Activity {
             }
         });
         refreshSettingsButton.setOnClickListener(v -> {
-            setSettingsStatus("正在读取设置…");
-            log("设置操作：读取");
-            refreshSettings();
+            setRadarSettingsStatus("正在读取雷达设置…");
+            refreshRadarSettings();
         });
         autoLocationButton.setOnClickListener(v -> {
-            setSettingsStatus("正在请求自动定位…");
-            log("设置操作：自动定位");
+            setRadarSettingsStatus("正在请求 IP 自动定位…");
             setAutoLocation();
         });
         saveSettingsButton.setOnClickListener(v -> {
-            setSettingsStatus("正在保存设置…");
-            log("设置操作：保存");
+            setRadarSettingsStatus("正在保存雷达设置…");
             saveSettings();
+        });
+        refreshWifiButton.setOnClickListener(v -> refreshWifiProfiles());
+        saveWifiButton.setOnClickListener(v -> saveWifiProfile());
+        refreshClockButton.setOnClickListener(v -> refreshClockSettings());
+        setCustomClockButton.setOnClickListener(v -> setCustomClock());
+        syncBleClockButton.setOnClickListener(v -> syncClockFromPhone());
+        syncWifiClockButton.setOnClickListener(v -> syncClockFromWifi());
+        setAlarmButton.setOnClickListener(v -> setAlarm());
+        disableAlarmButton.setOnClickListener(v -> sendClockCommand("SET ALARM OFF", "闹钟已关闭"));
+        stopAlarmButton.setOnClickListener(v -> sendClockCommand("STOP ALARM", "响铃已停止"));
+        testAlarmButton.setOnClickListener(v -> sendClockCommand("TEST ALARM", "正在测试蜂鸣器"));
+        applyWatchStyleButton.setOnClickListener(v ->
+                applyWatchStyle(watchStyleSpinner.getSelectedItemPosition()));
+        wifiListView.setOnItemClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= wifiEntries.size()) return;
+            selectWifiProfile(wifiEntries.get(position));
+        });
+        wifiListView.setOnItemLongClickListener((parent, view, position, id) -> {
+            if (position < 0 || position >= wifiEntries.size()) return true;
+            showDeleteWifiDialog(wifiEntries.get(position));
+            return true;
         });
         sendButton.setOnClickListener(v -> writeCommand(commandEdit.getText().toString().trim()));
         uploadButton.setOnClickListener(v -> chooseMediaFile());
@@ -398,7 +695,10 @@ public class MainActivity extends Activity {
             }
         });
         retryUploadButton.setOnClickListener(v -> {
-            if (lastMediaUri != null && !mediaUploading) startMediaUpload(lastMediaUri);
+            if (lastMediaUri != null && !mediaUploading) {
+                startMediaUploadPrepared(lastMediaUri, lastPreparedMedia,
+                        lastPreparedDisplayName);
+            }
         });
         mediaListView.setOnItemLongClickListener((parent, view, position, id) -> {
             if (position < 0 || position >= mediaEntries.size()) return true;
@@ -426,6 +726,26 @@ public class MainActivity extends Activity {
         return view;
     }
 
+    private void updateConnectionUi(String text, boolean connecting, boolean connected) {
+        bleConnecting = connecting;
+        bleConnected = connected;
+        if (connectionStatus != null) {
+            connectionStatus.setText("● " + text);
+            connectionStatus.setTextColor(connected ? Color.rgb(48, 209, 88) :
+                    connecting ? Color.rgb(255, 190, 75) : Color.rgb(255, 105, 97));
+        }
+        boolean canConnect = selectedDevice != null && !connecting && !connected;
+        if (connectButton != null) {
+            connectButton.setEnabled(canConnect);
+            connectButton.setAlpha(canConnect ? 1.0f : 0.42f);
+        }
+        boolean canDisconnect = connecting || connected;
+        if (disconnectButton != null) {
+            disconnectButton.setEnabled(canDisconnect);
+            disconnectButton.setAlpha(canDisconnect ? 1.0f : 0.42f);
+        }
+    }
+
     private EditText settingsEdit(String hint) {
         EditText edit = new EditText(this);
         edit.setHint(hint);
@@ -451,7 +771,25 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void refreshSettings() {
+    private void setWifiSettingsStatus(String text) {
+        runOnUiThread(() -> {
+            if (wifiSettingsStatus != null) wifiSettingsStatus.setText(text);
+        });
+    }
+
+    private void setRadarSettingsStatus(String text) {
+        runOnUiThread(() -> {
+            if (radarSettingsStatus != null) radarSettingsStatus.setText(text);
+        });
+    }
+
+    private void setClockSettingsStatus(String text) {
+        runOnUiThread(() -> {
+            if (clockSettingsStatus != null) clockSettingsStatus.setText(text);
+        });
+    }
+
+    private void refreshDeviceSettings() {
         if (!settingsReady()) {
             setSettingsStatus("请先连接 PACON");
             return;
@@ -460,28 +798,314 @@ public class MainActivity extends Activity {
             try {
                 String response = sendCommandAndWait("GET SETTINGS", 8000);
                 int brightness = parseJsonInt(response, "brightness", -1);
-                int range = parseJsonInt(response, "range", -1);
-                String lat = parseJsonNumber(response, "lat");
-                String lon = parseJsonNumber(response, "lon");
-                String ssid = parseJsonString(response, "ssid");
+                int screenTimeout = parseJsonInt(response, "screen_timeout", 60);
                 runOnUiThread(() -> {
                     if (brightness >= 0) {
                         brightnessSeek.setProgress(brightness);
                         brightnessValue.setText(brightness + "%");
                     }
-                    if (range >= 0) {
-                        rangeSeek.setProgress(Math.min(3, range));
-                        rangeValue.setText(String.valueOf(Math.min(3, range)));
-                    }
-                    if (!lat.isEmpty() && !"0.000000".equals(lat)) latitudeEdit.setText(lat);
-                    if (!lon.isEmpty() && !"0.000000".equals(lon)) longitudeEdit.setText(lon);
-                    if (!ssid.isEmpty()) wifiSsidEdit.setText(ssid);
-                    settingsStatus.setText("设置已读取");
+                    screenTimeoutSpinner.setSelection(screenTimeoutIndex(screenTimeout));
+                    settingsStatus.setText("设备设置已读取");
                 });
             } catch (Exception e) {
-                runOnUiThread(() -> settingsStatus.setText("读取失败：" + e.getMessage()));
+                setSettingsStatus("读取失败：" + e.getMessage());
             }
         });
+    }
+
+    private static int screenTimeoutIndex(int seconds) {
+        for (int index = 0; index < SCREEN_TIMEOUT_SECONDS.length; index++) {
+            if (SCREEN_TIMEOUT_SECONDS[index] == seconds) return index;
+        }
+        return 2;
+    }
+
+    private void setScreenTimeout() {
+        if (!settingsReady()) {
+            setSettingsStatus("请先连接 PACON");
+            return;
+        }
+        int index = screenTimeoutSpinner == null ? 2
+                : screenTimeoutSpinner.getSelectedItemPosition();
+        index = Math.max(0, Math.min(SCREEN_TIMEOUT_SECONDS.length - 1, index));
+        final int seconds = SCREEN_TIMEOUT_SECONDS[index];
+        setSettingsStatus("正在应用息屏时间…");
+        mediaExecutor.execute(() -> {
+            try {
+                String response = sendCommandAndWait("SET SCREEN TIMEOUT " + seconds, 8000);
+                requireResponse(response, "OK SCREEN TIMEOUT ");
+                setSettingsStatus(seconds == 0 ? "已设为永不关闭（20 秒后仍会降亮）"
+                        : "无操作 " + seconds + " 秒后关闭屏幕");
+            } catch (Exception e) {
+                setSettingsStatus("设置失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void refreshClockSettings() {
+        if (!settingsReady()) {
+            setClockSettingsStatus("请先连接 PACON");
+            return;
+        }
+        setClockSettingsStatus("正在读取 PCF85063 与闹钟状态…");
+        mediaExecutor.execute(() -> {
+            try {
+                String response = sendCommandAndWait("GET CLOCK", 8000);
+                applyClockResponse(response);
+            } catch (Exception e) {
+                setClockSettingsStatus("读取失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private String applyClockResponse(String response) throws IOException {
+        String value = parseJsonString(response, "time");
+        String source = parseJsonString(response, "source");
+        String sync = parseJsonString(response, "sync");
+        String alarm = parseJsonString(response, "alarm");
+        boolean rtcValid = parseJsonBoolean(response, "rtc_valid", false);
+        boolean alarmEnabled = parseJsonBoolean(response, "alarm_enabled", false);
+        boolean ringing = parseJsonBoolean(response, "ringing", false);
+        int style = parseJsonInt(response, "style", 0);
+        if (value.isEmpty()) throw new IOException("设备返回的时钟状态不完整");
+        runOnUiThread(() -> {
+            if (value.length() >= 19) {
+                customDateEdit.setText(value.substring(0, 10));
+                customTimeEdit.setText(value.substring(11, 19));
+            }
+            alarmTimeEdit.setText(alarm);
+            watchStyleSpinner.setSelection(Math.max(0, Math.min(1, style)));
+            String styleText = style == 1 ? "KKD2 · 旋转人物表盘" : "KKD1 · 狂三双臂指针";
+            String sourceText;
+            switch (source) {
+                case "custom": sourceText = "自定义时间"; break;
+                case "ble": sourceText = "手机蓝牙校时"; break;
+                case "wifi": sourceText = "Wi-Fi 校时"; break;
+                default: sourceText = "RTC 原始时间"; break;
+            }
+            String syncText = "";
+            if ("waiting_wifi".equals(sync)) syncText = "；等待 Wi-Fi";
+            else if ("syncing".equals(sync)) syncText = "；网络校时中";
+            else if ("failed".equals(sync)) syncText = "；网络校时失败";
+            clockSettingsStatus.setText((rtcValid ? value : "RTC 尚未有效")
+                    + " · " + sourceText + syncText + " · 闹钟 "
+                    + (alarmEnabled ? alarm : "关闭") + (ringing ? "（响铃中）" : "")
+                    + " · 当前 " + styleText);
+        });
+        return sync;
+    }
+
+    private void applyWatchStyle(int requestedStyle) {
+        if (!settingsReady()) {
+            setClockSettingsStatus("请先连接 PACON");
+            return;
+        }
+        final int expected = Math.max(0, Math.min(1, requestedStyle));
+        final String expectedName = expected == 1 ? "KKD2" : "KKD1";
+        setClockSettingsStatus("正在切换到 " + expectedName + "…");
+        mediaExecutor.execute(() -> {
+            try {
+                sendSettingCommandChecked("SET WATCH STYLE " + expected);
+                Thread.sleep(350L);
+                String response = sendCommandAndWait("GET CLOCK", 8000);
+                int actual = parseJsonInt(response, "style", -1);
+                applyClockResponse(response);
+                if (actual != expected) {
+                    setClockSettingsStatus("切换失败：请求 " + expectedName
+                            + "，设备仍回报 " + (actual == 1 ? "KKD2" : "KKD1"));
+                } else {
+                    setClockSettingsStatus("已确认设备正在使用 " + expectedName);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                setClockSettingsStatus("表盘切换失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void setCustomClock() {
+        String date = customDateEdit.getText().toString().trim();
+        String time = customTimeEdit.getText().toString().trim();
+        if (!date.matches("\\d{4}-\\d{2}-\\d{2}") ||
+                !time.matches("\\d{2}:\\d{2}:\\d{2}")) {
+            setClockSettingsStatus("格式应为 YYYY-MM-DD 和 HH:MM:SS");
+            return;
+        }
+        sendClockCommand("SET TIME " + date + " " + time + " CUSTOM", "自定义时间已写入 RTC");
+    }
+
+    private void syncClockFromPhone() {
+        String now = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                .format(new Date());
+        sendClockCommand("SET TIME " + now + " BLE", "已用手机本地时间校准 RTC");
+    }
+
+    private void syncClockFromWifi() {
+        if (!settingsReady()) {
+            setClockSettingsStatus("请先连接 PACON");
+            return;
+        }
+        setClockSettingsStatus("正在请求 Wi-Fi 网络时间…");
+        mediaExecutor.execute(() -> {
+            try {
+                sendSettingCommandChecked("SYNC WIFI TIME");
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    String response = sendCommandAndWait("GET CLOCK", 8000);
+                    String state = applyClockResponse(response);
+                    if ("ok".equals(state) || "failed".equals(state)) return;
+                    Thread.sleep(1000L);
+                }
+                setClockSettingsStatus("网络校时仍未完成，请检查 PACON 的 Wi-Fi 连接");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                setClockSettingsStatus("网络校时已取消");
+            } catch (Exception e) {
+                setClockSettingsStatus("网络校时失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void setAlarm() {
+        String alarm = alarmTimeEdit.getText().toString().trim();
+        if (!alarm.matches("(?:[01]\\d|2[0-3]):[0-5]\\d")) {
+            setClockSettingsStatus("闹钟格式应为 HH:MM，例如 07:30");
+            return;
+        }
+        sendClockCommand("SET ALARM " + alarm, "每日闹钟已设置为 " + alarm);
+    }
+
+    private void sendClockCommand(String command, String success) {
+        if (!settingsReady()) {
+            setClockSettingsStatus("请先连接 PACON");
+            return;
+        }
+        setClockSettingsStatus("正在发送…");
+        mediaExecutor.execute(() -> {
+            try {
+                sendSettingCommandChecked(command);
+                setClockSettingsStatus(success);
+                Thread.sleep(250L);
+                applyClockResponse(sendCommandAndWait("GET CLOCK", 8000));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                setClockSettingsStatus("操作失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void refreshRadarSettings() {
+        if (!settingsReady()) {
+            setRadarSettingsStatus("请先连接 PACON");
+            return;
+        }
+        mediaExecutor.execute(() -> {
+            try {
+                String response = sendCommandAndWait("GET RADAR", 8000);
+                applyRadarResponse(response);
+            } catch (Exception e) {
+                setRadarSettingsStatus("读取失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void refreshWifiProfiles() {
+        if (!settingsReady()) {
+            setWifiSettingsStatus("请先连接 PACON");
+            return;
+        }
+        setWifiSettingsStatus("正在读取已保存网络…");
+        mediaExecutor.execute(() -> {
+            try {
+                String listResponse = sendCommandAndWait("GET WIFI LIST", 8000);
+                int count = Math.max(0, parseJsonInt(listResponse, "count", 0));
+                int selected = parseJsonInt(listResponse, "selected", -1);
+                ArrayList<WifiEntry> loaded = new ArrayList<>();
+                for (int i = 0; i < count; i++) {
+                    String itemResponse = sendCommandAndWait("GET WIFI " + i, 8000);
+                    String ssid = parseJsonString(itemResponse, "ssid");
+                    if (!ssid.isEmpty()) {
+                        boolean isSelected = parseJsonBoolean(itemResponse, "selected", i == selected);
+                        loaded.add(new WifiEntry(i, ssid, isSelected));
+                    }
+                }
+                runOnUiThread(() -> {
+                    wifiEntries.clear();
+                    wifiEntries.addAll(loaded);
+                    wifiAdapter.notifyDataSetChanged();
+                    wifiSettingsStatus.setText(loaded.isEmpty()
+                            ? "暂无已保存网络"
+                            : "共 " + loaded.size() + " 个；点击连接，长按删除");
+                });
+            } catch (Exception e) {
+                setWifiSettingsStatus("读取失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void saveWifiProfile() {
+        if (!settingsReady()) {
+            setWifiSettingsStatus("请先连接 PACON");
+            return;
+        }
+        String ssid = wifiSsidEdit.getText().toString().trim();
+        String password = wifiPasswordEdit.getText().toString();
+        if (ssid.isEmpty()) {
+            setWifiSettingsStatus("请输入 Wi-Fi 名称");
+            return;
+        }
+        setWifiSettingsStatus("正在保存 " + ssid + "…");
+        mediaExecutor.execute(() -> {
+            try {
+                sendSettingCommandChecked("SET WIFI " + ssid + "|" + password);
+                runOnUiThread(() -> {
+                    wifiSsidEdit.setText("");
+                    wifiPasswordEdit.setText("");
+                });
+                setWifiSettingsStatus("已保存，正在刷新…");
+                refreshWifiProfiles();
+            } catch (Exception e) {
+                setWifiSettingsStatus("保存失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void selectWifiProfile(WifiEntry entry) {
+        if (!settingsReady()) {
+            setWifiSettingsStatus("请先连接 PACON");
+            return;
+        }
+        setWifiSettingsStatus("正在连接 " + entry.ssid + "…");
+        mediaExecutor.execute(() -> {
+            try {
+                sendSettingCommandChecked("SELECT WIFI " + entry.index);
+                setWifiSettingsStatus("已发起连接：" + entry.ssid);
+                refreshWifiProfiles();
+            } catch (Exception e) {
+                setWifiSettingsStatus("连接失败：" + e.getMessage());
+            }
+        });
+    }
+
+    private void showDeleteWifiDialog(WifiEntry entry) {
+        new AlertDialog.Builder(this)
+                .setTitle("删除已保存网络？")
+                .setMessage(entry.ssid)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("删除", (dialog, which) -> {
+                    setWifiSettingsStatus("正在删除 " + entry.ssid + "…");
+                    mediaExecutor.execute(() -> {
+                        try {
+                            sendSettingCommandChecked("DELETE WIFI " + entry.index);
+                            setWifiSettingsStatus("已删除，正在刷新…");
+                            refreshWifiProfiles();
+                        } catch (Exception e) {
+                            setWifiSettingsStatus("删除失败：" + e.getMessage());
+                        }
+                    });
+                })
+                .show();
     }
 
     private void setDeviceBrightness(int percent) {
@@ -490,57 +1114,129 @@ public class MainActivity extends Activity {
             return;
         }
         setSettingsStatus("正在应用亮度…");
-        mediaExecutor.execute(() -> sendSettingCommand("SET BRIGHTNESS " + percent));
+        mediaExecutor.execute(() -> sendSettingCommand("SET BRIGHTNESS " + percent, false));
     }
 
     private void setSkyOrbRange(int range) {
         if (!settingsReady()) {
-            setSettingsStatus("请先连接 PACON");
+            setRadarSettingsStatus("请先连接 PACON");
             return;
         }
-        setSettingsStatus("正在应用量程…");
-        mediaExecutor.execute(() -> sendSettingCommand("SET RANGE " + range));
+        setRadarSettingsStatus("正在应用量程…");
+        mediaExecutor.execute(() -> sendSettingCommand("SET RANGE " + range, true));
     }
 
     private void setAutoLocation() {
         if (!settingsReady()) {
-            setSettingsStatus("请先连接 PACON");
+            setRadarSettingsStatus("请先连接 PACON");
             return;
         }
-        mediaExecutor.execute(() -> sendSettingCommand("SET AUTO_LOCATION"));
+        mediaExecutor.execute(this::pollAutoLocation);
+    }
+
+    private void pollAutoLocation() {
+        try {
+            sendSettingCommandChecked("SET AUTO_LOCATION");
+            for (int attempt = 0; attempt < 22; attempt++) {
+                String response = sendCommandAndWait("GET RADAR", 8000);
+                String state = applyRadarResponse(response);
+                if ("ready".equals(state) || "failed".equals(state) ||
+                        "waiting_wifi".equals(state)) return;
+                Thread.sleep(1000L);
+            }
+            setRadarSettingsStatus("自动定位仍未完成，请检查网络后重试");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            setRadarSettingsStatus("自动定位已取消");
+        } catch (Exception e) {
+            setRadarSettingsStatus("自动定位失败：" + e.getMessage());
+        }
+    }
+
+    private String applyRadarResponse(String response) throws IOException {
+        int range = parseJsonInt(response, "range", -1);
+        String lat = parseJsonNumber(response, "lat");
+        String lon = parseJsonNumber(response, "lon");
+        boolean locationValid = parseJsonBoolean(response, "location_valid", false);
+        boolean locationAuto = parseJsonBoolean(response, "location_auto", false);
+        String locationState = parseJsonString(response, "location_state");
+        String locationError = parseJsonString(response, "location_error");
+        if (range < 0 || (locationValid && (lat.isEmpty() || lon.isEmpty()))) {
+            throw new IOException("设备返回的雷达设置不完整");
+        }
+        if (locationState.isEmpty()) locationState = locationValid ? "ready" : "unset";
+        final String finalState = locationState;
+        runOnUiThread(() -> {
+            int rangeIndex = Math.max(0, Math.min(RADAR_RANGE_KM.length - 1, range));
+            rangeSeek.setProgress(rangeIndex);
+            rangeValue.setText(RADAR_RANGE_KM[rangeIndex] + " km");
+            if (locationValid) {
+                latitudeEdit.setText(lat);
+                longitudeEdit.setText(lon);
+                radarSettingsStatus.setText(locationAuto
+                        ? "雷达设置已读取（IP 自动定位）"
+                        : "雷达设置已读取（手动位置）");
+                return;
+            }
+            latitudeEdit.setText("");
+            longitudeEdit.setText("");
+            switch (finalState) {
+                case "requested":
+                case "pending":
+                    radarSettingsStatus.setText("正在通过公网 IP 自动定位…");
+                    break;
+                case "waiting_wifi":
+                    radarSettingsStatus.setText("自动定位正在等待 Wi-Fi 联网");
+                    break;
+                case "failed":
+                    radarSettingsStatus.setText("自动定位失败：" + locationErrorText(locationError));
+                    break;
+                default:
+                    radarSettingsStatus.setText("位置尚未生成；联网后点自动定位");
+                    break;
+            }
+        });
+        return locationState;
+    }
+
+    private static String locationErrorText(String error) {
+        switch (error == null ? "" : error) {
+            case "client_init": return "网络客户端初始化失败";
+            case "network_open": return "定位服务连接失败";
+            case "network_read": return "定位服务没有返回数据";
+            case "http_status": return "定位服务拒绝请求";
+            case "invalid_response": return "定位服务响应无有效坐标";
+            default: return "未知网络错误";
+        }
     }
 
     private void saveSettings() {
         if (!settingsReady()) {
-            setSettingsStatus("请先连接 PACON");
+            setRadarSettingsStatus("请先连接 PACON");
             return;
         }
         String lat = latitudeEdit.getText().toString().trim();
         String lon = longitudeEdit.getText().toString().trim();
-        String ssid = wifiSsidEdit.getText().toString().trim();
-        String password = wifiPasswordEdit.getText().toString();
         mediaExecutor.execute(() -> {
             try {
-                if (!lat.isEmpty() || !lon.isEmpty()) {
-                    if (lat.isEmpty() || lon.isEmpty()) throw new IOException("经纬度需同时填写");
-                    sendSettingCommandChecked("SET LOCATION " + lat + " " + lon);
-                }
-                if (!ssid.isEmpty() || !password.isEmpty()) {
-                    if (ssid.isEmpty() || password.isEmpty()) throw new IOException("Wi-Fi 名称和密码需同时填写");
-                    sendSettingCommandChecked("SET WIFI " + ssid + "|" + password);
-                }
-                runOnUiThread(() -> settingsStatus.setText("设置已保存"));
+                if (lat.isEmpty() && lon.isEmpty()) throw new IOException("请填写经纬度，或使用自动定位");
+                if (lat.isEmpty() || lon.isEmpty()) throw new IOException("经纬度需同时填写");
+                sendSettingCommandChecked("SET LOCATION " + lat + " " + lon);
+                setRadarSettingsStatus("雷达设置已保存");
             } catch (Exception e) {
-                runOnUiThread(() -> settingsStatus.setText("保存失败：" + e.getMessage()));
+                setRadarSettingsStatus("保存失败：" + e.getMessage());
             }
         });
     }
 
-    private void sendSettingCommand(String command) {
+    private void sendSettingCommand(String command, boolean radar) {
         try {
             sendSettingCommandChecked(command);
+            if (radar) setRadarSettingsStatus("设置已应用");
+            else setSettingsStatus("设置已应用");
         } catch (Exception e) {
-            runOnUiThread(() -> settingsStatus.setText("设置失败：" + e.getMessage()));
+            if (radar) setRadarSettingsStatus("设置失败：" + e.getMessage());
+            else setSettingsStatus("设置失败：" + e.getMessage());
         }
     }
 
@@ -571,6 +1267,13 @@ public class MainActivity extends Activity {
                 + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"")
                 .matcher(response == null ? "" : response);
         return matcher.find() ? matcher.group(1) : "";
+    }
+
+    private static boolean parseJsonBoolean(String response, String key, boolean fallback) {
+        Matcher matcher = Pattern.compile("\\\"" + Pattern.quote(key)
+                + "\\\"\\s*:\\s*(true|false)", Pattern.CASE_INSENSITIVE)
+                .matcher(response == null ? "" : response);
+        return matcher.find() ? Boolean.parseBoolean(matcher.group(1)) : fallback;
     }
 
     private void styleUi(LinearLayout root) {
@@ -686,6 +1389,9 @@ public class MainActivity extends Activity {
             selectedDevice = device;
             runOnUiThread(() -> {
                 deviceText.setText("设备：" + DEVICE_NAME + "\n" + device.getAddress());
+                if (!bleConnecting && !bleConnected) {
+                    updateConnectionUi("已发现，未连接", false, false);
+                }
                 log("发现 " + DEVICE_NAME + "（" + device.getAddress() + "）");
             });
         }
@@ -706,12 +1412,17 @@ public class MainActivity extends Activity {
             return;
         }
         try {
+            /* Low-latency scanning must not continue while the same radio is
+             * establishing and servicing GATT.  On the Xiaomi test phone it
+             * starved acknowledged writes until the 5 s supervision timeout. */
+            stopScan();
             disconnect();
             /* disconnect() intentionally raises the upload-cancel flag.  A
              * fresh connection must clear that stale flag or catalog control
              * commands would skip their wait and report a false timeout. */
             mediaCancelRequested = false;
             log("正在连接...");
+            updateConnectionUi("正在连接…", true, false);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 gatt = selectedDevice.connectGatt(this, false, gattCallback,
                         android.bluetooth.BluetoothDevice.TRANSPORT_LE);
@@ -719,6 +1430,7 @@ public class MainActivity extends Activity {
                 gatt = selectedDevice.connectGatt(this, false, gattCallback);
             }
         } catch (SecurityException e) {
+            updateConnectionUi("连接失败", false, false);
             log("连接权限不足：" + e.getMessage());
         }
     }
@@ -732,12 +1444,13 @@ public class MainActivity extends Activity {
             commandWritePending = false;
             commandWriteLock.notifyAll();
         }
-        if (gatt == null) return;
-        try {
-            gatt.disconnect();
-            gatt.close();
-        } catch (SecurityException ignored) {
-            // The connection is already being torn down.
+        if (gatt != null) {
+            try {
+                gatt.disconnect();
+                gatt.close();
+            } catch (SecurityException ignored) {
+                // The connection is already being torn down.
+            }
         }
         gatt = null;
         commandCharacteristic = null;
@@ -747,6 +1460,7 @@ public class MainActivity extends Activity {
         if (mediaListButton != null) mediaListButton.setEnabled(false);
         if (cancelUploadButton != null) cancelUploadButton.setEnabled(false);
         if (retryUploadButton != null) retryUploadButton.setEnabled(false);
+        updateConnectionUi("已断开", false, false);
         log("已断开");
     }
 
@@ -754,8 +1468,20 @@ public class MainActivity extends Activity {
         @Override
         public void onConnectionStateChange(BluetoothGatt callbackGatt, int status, int newState) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                runOnUiThread(() -> log("已连接，正在发现服务"));
+                runOnUiThread(() -> {
+                    updateConnectionUi("已连接，正在发现服务…", true, false);
+                    log("已连接，正在发现服务");
+                });
                 try {
+                    /* PACON's compact 2.4 GHz RF path has substantially less
+                     * margin at BLE 2M on the target Xiaomi phone.  The phone
+                     * otherwise upgrades to 2M automatically and the link
+                     * reaches its five-second supervision timeout. */
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        callbackGatt.setPreferredPhy(BluetoothDevice.PHY_LE_1M_MASK,
+                                BluetoothDevice.PHY_LE_1M_MASK,
+                                BluetoothDevice.PHY_OPTION_NO_PREFERRED);
+                    }
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
                             && callbackGatt.requestMtu(247)) {
                         runOnUiThread(() -> log("BLE MTU 247 请求已发送"));
@@ -770,8 +1496,29 @@ public class MainActivity extends Activity {
                     commandWritePending = false;
                     commandWriteLock.notifyAll();
                 }
-                runOnUiThread(() -> log("连接断开，status=" + status));
+                runOnUiThread(() -> {
+                    /* A manual reconnect closes the previous GATT before the
+                     * new one is assigned.  Ignore that stale callback so it
+                     * cannot overwrite the new connection's visible state. */
+                    if (gatt != callbackGatt) return;
+                    gatt = null;
+                    commandCharacteristic = null;
+                    responseCharacteristic = null;
+                    mediaDataCharacteristic = null;
+                    try {
+                        callbackGatt.close();
+                    } catch (SecurityException ignored) { }
+                    updateConnectionUi("连接已断开", false, false);
+                    log("连接断开，status=" + status);
+                });
             }
+        }
+
+        @Override
+        public void onPhyUpdate(BluetoothGatt callbackGatt, int txPhy, int rxPhy,
+                                int status) {
+            runOnUiThread(() -> log("BLE PHY tx=" + txPhy + " rx=" + rxPhy
+                    + " status=" + status));
         }
 
         @Override
@@ -792,19 +1539,28 @@ public class MainActivity extends Activity {
         @Override
         public void onServicesDiscovered(BluetoothGatt callbackGatt, int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                runOnUiThread(() -> log("服务发现失败，status=" + status));
+                runOnUiThread(() -> {
+                    updateConnectionUi("服务发现失败", false, false);
+                    log("服务发现失败，status=" + status);
+                });
                 return;
             }
             BluetoothGattService service = callbackGatt.getService(SERVICE_UUID);
             if (service == null) {
-                runOnUiThread(() -> log("未找到 PACON 自定义服务"));
+                runOnUiThread(() -> {
+                    updateConnectionUi("服务不可用", false, false);
+                    log("未找到 PACON 自定义服务");
+                });
                 return;
             }
             commandCharacteristic = service.getCharacteristic(COMMAND_UUID);
             responseCharacteristic = service.getCharacteristic(RESPONSE_UUID);
             mediaDataCharacteristic = service.getCharacteristic(MEDIA_DATA_UUID);
             if (commandCharacteristic == null || responseCharacteristic == null) {
-                runOnUiThread(() -> log("未找到命令或响应特征"));
+                runOnUiThread(() -> {
+                    updateConnectionUi("服务不完整", false, false);
+                    log("未找到命令或响应特征");
+                });
                 return;
             }
             log(mediaDataCharacteristic == null
@@ -820,6 +1576,7 @@ public class MainActivity extends Activity {
             if (descriptor.getUuid().equals(CCCD_UUID)) {
                 if (status == BluetoothGatt.GATT_SUCCESS && uploadButton != null) {
                     runOnUiThread(() -> {
+                        updateConnectionUi("已连接，可用", false, true);
                         uploadButton.setEnabled(true);
                         if (mediaListButton != null) mediaListButton.setEnabled(true);
                     });
@@ -827,9 +1584,15 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> log(status == BluetoothGatt.GATT_SUCCESS
                         ? "响应通知已开启" : "响应通知开启失败，status=" + status));
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    /* Let the CCCD write settle before issuing the first
-                     * acknowledged catalog command after reconnect. */
-                    mainHandler.postDelayed(MainActivity.this::refreshMediaList, 250L);
+                    if (AUTO_MEDIA_REFRESH_ON_CONNECT) {
+                        /* Let the CCCD write settle before issuing the first
+                         * acknowledged catalog command after reconnect. */
+                        mainHandler.postDelayed(MainActivity.this::refreshMediaList,
+                                AUTO_MEDIA_REFRESH_DELAY_MS);
+                    } else {
+                        runOnUiThread(() -> log(
+                                "A/B 测试：已关闭连接后的自动命令，请先静置 15 秒"));
+                    }
                 }
             }
         }
@@ -894,7 +1657,18 @@ public class MainActivity extends Activity {
             log("命令超过当前 BLE MTU 限制");
             return;
         }
-        writeCommandInternal(command, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT, true);
+        /* Catalog refresh, settings, uploads and interactive buttons all share
+         * Android's single acknowledged-GATT-write lane.  Queue PING and other
+         * manual commands on the same single-thread executor instead of racing
+         * an automatic media refresh from the UI thread. */
+        mediaExecutor.execute(() -> {
+            try {
+                log(">> " + command);
+                sendCommandAndWait(command, 8000L);
+            } catch (IOException e) {
+                log("命令失败: " + e.getMessage());
+            }
+        });
     }
 
     private boolean writeCommandInternal(String command, int writeType, boolean logCommand) {
@@ -970,13 +1744,124 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_MEDIA_FILE && resultCode == RESULT_OK && data != null
                 && data.getData() != null) {
-            startMediaUpload(data.getData());
+            Uri uri = data.getData();
+            String displayName = queryDisplayName(uri);
+            if (isRgb565Name(displayName)) {
+                startMediaUploadPrepared(uri, null, displayName);
+            } else {
+                prepareImageCrop(uri, displayName);
+            }
         }
     }
 
-    private void startMediaUpload(Uri uri) {
+    private void prepareImageCrop(Uri uri, String displayName) {
+        if (mediaUploading) return;
+        setUploadStatus("正在读取图片…");
+        mediaExecutor.execute(() -> {
+            try {
+                Bitmap bitmap = decodePreviewBitmap(uri, 2400);
+                runOnUiThread(() -> showCropDialog(uri, displayName, bitmap));
+            } catch (Exception e) {
+                setUploadStatus("图片读取失败");
+                log("图片读取失败: " + e.getMessage());
+            }
+        });
+    }
+
+    private void showCropDialog(Uri uri, String displayName, Bitmap bitmap) {
+        CropImageView cropView = new CropImageView(this, bitmap);
+        cropView.setLayoutParams(new LinearLayout.LayoutParams(-1, dp(470)));
+        TextView hint = label("单指拖动，双指缩放；椭圆框就是圆屏可见区域");
+        hint.setPadding(dp(14), dp(8), dp(14), dp(8));
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setBackgroundColor(Color.rgb(10, 14, 24));
+        content.addView(cropView, new LinearLayout.LayoutParams(-1, dp(470)));
+        content.addView(hint, new LinearLayout.LayoutParams(-1, -2));
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("选择 PACON 图片裁剪位置")
+                .setView(content)
+                .setNegativeButton("取消", null)
+                .setPositiveButton("转换并上传", null)
+                .create();
+        dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+                .setOnClickListener(v -> {
+                    try {
+                        Bitmap cropped = cropView.createCroppedBitmap(LCD_WIDTH, LCD_HEIGHT);
+                        byte[] converted;
+                        try {
+                            converted = convertBitmapToRgb565(cropped);
+                        } finally {
+                            cropped.recycle();
+                        }
+                        dialog.dismiss();
+                        startMediaUploadPrepared(uri, converted, displayName);
+                    } catch (Exception e) {
+                        setUploadStatus("图片转换失败");
+                        log("图片转换失败: " + e.getMessage());
+                    }
+                }));
+        dialog.setOnDismissListener(ignored -> bitmap.recycle());
+        dialog.show();
+    }
+
+    private Bitmap decodePreviewBitmap(Uri uri, int maxDimension) throws IOException {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) throw new IOException("无法打开图片");
+            BitmapFactory.decodeStream(input, null, bounds);
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw new IOException("无法识别图片格式");
+        }
+        int sample = 1;
+        while (Math.max(bounds.outWidth / sample, bounds.outHeight / sample) > maxDimension) {
+            sample *= 2;
+        }
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = sample;
+        options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) throw new IOException("无法重新打开图片");
+            Bitmap decoded = BitmapFactory.decodeStream(input, null, options);
+            if (decoded == null) throw new IOException("无法解码图片");
+            return applyExifOrientation(uri, decoded);
+        }
+    }
+
+    private Bitmap applyExifOrientation(Uri uri, Bitmap decoded) {
+        try (InputStream input = getContentResolver().openInputStream(uri)) {
+            if (input == null) return decoded;
+            int orientation = new ExifInterface(input).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+            Matrix matrix = new Matrix();
+            switch (orientation) {
+                case ExifInterface.ORIENTATION_FLIP_HORIZONTAL: matrix.setScale(-1, 1); break;
+                case ExifInterface.ORIENTATION_ROTATE_180: matrix.setRotate(180); break;
+                case ExifInterface.ORIENTATION_FLIP_VERTICAL: matrix.setScale(1, -1); break;
+                case ExifInterface.ORIENTATION_TRANSPOSE:
+                    matrix.setRotate(90); matrix.postScale(-1, 1); break;
+                case ExifInterface.ORIENTATION_ROTATE_90: matrix.setRotate(90); break;
+                case ExifInterface.ORIENTATION_TRANSVERSE:
+                    matrix.setRotate(-90); matrix.postScale(-1, 1); break;
+                case ExifInterface.ORIENTATION_ROTATE_270: matrix.setRotate(-90); break;
+                default: return decoded;
+            }
+            Bitmap oriented = Bitmap.createBitmap(decoded, 0, 0,
+                    decoded.getWidth(), decoded.getHeight(), matrix, true);
+            if (oriented != decoded) decoded.recycle();
+            return oriented;
+        } catch (Exception ignored) {
+            return decoded;
+        }
+    }
+
+    private void startMediaUploadPrepared(Uri uri, byte[] prepared, String displayName) {
         if (mediaUploading) return;
         lastMediaUri = uri;
+        lastPreparedMedia = prepared;
+        lastPreparedDisplayName = displayName;
         mediaUploading = true;
         mediaCancelRequested = false;
         if (uploadButton != null) uploadButton.setEnabled(false);
@@ -984,7 +1869,7 @@ public class MainActivity extends Activity {
         if (cancelUploadButton != null) cancelUploadButton.setEnabled(true);
         if (retryUploadButton != null) retryUploadButton.setEnabled(false);
         setUploadProgress(0, "Preparing media");
-        mediaExecutor.execute(() -> uploadMediaFile(uri));
+        mediaExecutor.execute(() -> uploadMediaFile(uri, prepared, displayName));
     }
 
     private void refreshMediaList() {
@@ -1125,13 +2010,14 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void uploadMediaFile(Uri uri) {
+    private void uploadMediaFile(Uri uri, byte[] prepared, String preparedDisplayName) {
         boolean completed = false;
         try {
             requestUploadConnectionPriority(true);
             setUploadProgress(0, "Reading media");
-            String displayName = queryDisplayName(uri);
-            byte[] media = readMediaBytes(uri, displayName);
+            String displayName = preparedDisplayName == null
+                    ? queryDisplayName(uri) : preparedDisplayName;
+            byte[] media = prepared == null ? readMediaBytes(uri, displayName) : prepared;
             if (media.length == 0 || media.length % LCD_FRAME_BYTES != 0) {
                 throw new IOException("文件大小必须是单帧 " + LCD_FRAME_BYTES
                         + " 字节的整数倍，且文件应为原始 RGB565");
@@ -1512,8 +2398,24 @@ public class MainActivity extends Activity {
             mainHandler.post(() -> log(message));
             return;
         }
+        final boolean stickLogToBottom;
+        if (logScroll != null && logScroll.getChildCount() > 0) {
+            int oldMaxScroll = Math.max(0,
+                    logScroll.getChildAt(0).getHeight() - logScroll.getHeight());
+            stickLogToBottom = logScroll.getScrollY() >= oldMaxScroll - dp(24);
+        } else {
+            stickLogToBottom = false;
+        }
         String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
         logText.append(time + "  " + message + "\n");
+        if (logScroll != null && stickLogToBottom) {
+            logScroll.post(() -> {
+                if (logScroll.getChildCount() == 0) return;
+                int maxScroll = Math.max(0,
+                        logScroll.getChildAt(0).getHeight() - logScroll.getHeight());
+                logScroll.scrollTo(0, maxScroll);
+            });
+        }
     }
 
     @Override
