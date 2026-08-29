@@ -1,3 +1,11 @@
+# This repository intentionally tracks only the Android companion and firmware.
+/*
+!/.gitignore
+!/PaconBleTool/
+!/PaconBleTool/**
+!/my_Pacon/
+!/my_Pacon/**
+
 # ESP-IDF / CMake generated output
 **/build/
 **/build_wifi_fix/
@@ -51,6 +59,10 @@ my_Pacon/main/assets/*.rgb565
 **/Thumbs.db
 *.user
 *.suo
-.git-pacon/
 **/.ninja_lock
 **/.codex_fluid_compile.cmd
+
+# Generated local test/cache artifacts
+**/__pycache__/
+my_Pacon/*.rgb565a.S
+my_Pacon/tests/tests/
