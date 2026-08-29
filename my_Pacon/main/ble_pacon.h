@@ -19,6 +19,7 @@ esp_err_t ble_pacon_set_enabled(bool enabled);
  * Volume Increment press/release pulse; Android and iOS camera apps commonly
  * expose the volume key as their shutter action. */
 bool ble_pacon_is_camera_remote_enabled(void);
+bool ble_pacon_is_camera_remote_ready(void);
 esp_err_t ble_pacon_set_camera_remote_enabled(bool enabled);
 esp_err_t ble_pacon_camera_shutter(void);
 

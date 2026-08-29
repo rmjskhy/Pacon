@@ -26,6 +26,8 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Matrix;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.content.res.ColorStateList;
 import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
@@ -48,6 +50,7 @@ import android.widget.SeekBar;
 import android.widget.ScrollView;
 import android.widget.Spinner;
 import android.widget.TextView;
+import android.widget.Switch;
 import android.text.InputType;
 
 import java.io.ByteArrayOutputStream;
@@ -67,6 +70,9 @@ import java.util.regex.Pattern;
 
 /** PACON BLE control client with image conversion and windowed RGB565 upload. */
 public class MainActivity extends Activity {
+    private static final int UI_BACKGROUND = Color.rgb(12, 17, 23);
+    private static final int UI_CARD = Color.rgb(23, 30, 39);
+    private static final int UI_ACCENT = Color.rgb(132, 225, 195);
     private static final int REQUEST_BLE_PERMISSIONS = 10;
     private static final int REQUEST_MEDIA_FILE = 20;
     private static final String DEVICE_NAME = "PACON-BLE-TEST";
@@ -132,9 +138,20 @@ public class MainActivity extends Activity {
     private TextView deviceText;
     private TextView connectionStatus;
     private TextView logText;
+    private TextView noticeText;
+    private TextView overviewText;
+    private TextView modeStatus;
+    private LinearLayout debugPanel;
+    private final LinearLayout[] companionPages = new LinearLayout[3];
+    private final Button[] navButtons = new Button[3];
+    private final Button[] modeButtons = new Button[3];
+    private Button overviewButton;
+    private boolean screenSwitching;
+    private String confirmedScreen = "";
     private Button scanButton;
     private Button connectButton;
     private Button disconnectButton;
+    private Button cameraButton;
     private ScrollView pageScroll;
     private ScrollView logScroll;
     private EditText commandEdit;
@@ -195,8 +212,8 @@ public class MainActivity extends Activity {
             String size = bytes >= 1024L * 1024L
                     ? String.format(Locale.US, "%.1f MiB", bytes / (1024.0 * 1024.0))
                     : String.format(Locale.US, "%.1f KiB", bytes / 1024.0);
-            return (current ? "[PLAYING] " : "") + name + " / " + size + " / "
-                    + frames + " frame" + (frames == 1 ? "" : "s") + " / " + fps + " fps";
+            return (current ? "正在播放 · " : "") + name + "\n" + size + " · "
+                    + frames + " 帧 · " + fps + " fps";
         }
 
         @Override
@@ -246,48 +263,96 @@ public class MainActivity extends Activity {
         pageScroll.setClipToPadding(false);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(18), dp(18), dp(18), dp(20));
-        root.setBackgroundColor(Color.rgb(9, 14, 28));
+        root.setPadding(dp(20), dp(22), dp(20), dp(24));
+        root.setBackgroundColor(UI_BACKGROUND);
 
         TextView title = new TextView(this);
-        title.setText("PACON BLE Tool");
-        title.setTextSize(24);
+        title.setText("PACON");
+        title.setTextSize(30);
+        title.setLetterSpacing(0.10f);
         title.setTextColor(Color.rgb(245, 247, 255));
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(title, new LinearLayout.LayoutParams(-1, -2));
+        TextView subtitle = label("你的随身伙伴，一触即达");
+        subtitle.setTextColor(Color.rgb(146, 161, 176));
+        subtitle.setPadding(0, dp(6), 0, dp(22));
+        root.addView(subtitle);
+        for (int i = 0; i < companionPages.length; i++) {
+            companionPages[i] = new LinearLayout(this);
+            companionPages[i].setOrientation(LinearLayout.VERTICAL);
+            root.addView(companionPages[i], new LinearLayout.LayoutParams(-1, -2));
+        }
+        LinearLayout devicePage = companionPages[0];
+        LinearLayout mediaPage = companionPages[1];
+        LinearLayout preferencesPage = companionPages[2];
+        LinearLayout connectionCard = card(devicePage, "我的设备", "打开 PACON 蓝牙后，扫描并连接");
 
         deviceText = new TextView(this);
-        deviceText.setText("设备：未选择");
+        deviceText.setText("尚未发现设备");
         deviceText.setTextSize(16);
         deviceText.setTextColor(Color.rgb(224, 230, 245));
-        root.addView(deviceText, new LinearLayout.LayoutParams(-1, -2));
+        connectionCard.addView(deviceText, new LinearLayout.LayoutParams(-1, -2));
 
         connectionStatus = label("● 未连接");
         connectionStatus.setTextSize(15);
-        root.addView(connectionStatus, new LinearLayout.LayoutParams(-1, dp(34)));
+        connectionCard.addView(connectionStatus, new LinearLayout.LayoutParams(-1, dp(38)));
 
         LinearLayout scanRow = new LinearLayout(this);
         scanButton = button("扫描 PACON");
+        scanButton.setTag("primary");
         connectButton = button("连接");
         disconnectButton = button("断开");
         scanRow.addView(scanButton, weightParams());
         scanRow.addView(connectButton, weightParams());
         scanRow.addView(disconnectButton, weightParams());
-        root.addView(scanRow);
+        connectionCard.addView(scanRow);
+        overviewText = label("连接后可查看电量和当前界面");
+        overviewText.setPadding(0, dp(14), 0, dp(6));
+        connectionCard.addView(overviewText);
+        overviewButton = button("刷新设备状态");
+        connectionCard.addView(overviewButton);
+
+        LinearLayout modeCard = card(devicePage, "切换界面", "在手机上选择 PACON 当前显示的内容");
+        LinearLayout modes = new LinearLayout(this);
+        String[] modeLabels = {"主界面", "流体", "OuO"};
+        for (int i = 0; i < modeButtons.length; i++) {
+            final int mode = i;
+            modeButtons[i] = button(modeLabels[i]);
+            modeButtons[i].setCompoundDrawablesWithIntrinsicBounds(null,
+                    new CompanionIcon(i, UI_ACCENT, dp(28)), null, null);
+            modeButtons[i].setCompoundDrawablePadding(dp(10));
+            LinearLayout.LayoutParams modeParams = new LinearLayout.LayoutParams(0, dp(100), 1);
+            modeParams.setMargins(dp(3), dp(4), dp(3), dp(4));
+            modes.addView(modeButtons[i], modeParams);
+            modeButtons[i].setOnClickListener(v -> requestDeviceScreen(mode));
+        }
+        modeCard.addView(modes);
+        modeStatus = label("请先连接设备");
+        modeStatus.setPadding(0, dp(12), 0, 0);
+        modeCard.addView(modeStatus);
 
         LinearLayout testRow = new LinearLayout(this);
         Button pingButton = button("PING");
         Button statusButton = button("GET STATUS");
         testRow.addView(pingButton, weightParams());
         testRow.addView(statusButton, weightParams());
-        root.addView(testRow);
+        debugPanel = new LinearLayout(this);
+        debugPanel.setOrientation(LinearLayout.VERTICAL);
+        debugPanel.addView(testRow);
+
+        LinearLayout cameraCard = card(debugPanel, "遥控快门测试", "仅用于调试：需先在系统蓝牙中配对；相机须支持音量键拍照");
+        cameraButton = button("触发快门");
+        cameraButton.setEnabled(false);
+        cameraCard.addView(cameraButton, new LinearLayout.LayoutParams(-1, dp(50)));
+
+        LinearLayout preferencesCard = card(preferencesPage, "设备偏好", "管理显示、网络、雷达和时钟");
 
         Button settingsToggle = button("设备与显示");
-        root.addView(settingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(settingsToggle, new LinearLayout.LayoutParams(-1, -2));
         settingsPanel = new LinearLayout(this);
         settingsPanel.setOrientation(LinearLayout.VERTICAL);
         settingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
-        settingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+        settingsPanel.setBackground(roundBackground(UI_CARD, 12));
 
         LinearLayout brightnessRow = new LinearLayout(this);
         brightnessRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -321,14 +386,14 @@ public class MainActivity extends Activity {
         settingsStatus.setTextColor(Color.rgb(166, 176, 202));
         settingsPanel.addView(settingsStatus);
         settingsPanel.setVisibility(View.GONE);
-        root.addView(settingsPanel, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(settingsPanel, new LinearLayout.LayoutParams(-1, -2));
 
         Button wifiSettingsToggle = button("Wi-Fi 管理");
-        root.addView(wifiSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(wifiSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
         wifiSettingsPanel = new LinearLayout(this);
         wifiSettingsPanel.setOrientation(LinearLayout.VERTICAL);
         wifiSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
-        wifiSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+        wifiSettingsPanel.setBackground(roundBackground(UI_CARD, 12));
 
         wifiListView = new ListView(this);
         wifiAdapter = new ArrayAdapter<WifiEntry>(this,
@@ -370,14 +435,14 @@ public class MainActivity extends Activity {
         wifiSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
         wifiSettingsPanel.addView(wifiSettingsStatus);
         wifiSettingsPanel.setVisibility(View.GONE);
-        root.addView(wifiSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(wifiSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
 
         Button radarSettingsToggle = button("雷达设置");
-        root.addView(radarSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(radarSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
         radarSettingsPanel = new LinearLayout(this);
         radarSettingsPanel.setOrientation(LinearLayout.VERTICAL);
         radarSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
-        radarSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+        radarSettingsPanel.setBackground(roundBackground(UI_CARD, 12));
 
         LinearLayout rangeRow = new LinearLayout(this);
         rangeRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -408,14 +473,14 @@ public class MainActivity extends Activity {
         radarSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
         radarSettingsPanel.addView(radarSettingsStatus);
         radarSettingsPanel.setVisibility(View.GONE);
-        root.addView(radarSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(radarSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
 
         Button clockSettingsToggle = button("时钟与闹钟");
-        root.addView(clockSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(clockSettingsToggle, new LinearLayout.LayoutParams(-1, -2));
         clockSettingsPanel = new LinearLayout(this);
         clockSettingsPanel.setOrientation(LinearLayout.VERTICAL);
         clockSettingsPanel.setPadding(dp(12), dp(8), dp(12), dp(8));
-        clockSettingsPanel.setBackground(roundBackground(Color.rgb(18, 24, 42), 12));
+        clockSettingsPanel.setBackground(roundBackground(UI_CARD, 12));
 
         clockSettingsStatus = label("未读取时钟状态");
         clockSettingsStatus.setTextColor(Color.rgb(166, 176, 202));
@@ -448,7 +513,7 @@ public class MainActivity extends Activity {
         alarmRow.addView(stopAlarmButton, weightParams());
         clockSettingsPanel.addView(alarmRow);
         Button testAlarmButton = button("测试响铃");
-        clockSettingsPanel.addView(testAlarmButton,
+        debugPanel.addView(testAlarmButton,
                 new LinearLayout.LayoutParams(-1, dp(44)));
 
         LinearLayout watchStyleRow = new LinearLayout(this);
@@ -466,39 +531,43 @@ public class MainActivity extends Activity {
                 new LinearLayout.LayoutParams(dp(74), dp(44)));
         clockSettingsPanel.addView(watchStyleRow);
         clockSettingsPanel.setVisibility(View.GONE);
-        root.addView(clockSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
+        preferencesCard.addView(clockSettingsPanel, new LinearLayout.LayoutParams(-1, -2));
 
         commandEdit = new EditText(this);
         commandEdit.setSingleLine(true);
         commandEdit.setHint("输入命令，例如 GET HELP");
-        root.addView(commandEdit, new LinearLayout.LayoutParams(-1, -2));
+        debugPanel.addView(commandEdit, new LinearLayout.LayoutParams(-1, dp(52)));
         Button sendButton = button("发送命令");
-        root.addView(sendButton, new LinearLayout.LayoutParams(-1, -2));
+        debugPanel.addView(sendButton, new LinearLayout.LayoutParams(-1, -2));
 
-        uploadButton = button("UPLOAD / CONVERT IMAGE");
+        LinearLayout mediaCard = card(mediaPage, "屏幕素材", "上传照片或 RGB565 动画，让主界面更有个性");
+
+        uploadButton = button("添加图片或动画");
+        uploadButton.setTag("primary");
         uploadButton.setEnabled(false);
-        root.addView(uploadButton, new LinearLayout.LayoutParams(-1, -2));
+        mediaCard.addView(uploadButton, new LinearLayout.LayoutParams(-1, dp(52)));
 
         LinearLayout mediaRow = new LinearLayout(this);
-        mediaListButton = button("MEDIA LIST");
-        cancelUploadButton = button("CANCEL");
-        retryUploadButton = button("RETRY");
+        mediaListButton = button("刷新素材");
+        cancelUploadButton = button("取消上传");
+        retryUploadButton = button("重试");
         cancelUploadButton.setEnabled(false);
         retryUploadButton.setEnabled(false);
         mediaRow.addView(mediaListButton, weightParams());
         mediaRow.addView(cancelUploadButton, weightParams());
         mediaRow.addView(retryUploadButton, weightParams());
-        root.addView(mediaRow);
+        mediaCard.addView(mediaRow);
 
         uploadProgress = new ProgressBar(this, null,
                 android.R.attr.progressBarStyleHorizontal);
         uploadProgress.setMax(100);
         uploadProgress.setProgress(0);
-        root.addView(uploadProgress, new LinearLayout.LayoutParams(-1, -2));
+        uploadProgress.setProgressTintList(ColorStateList.valueOf(UI_ACCENT));
+        mediaCard.addView(uploadProgress, new LinearLayout.LayoutParams(-1, dp(12)));
         uploadStatus = new TextView(this);
-        uploadStatus.setText("Media idle");
+        uploadStatus.setText("尚无传输任务 · 点击刷新查看设备素材");
         uploadStatus.setTextColor(Color.rgb(166, 176, 202));
-        root.addView(uploadStatus, new LinearLayout.LayoutParams(-1, -2));
+        mediaCard.addView(uploadStatus, new LinearLayout.LayoutParams(-1, -2));
 
         mediaListView = new ListView(this);
         mediaAdapter = new ArrayAdapter<MediaEntry>(this,
@@ -525,14 +594,40 @@ public class MainActivity extends Activity {
         mediaListView.setBackgroundColor(Color.TRANSPARENT);
         mediaListView.setClipToPadding(false);
         mediaListView.setAdapter(mediaAdapter);
-        root.addView(mediaListView, new LinearLayout.LayoutParams(-1, 240));
+        LinearLayout catalogCard = card(mediaPage, "设备上的素材", "点击播放 · 长按删除");
+        TextView mediaEmpty = label("还没有素材记录\n连接设备后，点击「刷新素材」");
+        mediaEmpty.setGravity(Gravity.CENTER);
+        mediaEmpty.setPadding(0, dp(32), 0, dp(32));
+        catalogCard.addView(mediaEmpty);
+        catalogCard.addView(mediaListView, new LinearLayout.LayoutParams(-1, dp(280)));
+        mediaListView.setEmptyView(mediaEmpty);
+
+        LinearLayout debugCard = card(preferencesPage, "高级选项", "日常使用无需开启调试模式");
+        Switch debugSwitch = new Switch(this);
+        debugSwitch.setText("调试模式");
+        debugSwitch.setTextSize(16);
+        debugSwitch.setTextColor(Color.WHITE);
+        debugSwitch.setPadding(0, dp(12), 0, dp(12));
+        debugSwitch.setChecked(getPreferences(MODE_PRIVATE).getBoolean("debug_mode", false));
+        debugCard.addView(debugSwitch, new LinearLayout.LayoutParams(-1, dp(56)));
+        debugCard.addView(debugPanel, new LinearLayout.LayoutParams(-1, -2));
+        debugPanel.setVisibility(debugSwitch.isChecked() ? View.VISIBLE : View.GONE);
+        debugSwitch.setOnCheckedChangeListener((v, checked) -> {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("debug_mode", checked).apply();
+            debugPanel.setVisibility(checked ? View.VISIBLE : View.GONE);
+            if (!checked) {
+                commandEdit.clearFocus();
+                ((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE))
+                        .hideSoftInputFromWindow(commandEdit.getWindowToken(), 0);
+            }
+        });
 
         TextView logTitle = label("运行日志");
         logTitle.setTextSize(15);
         logTitle.setTypeface(null, android.graphics.Typeface.BOLD);
         LinearLayout.LayoutParams logTitleParams = new LinearLayout.LayoutParams(-1, -2);
         logTitleParams.topMargin = dp(12);
-        root.addView(logTitle, logTitleParams);
+        debugPanel.addView(logTitle, logTitleParams);
 
         logScroll = new ScrollView(this);
         logScroll.setFillViewport(true);
@@ -552,11 +647,49 @@ public class MainActivity extends Activity {
         logText.setTextIsSelectable(true);
         logText.setPadding(dp(12), dp(10), dp(12), dp(18));
         logScroll.addView(logText, new ScrollView.LayoutParams(-1, -2));
-        root.addView(logScroll, new LinearLayout.LayoutParams(-1, dp(300)));
+        debugPanel.addView(logScroll, new LinearLayout.LayoutParams(-1, dp(280)));
+        LinearLayout logActions = new LinearLayout(this);
+        Button copyLogButton = button("复制日志");
+        Button clearLogButton = button("清空日志");
+        logActions.addView(copyLogButton, weightParams());
+        logActions.addView(clearLogButton, weightParams());
+        debugPanel.addView(logActions);
+        copyLogButton.setOnClickListener(v -> {
+            android.content.ClipboardManager clipboard = (android.content.ClipboardManager)
+                    getSystemService(CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(android.content.ClipData.newPlainText("PACON 日志", logText.getText()));
+            noticeText.setText("日志已复制；分享前请检查设备信息");
+        });
+        clearLogButton.setOnClickListener(v -> logText.setText(""));
+        TextView version = label("PACON Companion  ·  0.2\n通过蓝牙连接你的 PACON");
+        version.setTextColor(Color.rgb(146, 161, 176));
+        version.setGravity(Gravity.CENTER);
+        version.setPadding(0, dp(12), 0, dp(12));
+        preferencesPage.addView(version);
         styleUi(root);
         pageScroll.addView(root, new ScrollView.LayoutParams(-1, -2));
-        setContentView(pageScroll);
-        pageScroll.setOnApplyWindowInsetsListener((view, insets) -> {
+        LinearLayout shell = new LinearLayout(this);
+        shell.setOrientation(LinearLayout.VERTICAL);
+        shell.setBackgroundColor(UI_BACKGROUND);
+        shell.addView(pageScroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        noticeText = label("准备好后，扫描附近的 PACON");
+        noticeText.setTextSize(12);
+        noticeText.setMaxLines(2);
+        noticeText.setPadding(dp(24), dp(6), dp(24), dp(6));
+        shell.addView(noticeText, new LinearLayout.LayoutParams(-1, -2));
+        LinearLayout navigation = new LinearLayout(this);
+        navigation.setPadding(dp(16), dp(8), dp(16), dp(8));
+        String[] tabLabels = {"设备", "素材", "设置"};
+        for (int i = 0; i < navButtons.length; i++) {
+            final int tab = i;
+            navButtons[i] = button(tabLabels[i]);
+            styleNode(navButtons[i]);
+            navigation.addView(navButtons[i], new LinearLayout.LayoutParams(0, dp(48), 1));
+            navButtons[i].setOnClickListener(v -> showCompanionPage(tab));
+        }
+        shell.addView(navigation, new LinearLayout.LayoutParams(-1, -2));
+        setContentView(shell);
+        shell.setOnApplyWindowInsetsListener((view, insets) -> {
             int topInset;
             int bottomInset;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -567,11 +700,13 @@ public class MainActivity extends Activity {
                 topInset = insets.getSystemWindowInsetTop();
                 bottomInset = insets.getSystemWindowInsetBottom();
             }
-            root.setPadding(dp(18), dp(18) + topInset,
-                    dp(18), dp(20) + bottomInset);
+            int imeInset = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? insets.getInsets(WindowInsets.Type.ime()).bottom : 0;
+            shell.setPadding(0, topInset, 0, Math.max(bottomInset, imeInset));
             return insets;
         });
-        pageScroll.requestApplyInsets();
+        shell.requestApplyInsets();
+        showCompanionPage(0);
         updateConnectionUi("未连接", false, false);
 
         View.OnFocusChangeListener revealEditor = (view, hasFocus) -> {
@@ -595,6 +730,8 @@ public class MainActivity extends Activity {
         disconnectButton.setOnClickListener(v -> disconnect());
         pingButton.setOnClickListener(v -> writeCommand("PING"));
         statusButton.setOnClickListener(v -> writeCommand("GET STATUS"));
+        cameraButton.setOnClickListener(v -> writeCommand("CAMERA SHUTTER"));
+        overviewButton.setOnClickListener(v -> refreshOverview());
         settingsToggle.setOnClickListener(v -> {
             boolean visible = settingsPanel.getVisibility() == View.VISIBLE;
             settingsPanel.setVisibility(visible ? View.GONE : View.VISIBLE);
@@ -691,7 +828,7 @@ public class MainActivity extends Activity {
                 synchronized (responseLock) {
                     responseLock.notifyAll();
                 }
-                setUploadStatus("Cancel requested");
+                setUploadStatus("正在取消上传…");
             }
         });
         retryUploadButton.setOnClickListener(v -> {
@@ -708,6 +845,141 @@ public class MainActivity extends Activity {
         mediaListView.setOnItemClickListener((parent, view, position, id) -> {
             if (position < 0 || position >= mediaEntries.size()) return;
             playMedia(mediaEntries.get(position).name);
+        });
+    }
+
+    private LinearLayout card(LinearLayout parent, String title, String description) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(18), dp(18), dp(18), dp(18));
+        card.setBackground(roundBackground(UI_CARD, 22));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.bottomMargin = dp(16);
+        parent.addView(card, params);
+        TextView heading = label(title);
+        heading.setTextSize(19);
+        heading.setTypeface(null, android.graphics.Typeface.BOLD);
+        card.addView(heading);
+        TextView detail = label(description);
+        detail.setTextSize(13);
+        detail.setTextColor(Color.rgb(146, 161, 176));
+        detail.setPadding(0, dp(6), 0, dp(16));
+        card.addView(detail);
+        return card;
+    }
+
+    private void showCompanionPage(int selected) {
+        for (int i = 0; i < companionPages.length; i++) {
+            companionPages[i].setVisibility(i == selected ? View.VISIBLE : View.GONE);
+            navButtons[i].setTextColor(i == selected ? UI_ACCENT : Color.rgb(146, 161, 176));
+            navButtons[i].setSelected(i == selected);
+            navButtons[i].setBackground(roundBackground(i == selected ? UI_CARD : UI_BACKGROUND, 16));
+        }
+        pageScroll.scrollTo(0, 0);
+        if (selected != 2) {
+            View focus = getCurrentFocus();
+            if (focus != null) {
+                ((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE))
+                        .hideSoftInputFromWindow(focus.getWindowToken(), 0);
+                focus.clearFocus();
+            }
+        }
+    }
+
+    private void updateModeControls() {
+        boolean enabled = bleConnected && settingsReady() && !screenSwitching;
+        for (int i = 0; i < modeButtons.length; i++) {
+            Button button = modeButtons[i];
+            if (button == null) continue;
+            button.setEnabled(enabled);
+            button.setAlpha(enabled ? 1f : 0.42f);
+            boolean selected = UiModeProtocol.MODES[i].equals(confirmedScreen);
+            button.setSelected(selected);
+            GradientDrawable background = roundBackground(Color.rgb(32, 43, 52), 16);
+            if (selected) background.setStroke(dp(2), UI_ACCENT);
+            button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x3384E1C3), background, null));
+        }
+        if (overviewButton != null) overviewButton.setEnabled(enabled);
+        if (uploadButton != null) uploadButton.setEnabled(enabled);
+        if (mediaListButton != null) mediaListButton.setEnabled(enabled);
+        if (retryUploadButton != null) retryUploadButton.setEnabled(enabled && lastMediaUri != null);
+        if (cameraButton != null) {
+            cameraButton.setEnabled(enabled);
+            cameraButton.setAlpha(enabled ? 1f : 0.42f);
+        }
+    }
+
+    private void requestDeviceScreen(int index) {
+        if (!bleConnected || !settingsReady() || screenSwitching) return;
+        final BluetoothGatt session = gatt;
+        screenSwitching = true;
+        modeStatus.setText("正在切换到" + UiModeProtocol.LABELS[index] + "…");
+        updateModeControls();
+        mediaExecutor.execute(() -> {
+            String result;
+            boolean completed = false;
+            try {
+                if (gatt != session) throw new IOException("连接已变更，请重试");
+                UiModeProtocol.requireQueued(sendCommandAndWait(UiModeProtocol.command(index), 8000), index);
+                for (int attempt = 0; attempt < 12; attempt++) {
+                    if (gatt != session) throw new IOException("连接已断开");
+                    String state = sendCommandAndWait("GET UI", 3000);
+                    if ("busy".equals(UiModeProtocol.field(state, "state"))) {
+                        throw new IOException("设备正忙，请稍后重试");
+                    }
+                    if (UiModeProtocol.completed(state, index)) { completed = true; break; }
+                    android.os.SystemClock.sleep(150);
+                }
+                if (!completed) throw new IOException("未确认切换完成，请刷新设备状态");
+                result = "已切换到" + UiModeProtocol.LABELS[index];
+            } catch (Exception e) {
+                result = "切换失败：" + e.getMessage();
+            }
+            final String message = result;
+            final boolean success = completed;
+            runOnUiThread(() -> {
+                screenSwitching = false;
+                if (session == gatt && bleConnected) {
+                    if (success) confirmedScreen = UiModeProtocol.MODES[index];
+                    modeStatus.setText(message);
+                    noticeText.setText(message);
+                }
+                updateModeControls();
+            });
+        });
+    }
+
+    private void refreshOverview() {
+        if (!bleConnected || !settingsReady() || screenSwitching) return;
+        final BluetoothGatt session = gatt;
+        overviewButton.setEnabled(false);
+        overviewText.setText("正在读取设备状态…");
+        mediaExecutor.execute(() -> {
+            try {
+                if (gatt != session) throw new IOException("连接已变更");
+                String response = sendCommandAndWait("GET STATUS", 8000);
+                int battery = parseJsonInt(response, "battery_pct", -1);
+                boolean valid = parseJsonBoolean(response, "battery_valid", false);
+                String batteryText = valid && battery >= 0 ? "电量 " + battery + "%" : "电量暂不可用";
+                if (parseJsonBoolean(response, "charging", false)) batteryText += " · 充电中";
+                final String summary = batteryText;
+                String ui = sendCommandAndWait("GET UI", 3000);
+                final String screen = UiModeProtocol.field(ui, "screen");
+                runOnUiThread(() -> {
+                    if (session != gatt || !bleConnected) return;
+                    overviewText.setText(summary);
+                    confirmedScreen = screen;
+                    modeStatus.setText(screen.isEmpty() ? "当前固件未提供切屏状态，请更新固件"
+                            : "当前界面：" + UiModeProtocol.label(screen));
+                    updateModeControls();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (session != gatt || !bleConnected) return;
+                    overviewText.setText("读取失败：" + e.getMessage());
+                    updateModeControls();
+                });
+            }
         });
     }
 
@@ -744,6 +1016,20 @@ public class MainActivity extends Activity {
             disconnectButton.setEnabled(canDisconnect);
             disconnectButton.setAlpha(canDisconnect ? 1.0f : 0.42f);
         }
+        if (cameraButton != null) {
+            boolean canCamera = connected && gatt != null && commandCharacteristic != null;
+            cameraButton.setEnabled(canCamera);
+            cameraButton.setAlpha(canCamera ? 1.0f : 0.42f);
+        }
+        if (!connected) {
+            confirmedScreen = "";
+            if (modeStatus != null) modeStatus.setText("请先连接设备");
+            if (overviewText != null) overviewText.setText("连接后可查看电量和当前界面");
+        } else if (modeStatus != null && confirmedScreen.isEmpty()) {
+            modeStatus.setText("选择一个界面，或刷新设备状态");
+        }
+        if (scanButton != null) scanButton.setEnabled(!connecting && !connected);
+        updateModeControls();
     }
 
     private EditText settingsEdit(String hint) {
@@ -1277,20 +1563,45 @@ public class MainActivity extends Activity {
     }
 
     private void styleUi(LinearLayout root) {
-        getWindow().setStatusBarColor(Color.rgb(9, 14, 28));
-        getWindow().setNavigationBarColor(Color.rgb(9, 14, 28));
+        getWindow().setStatusBarColor(UI_BACKGROUND);
+        getWindow().setNavigationBarColor(UI_BACKGROUND);
+        getWindow().getDecorView().setSystemUiVisibility(0);
         styleNode(root);
     }
 
     private void styleNode(View view) {
-        if (view instanceof Button) {
+        if (view instanceof Switch) {
+            Switch toggle = (Switch)view;
+            toggle.setThumbTintList(new ColorStateList(
+                    new int[][]{new int[]{android.R.attr.state_checked}, new int[]{}},
+                    new int[]{UI_ACCENT, Color.rgb(146, 161, 176)}));
+        } else if (view instanceof Button) {
             Button button = (Button) view;
             button.setAllCaps(false);
             button.setTextColor(Color.WHITE);
             button.setTextSize(14);
-            button.setMinHeight(dp(44));
-            button.setPadding(dp(8), 0, dp(8), 0);
-            button.setBackground(roundBackground(Color.rgb(38, 47, 72), 12));
+            button.setMinHeight(dp(48));
+            button.setMinimumWidth(0);
+            button.setMinWidth(0);
+            button.setPadding(dp(10), dp(8), dp(10), dp(8));
+            boolean primary = "primary".equals(button.getTag());
+            button.setTextColor(primary ? UI_BACKGROUND : Color.rgb(230, 237, 243));
+            button.setBackgroundTintList(null);
+            button.setBackground(new RippleDrawable(ColorStateList.valueOf(0x3384E1C3),
+                    roundBackground(primary ? UI_ACCENT : Color.rgb(32, 43, 52), 14), null));
+            if (button.getLayoutParams() instanceof LinearLayout.LayoutParams) {
+                LinearLayout.LayoutParams params = (LinearLayout.LayoutParams)button.getLayoutParams();
+                if (params.topMargin == 0 && params.bottomMargin == 0) {
+                    params.topMargin = dp(5);
+                    params.bottomMargin = dp(5);
+                    button.setLayoutParams(params);
+                }
+            }
+        } else if (view instanceof Spinner) {
+            view.setBackgroundTintList(ColorStateList.valueOf(UI_ACCENT));
+        } else if (view instanceof SeekBar) {
+            ((SeekBar)view).setProgressTintList(ColorStateList.valueOf(UI_ACCENT));
+            ((SeekBar)view).setThumbTintList(ColorStateList.valueOf(UI_ACCENT));
         } else if (view instanceof EditText) {
             EditText edit = (EditText) view;
             edit.setTextColor(Color.rgb(245, 247, 255));
@@ -1318,7 +1629,9 @@ public class MainActivity extends Activity {
     }
 
     private LinearLayout.LayoutParams weightParams() {
-        return new LinearLayout.LayoutParams(0, -2, 1.0f);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1.0f);
+        params.setMargins(dp(3), dp(4), dp(3), dp(4));
+        return params;
     }
 
     private boolean hasBlePermissions() {
@@ -1388,7 +1701,7 @@ public class MainActivity extends Activity {
             if (device == null) return;
             selectedDevice = device;
             runOnUiThread(() -> {
-                deviceText.setText("设备：" + DEVICE_NAME + "\n" + device.getAddress());
+                deviceText.setText("PACON · " + device.getAddress());
                 if (!bleConnecting && !bleConnected) {
                     updateConnectionUi("已发现，未连接", false, false);
                 }
@@ -1664,7 +1977,9 @@ public class MainActivity extends Activity {
         mediaExecutor.execute(() -> {
             try {
                 log(">> " + command);
-                sendCommandAndWait(command, 8000L);
+                String response = sendCommandAndWait(command, 8000L);
+                if (response.startsWith("ERR")) throw new IOException(response);
+                if ("CAMERA SHUTTER".equals(command)) log("快门指令已发送，请在手机相机中确认");
             } catch (IOException e) {
                 log("命令失败: " + e.getMessage());
             }
@@ -1858,17 +2173,21 @@ public class MainActivity extends Activity {
     }
 
     private void startMediaUploadPrepared(Uri uri, byte[] prepared, String displayName) {
-        if (mediaUploading) return;
+        if (mediaUploading || screenSwitching) {
+            noticeText.setText("请等待当前操作完成");
+            return;
+        }
         lastMediaUri = uri;
         lastPreparedMedia = prepared;
         lastPreparedDisplayName = displayName;
         mediaUploading = true;
+        updateModeControls();
         mediaCancelRequested = false;
         if (uploadButton != null) uploadButton.setEnabled(false);
         if (mediaListButton != null) mediaListButton.setEnabled(false);
         if (cancelUploadButton != null) cancelUploadButton.setEnabled(true);
         if (retryUploadButton != null) retryUploadButton.setEnabled(false);
-        setUploadProgress(0, "Preparing media");
+        setUploadProgress(0, "正在准备素材…");
         mediaExecutor.execute(() -> uploadMediaFile(uri, prepared, displayName));
     }
 
@@ -1902,9 +2221,9 @@ public class MainActivity extends Activity {
                     if (mediaListButton != null) mediaListButton.setEnabled(
                             gatt != null && commandCharacteristic != null);
                 });
-                log("Media list refreshed: " + entries.size() + " item(s). Long-press an item to delete.");
+                log("素材已刷新，共 " + entries.size() + " 项；长按可删除");
             } catch (Exception e) {
-                log("Media list failed: " + e.getMessage());
+                log("素材读取失败：" + e.getMessage());
                 runOnUiThread(() -> {
                     if (mediaListButton != null) mediaListButton.setEnabled(
                             gatt != null && commandCharacteristic != null);
@@ -1936,9 +2255,9 @@ public class MainActivity extends Activity {
                     }
                     if (mediaAdapter != null) mediaAdapter.notifyDataSetChanged();
                 });
-                log("Playing media: " + name);
+                log("正在播放：" + name);
             } catch (Exception e) {
-                log("Play failed: " + e.getMessage());
+                log("播放失败：" + e.getMessage());
             }
         });
     }
@@ -1950,10 +2269,10 @@ public class MainActivity extends Activity {
             try {
                 String response = sendCommandAndWait("MEDIA_DELETE " + name, 5000);
                 requireResponse(response, "OK MEDIA_DELETED");
-                log("Deleted media: " + name);
+                log("已删除素材：" + name);
                 refreshMediaList();
             } catch (Exception e) {
-                log("Delete failed: " + e.getMessage());
+                log("删除失败：" + e.getMessage());
                 runOnUiThread(() -> {
                     if (mediaListButton != null) mediaListButton.setEnabled(
                             gatt != null && commandCharacteristic != null);
@@ -2014,7 +2333,7 @@ public class MainActivity extends Activity {
         boolean completed = false;
         try {
             requestUploadConnectionPriority(true);
-            setUploadProgress(0, "Reading media");
+            setUploadProgress(0, "正在读取素材…");
             String displayName = preparedDisplayName == null
                     ? queryDisplayName(uri) : preparedDisplayName;
             byte[] media = prepared == null ? readMediaBytes(uri, displayName) : prepared;
@@ -2025,7 +2344,7 @@ public class MainActivity extends Activity {
             int frames = media.length / LCD_FRAME_BYTES;
             int fps = inferFps(displayName);
             String remoteName = mediaRemoteName(displayName);
-            setUploadProgress(0, "Uploading " + remoteName);
+            setUploadProgress(0, "正在上传 " + remoteName);
             log("开始上传 " + remoteName + "，帧数=" + frames + "，fps=" + fps);
 
             String begin = sendCommandAndWait("MEDIA_BEGIN " + remoteName + " "
@@ -2054,7 +2373,7 @@ public class MainActivity extends Activity {
                 int percent = (int) ((long) offset * 100L / media.length);
                 if (percent / 10 != lastPercent / 10) {
                     lastPercent = percent;
-                    setUploadProgress(percent, "Uploading");
+                    setUploadProgress(percent, "正在上传");
                     log("媒体上传进度 " + percent + "%");
                 }
             }
@@ -2062,14 +2381,14 @@ public class MainActivity extends Activity {
             String end = sendCommandAndWait("MEDIA_END", 8000);
             requireResponse(end, "OK MEDIA_COMMITTED");
             completed = true;
-            setUploadProgress(100, "Upload complete");
+            setUploadProgress(100, "上传完成");
             log("媒体上传完成，设备将重新扫描媒体目录");
             /* The firmware commits the file first and schedules its display
              * reader rescan on the main task.  Refresh after a short settle
              * period so the new file appears without requiring another tap. */
             mainHandler.postDelayed(this::refreshMediaList, 800L);
         } catch (Exception e) {
-            setUploadStatus(mediaCancelRequested ? "Upload canceled" : "Upload failed");
+            setUploadStatus(mediaCancelRequested ? "上传已取消" : "上传失败，请重试");
             log("媒体上传失败: " + e.getMessage());
             boolean canceled = mediaCancelRequested;
             mediaCancelRequested = false;
@@ -2078,6 +2397,7 @@ public class MainActivity extends Activity {
         } finally {
             requestUploadConnectionPriority(false);
             mediaUploading = false;
+            runOnUiThread(this::updateModeControls);
             mediaCancelRequested = false;
             if (uploadButton != null) {
                 runOnUiThread(() -> uploadButton.setEnabled(gatt != null
@@ -2135,7 +2455,7 @@ public class MainActivity extends Activity {
             int percent = (int) ((long) offset * 100L / media.length);
             if (percent / 10 != lastPercent / 10) {
                 lastPercent = percent;
-                setUploadProgress(percent, "Uploading (BLE window)");
+                setUploadProgress(percent, "正在上传");
                 log("媒体上传进度 " + percent + "%（BLE 窗口）");
             }
         }
@@ -2398,6 +2718,15 @@ public class MainActivity extends Activity {
             mainHandler.post(() -> log(message));
             return;
         }
+        // Keep diagnostics bounded even when their panel is hidden. Never
+        // expose a Wi-Fi password in the shareable log.
+        final String safeMessage = message.replaceAll("(?i)(SET WIFI\\s+).*", "$1[已隐藏]");
+        if (noticeText != null && !message.startsWith(">>") && !message.startsWith("<<")
+                && !message.startsWith("BLE ") && !message.startsWith("设置:")
+                && !message.startsWith("命令写入完成")) {
+            noticeText.setText(safeMessage);
+        }
+        if (logText.length() > 24000) logText.setText(logText.getText().subSequence(logText.length() - 16000, logText.length()));
         final boolean stickLogToBottom;
         if (logScroll != null && logScroll.getChildCount() > 0) {
             int oldMaxScroll = Math.max(0,
@@ -2407,8 +2736,8 @@ public class MainActivity extends Activity {
             stickLogToBottom = false;
         }
         String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
-        logText.append(time + "  " + message + "\n");
-        if (logScroll != null && stickLogToBottom) {
+        logText.append(time + "  " + safeMessage + "\n");
+        if (logScroll != null && stickLogToBottom && debugPanel.getVisibility() == View.VISIBLE) {
             logScroll.post(() -> {
                 if (logScroll.getChildCount() == 0) return;
                 int maxScroll = Math.max(0,

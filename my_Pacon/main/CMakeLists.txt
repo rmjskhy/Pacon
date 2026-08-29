@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "fluid_pendant.c" "ble_pacon.c"
+    SRCS "fluid_pendant.c" "ble_pacon.c" "pacon_preferences.c"
     INCLUDE_DIRS "."
     EMBED_FILES "assets/kkd1_character.rgb565a"
                 "assets/kkd1_second_dial.rgb565a"

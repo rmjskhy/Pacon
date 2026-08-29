@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PACON OuO 圆屏预览器</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter,"Microsoft YaHei",sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; min-height:100vh; background:#101114; color:#f5f5f7; }
+    header { padding:20px 28px 12px; border-bottom:1px solid #292b31; }
+    h1 { margin:0 0 6px; font-size:22px; } .sub { color:#9da2ad; font-size:13px; }
+    main { display:grid; grid-template-columns:minmax(480px,1fr) 390px; gap:24px; padding:24px; }
+    .stage { display:grid; place-items:center; min-height:590px; border-radius:18px; background:#17191e; }
+    canvas { width:min(78vh,620px); height:min(78vh,620px); max-width:100%; aspect-ratio:1; border-radius:50%; box-shadow:0 0 0 2px #343740,0 22px 70px #0009; touch-action:none; cursor:crosshair; transition:opacity 120ms ease; }
+    aside { display:flex; flex-direction:column; gap:14px; }
+    .card { background:#191b20; border:1px solid #2a2d35; border-radius:14px; padding:15px; }
+    h2 { margin:0 0 12px; font-size:14px; color:#c8cbd2; }
+    .states { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; }
+    button { border:1px solid #343842; background:#24272e; color:#eee; padding:9px 8px; border-radius:9px; cursor:pointer; }
+    button:hover { background:#30343d; } button.active { background:#086bd8; border-color:#2690ff; }
+    button.research { border-style:dashed; color:#c6aee8; }
+    label { display:grid; grid-template-columns:90px 1fr 44px; align-items:center; gap:9px; margin:9px 0; font-size:12px; color:#c5c8cf; }
+    input[type=range] { width:100%; accent-color:#1686ff; } output { text-align:right; font-variant-numeric:tabular-nums; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    textarea { width:100%; height:112px; resize:vertical; background:#0d0e11; color:#a9e4b2; border:1px solid #30333b; border-radius:9px; padding:10px; font:12px/1.5 Consolas,monospace; }
+    .hint { color:#9297a2; font-size:12px; line-height:1.6; margin-top:10px; }
+    @media(max-width:980px){ main{grid-template-columns:1fr}.stage{min-height:auto;padding:22px} }
+  </style>
+</head>
+<body>
+  <header><h1>PACON OuO 圆屏预览器</h1><div class="sub">466 × 466 固件坐标 · 圆形安全区 · 参数可直接导出到 fluid_pendant.c</div></header>
+  <main>
+    <section class="stage"><canvas id="face" width="466" height="466" aria-label="OuO 圆屏预览"></canvas></section>
+    <aside>
+      <section class="card"><h2>表情状态</h2><div class="states" id="states"></div><div class="hint">虚线紫字是手势研究帧，不会直接进入固件。</div></section>
+      <section class="card"><h2>圆屏构图</h2><div id="controls"></div></section>
+      <section class="card"><h2>工具</h2><div class="actions">
+        <button id="reset">恢复固件值</button><button id="animate">播放待机动画</button>
+      <button id="shot">导出 PNG</button><button id="copy">复制 C 参数</button>
+       </div><div class="hint">交互校准：8 月 28 日触点录像版。额头（含两眼之间偏上）按住：一字眼＋ω嘴，松手后短暂开心带脸颊；按住单眼：对应闭眼＋折线嘴，不再超时变惊讶。嘴点击：亲吻；拉嘴松手后先收成短横嘴，再恢复。三角嘴始终朝上，横拉变宽、竖拉变高。嘴侧起手水平拖动：左右侧拉；拉嘴中不会误触眩晕。<br>待机仍按约 81 秒录像序列循环；播放中触摸会暂停，松手反馈结束后恢复。仅单指；紫色按钮是静态参考，实际拖动仍随机选择并锁定拉伸族。</div></section>
+      <section class="card"><h2>C 参数</h2><textarea id="export" readonly></textarea></section>
+    </aside>
+  </main>
+<script src="idle-reference.js"></script>
+<script>
+const canvas=document.querySelector('#face'),ctx=canvas.getContext('2d');
+/* Normalized from the 2400x1080 OuO captures around the screen centre.  The
+ * previous 44px eyes/214px gap made the round-screen face crowded; the source
+ * geometry is about 30px radius and 226px between eye centres. */
+const defaults={eyeGap:226,eyeY:216,eyeRadius:30,mouthY:264,mouthWidth:31,mouthHeight:29};
+const p={...defaults}; let state='idle',timer=null,drag=null,pullDx=0,pullDy=0;
+let idlePlaying=false,idleEpoch=0,idleFrame=-1,idleBytes=null,idleAtlas=null;
+let pointerKind='',pointerStartMs=0,pointerHoldTimer=null,pointerLastX=0,pointerLastY=0;
+let pointerLastMotionX=0,pointerLastMotionY=0,pointerReversals=0,pointerWindowStartMs=0;
+let pointerMoved=false,dizzyPhase=0,dizzyRaf=0;
+let responseTimer=null,resumeIdleAfterTouch=false;
+const activeEyePointers=new Map();
+const stateNames={idle:'默认',blink:'眨眼',closedNeutral:'闭眼平静',softSmile:'温和微笑',happy:'开心',sad:'难过',surprised:'惊讶',kiss:'亲吻',squish:'挤压',cat:'猫嘴',caret:'尖嘴',pullSide:'嘴侧拉',winkLeft:'左眼眨',winkRight:'右眼眨',angry:'生气',sleepy:'困倦',dizzy:'眩晕',pullHorizontal:'拉嘴·横向',pullVertical:'拉嘴·纵向',pullSquare:'拉嘴·斜向',pullTriangle:'拉嘴·尖角',bothClip:'双眼压缩',elasticH:'拉伸 H',pressLeft:'压左眼',pressRight:'压右眼',pullUp:'嘴上拉'};
+const researchStates=new Set(['pullHorizontal','pullVertical','pullSquare','pullTriangle','bothClip','elasticH','pressLeft','pressRight','pullUp']);
+const specs=[['eyeGap','眼间距',150,250,1],['eyeY','眼睛高度',135,225,1],['eyeRadius','眼睛大小',25,60,1],['mouthY','嘴部高度',235,325,1],['mouthWidth','圆嘴宽度',18,55,1],['mouthHeight','圆嘴高度',22,65,1]];
+const states=document.querySelector('#states'),controls=document.querySelector('#controls');
+Object.assign(stateNames,{headPat:'额头按住',delighted:'抚摸后开心',mouthRelease:'拉嘴松手'});
+for(const [key,name] of Object.entries(stateNames)){const b=document.createElement('button');b.textContent=name;b.dataset.state=key;if(researchStates.has(key))b.classList.add('research');b.onclick=()=>{resumeIdleAfterTouch=false;setState(key)};states.append(b)}
+for(const [key,name,min,max,step] of specs){const l=document.createElement('label');l.htmlFor=`control-${key}`;l.innerHTML=`<span>${name}</span><input id="control-${key}" aria-label="${name}" type="range" min="${min}" max="${max}" step="${step}" value="${p[key]}"><output>${p[key]}</output>`;const i=l.querySelector('input'),o=l.querySelector('output');i.oninput=()=>{p[key]=+i.value;o.value=i.value;draw()};l.dataset.key=key;controls.append(l)}
+function stopDizzyAnimation(){if(dizzyRaf){cancelAnimationFrame(dizzyRaf);dizzyRaf=0}}
+function startDizzyAnimation(){stopDizzyAnimation();const tick=()=>{if(state!=='dizzy'){dizzyRaf=0;return}dizzyPhase=(dizzyPhase+.18)%(Math.PI*2);draw();dizzyRaf=requestAnimationFrame(tick)};dizzyRaf=requestAnimationFrame(tick)}
+function setState(s){
+  if(responseTimer!==null){clearTimeout(responseTimer);responseTimer=null}
+  stopIdlePlayback();if(s!=='dizzy')stopDizzyAnimation();state=s;
+  const liveMouthDrag=drag&&drag.mouth&&(s==='kiss'||s==='surprised'||s==='pullSide');
+  if(!liveMouthDrag){pullDx=0;pullDy=0}
+  document.querySelectorAll('[data-state]').forEach(b=>b.classList.toggle('active',b.dataset.state===s));
+  // Pointer updates are geometry changes, not repeated whole-face fade-outs.
+  canvas.style.opacity='1';draw();if(s==='dizzy')startDizzyAnimation();
+}
+function releaseResponse(s,ms){
+  setState(s);
+  responseTimer=setTimeout(()=>{responseTimer=null;setState('idle');if(resumeIdleAfterTouch){resumeIdleAfterTouch=false;startIdlePlayback()}},ms);
+}
+function idleFrameAt(ms){
+  const data=OUO_IDLE_REFERENCE,t=((ms%data.durationMs)+data.durationMs)%data.durationMs;
+  let low=0,high=data.timeline.length;
+  while(low+1<high){const mid=(low+high)>>1;if(data.timeline[mid][0]<=t)low=mid;else high=mid}
+  return data.timeline[low][1];
+}
+function updateIdleFrame(ms){
+  const frame=idleFrameAt(ms);if(frame===idleFrame)return false;
+  const data=OUO_IDLE_REFERENCE;
+  if(!idleBytes)idleBytes=Uint8Array.from(atob(data.data),c=>c.charCodeAt(0));
+  if(!idleAtlas){idleAtlas=document.createElement('canvas');idleAtlas.width=96;idleAtlas.height=268}
+  const surface=idleAtlas.getContext('2d'),pixels=surface.createImageData(96,268);
+  let pos=0;
+  for(let i=data.offsets[frame];i<data.offsets[frame+1];i+=2){
+    const count=idleBytes[i],gray=idleBytes[i+1]*17;
+    if(pos+count>96*268)throw new Error('Invalid idle frame');
+    for(let j=0;j<count;++j){const at=pos++*4;pixels.data[at]=pixels.data[at+1]=pixels.data[at+2]=gray;pixels.data[at+3]=gray?255:0}
+  }
+  if(pos!==96*268)throw new Error('Incomplete idle frame');
+  surface.putImageData(pixels,0,0);idleFrame=frame;return true;
+}
+function drawIdleReference(){
+  const [lx,rx]=eyeCenters(),eyeScale=p.eyeRadius/30,mw=p.mouthWidth/31,mh=p.mouthHeight/29;
+  ctx.drawImage(idleAtlas,0,0,96,84,lx-48*eyeScale,p.eyeY-42*eyeScale,96*eyeScale,84*eyeScale);
+  ctx.drawImage(idleAtlas,0,84,96,84,rx-48*eyeScale,p.eyeY-42*eyeScale,96*eyeScale,84*eyeScale);
+  ctx.drawImage(idleAtlas,0,168,96,100,233-48*mw,p.mouthY-50*mh,96*mw,100*mh);
+}
+function stopIdlePlayback(){
+  if(timer!==null)cancelAnimationFrame(timer);timer=null;idlePlaying=false;
+  document.querySelector('#animate').textContent='播放待机动画';
+}
+function startIdlePlayback(){
+  if(responseTimer!==null){clearTimeout(responseTimer);responseTimer=null}resumeIdleAfterTouch=false;
+  stopDizzyAnimation();stopIdlePlayback();state='idle';drag=null;pullDx=0;pullDy=0;
+  if(pointerHoldTimer){clearTimeout(pointerHoldTimer);pointerHoldTimer=null}
+  document.querySelectorAll('[data-state]').forEach(b=>b.classList.toggle('active',b.dataset.state==='idle'));
+  idleEpoch=performance.now();idlePlaying=true;canvas.style.opacity='1';
+  document.querySelector('#animate').textContent='停止待机动画';
+  updateIdleFrame(0);draw();
+  const tick=now=>{if(!idlePlaying)return;if(updateIdleFrame(now-idleEpoch))draw();timer=requestAnimationFrame(tick)};
+  timer=requestAnimationFrame(tick);
+}
+function ellipse(x,y,rx,ry){ctx.beginPath();ctx.ellipse(x,y,rx,ry,0,0,Math.PI*2);ctx.fill()}
+function strokeArc(x,y,r,a0,a1,w=7){ctx.lineWidth=w;ctx.lineCap='round';ctx.beginPath();ctx.arc(x,y,r,a0,a1);ctx.stroke()}
+function eyeCenters(){return [233-p.eyeGap/2,233+p.eyeGap/2]}
+function mouthCurve(smile=true,w=50,h=27,t=7){ctx.lineWidth=t*2;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(233-w,p.mouthY+(smile?-h:h));ctx.quadraticCurveTo(233,p.mouthY+(smile?h:-h),233+w,p.mouthY+(smile?-h:h));ctx.stroke()}
+function sourceSmileMouth(){mouthCurve(true,29,17,4)}
+function catMouth(){ctx.lineWidth=7;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(201,p.mouthY-6);ctx.quadraticCurveTo(217,p.mouthY+20,233,p.mouthY-2);ctx.quadraticCurveTo(249,p.mouthY+20,265,p.mouthY-6);ctx.stroke()}
+function caretMouth(){ctx.lineWidth=6;ctx.lineCap='round';ctx.lineJoin='round';ctx.beginPath();ctx.moveTo(206,p.mouthY+12);ctx.lineTo(233,p.mouthY-13);ctx.lineTo(260,p.mouthY+12);ctx.stroke()}
+function delightedMouth(){ctx.save();ctx.beginPath();ctx.rect(198,p.mouthY-23,70,60);ctx.clip();ellipse(233,p.mouthY+1,32,30);ctx.restore()}
+function barEye(cx){ctx.fillRect(cx-p.eyeRadius,p.eyeY-4,p.eyeRadius*2,8)}
+function upperClippedEye(cx){ctx.save();ctx.beginPath();ctx.rect(cx-p.eyeRadius-2,p.eyeY-p.eyeRadius-2,p.eyeRadius*2+4,p.eyeRadius*1.4+2);ctx.clip();ellipse(cx,p.eyeY,p.eyeRadius,p.eyeRadius);ctx.restore()}
+function blush(){const [lx,rx]=eyeCenters();ctx.fillStyle='#454545';ellipse(lx-28,p.eyeY+29,13,5);ellipse(rx+28,p.eyeY+29,13,5);ctx.fillStyle='#fff'}
+function angryEye(cx,left){ctx.lineWidth=7;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(cx+(left?-26:26),p.eyeY-18);ctx.lineTo(cx+(left?9:-9),p.eyeY);ctx.lineTo(cx+(left?-26:26),p.eyeY+18);ctx.stroke()}
+function sleepyEye(cx){ctx.lineWidth=6;ctx.lineCap='round';ctx.beginPath();ctx.arc(cx,p.eyeY+9,25,Math.PI,Math.PI*2);ctx.stroke()}
+function dizzyEye(cx,phase=0){ctx.lineWidth=5;ctx.lineCap='round';ctx.beginPath();for(let i=0;i<=26;i++){const t=i/26*Math.PI*4.5+phase,r=3+(i/26*Math.PI*4.5)*1.7,x=cx+Math.cos(t)*r,y=p.eyeY+Math.sin(t)*r;if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y)}ctx.stroke()}
+/* The captured upper-lid family spans about x=±28 and y=203..229 after
+ * normalization.  Use a shallow ellipse instead of a full-radius circle so
+ * happy/kiss lids do not become oversized eyebrows on the round panel. */
+function closedEye(cx){ctx.lineWidth=6;ctx.lineCap='round';ctx.beginPath();ctx.ellipse(cx,p.eyeY+10,25,20,0,Math.PI,Math.PI*2);ctx.stroke()}
+function pressedEye(cx,left){
+  // 91.524s: a shallow inward-sloping crescent, not a symmetric arch.
+  const scale=p.eyeRadius/30;ctx.beginPath();
+  for(let x=-28;x<=28;x++){const y=-7+(left?x:-x)*.34+x*x*.009,w=1+3*(1-x*x/784);if(x===-28)ctx.moveTo(cx+x*scale,p.eyeY+(y-w)*scale);else ctx.lineTo(cx+x*scale,p.eyeY+(y-w)*scale)}
+  for(let x=28;x>=-28;x--){const y=-7+(left?x:-x)*.34+x*x*.009,w=1+3*(1-x*x/784);ctx.lineTo(cx+x*scale,p.eyeY+(y+w)*scale)}
+  ctx.closePath();ctx.fill();
+}
+function bottomClippedEye(cx){ctx.save();ctx.beginPath();ctx.rect(cx-p.eyeRadius-2,p.eyeY-8,p.eyeRadius*2+4,p.eyeRadius+10);ctx.clip();ellipse(cx,p.eyeY,p.eyeRadius,p.eyeRadius);ctx.restore()}
+function neutralMouth(){ctx.lineWidth=7;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(215,p.mouthY);ctx.lineTo(251,p.mouthY);ctx.stroke()}
+function elasticHMouth(){ctx.lineWidth=6;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(207,p.mouthY-22);ctx.quadraticCurveTo(214,p.mouthY,207,p.mouthY+22);ctx.moveTo(259,p.mouthY-22);ctx.quadraticCurveTo(252,p.mouthY,259,p.mouthY+22);ctx.moveTo(211,p.mouthY);ctx.lineTo(255,p.mouthY);ctx.stroke()}
+function sadEye(cx,left){ctx.save();ctx.beginPath();ctx.ellipse(cx,p.eyeY,p.eyeRadius,p.eyeRadius,0,0,Math.PI*2);ctx.clip();ctx.beginPath();const x0=cx-p.eyeRadius-3,x1=cx+p.eyeRadius+3;const base=p.eyeY-14;const y0=base+(left?p.eyeRadius*.5:-p.eyeRadius*.5),y1=base+(left?-p.eyeRadius*.5:p.eyeRadius*.5);ctx.moveTo(x0,y0);ctx.lineTo(x1,y1);ctx.lineTo(x1,p.eyeY+p.eyeRadius+4);ctx.lineTo(x0,p.eyeY+p.eyeRadius+4);ctx.fill();ctx.restore()}
+function flatMouth(){const w=31,h=29;ctx.beginPath();ctx.moveTo(233-w,p.mouthY-h*.55);ctx.quadraticCurveTo(233-w*.82,p.mouthY-h*.72,233-w*.64,p.mouthY-h*.72);ctx.lineTo(233+w*.64,p.mouthY-h*.72);ctx.quadraticCurveTo(233+w*.82,p.mouthY-h*.72,233+w,p.mouthY-h*.55);ctx.lineTo(233+w,p.mouthY+h*.12);ctx.quadraticCurveTo(233+w*.82,p.mouthY+h,233,p.mouthY+h);ctx.quadraticCurveTo(233-w*.82,p.mouthY+h,233-w,p.mouthY+h*.12);ctx.closePath();ctx.fill()}
+/* The capture's kiss mouth is a thick side-opening 3: each lobe arches high
+ * near the centre-left, then rolls into a short right-hand vertical. */
+function kissMouth(){ctx.lineWidth=9;ctx.lineCap='round';ctx.beginPath();ctx.moveTo(224,p.mouthY-16);ctx.quadraticCurveTo(227,p.mouthY-25,236,p.mouthY-25);ctx.quadraticCurveTo(247,p.mouthY-25,249,p.mouthY-16);ctx.quadraticCurveTo(249,p.mouthY-7,236,p.mouthY);ctx.quadraticCurveTo(249,p.mouthY+7,249,p.mouthY+16);ctx.quadraticCurveTo(247,p.mouthY+25,236,p.mouthY+25);ctx.quadraticCurveTo(227,p.mouthY+25,224,p.mouthY+16);ctx.stroke()}
+function roundedRectPath(x,y,w,h,r){const rr=Math.min(r,Math.abs(w)/2,Math.abs(h)/2);ctx.beginPath();ctx.moveTo(x+rr,y);ctx.lineTo(x+w-rr,y);ctx.quadraticCurveTo(x+w,y,x+w,y+rr);ctx.lineTo(x+w,y+h-rr);ctx.quadraticCurveTo(x+w,y+h,x+w-rr,y+h);ctx.lineTo(x+rr,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-rr);ctx.lineTo(x,y+rr);ctx.quadraticCurveTo(x,y,x+rr,y);ctx.closePath()}
+/* Android's drag mouth is a continuously deformable blob.  The four edge
+ * extents are calculated from the drag vector, but the contour itself is
+ * never rotated or snapped to a square.  This is deliberately a local path:
+ * the caller translates it to the mouth anchor, so every direction can keep
+ * its own top/bottom and left/right asymmetry. */
+function irregularPullMouth(dx,dy,mag,allowPoint=true){
+  const ax=Math.abs(dx),ay=Math.abs(dy),m=mag||Math.hypot(dx,dy)||1;
+  const h=ax/m,v=ay/m,t=Math.min(1,Math.max(0,(m-4)/58));
+  const cross=(2*h*v)*(2*h*v);
+  let halfW=21+t*(42*Math.pow(h,4)+12*cross);
+  let halfH=20+t*(15*Math.pow(h,4)+22*Math.pow(v,4)+7*cross);
+  const diagonal=t*(5*cross+3*h*v);
+  /* At 45° the Android reference is a rounded square, not a diamond.  Fade
+   * the directional edge bias smoothly as both axes become equally involved;
+   * horizontal/vertical pulls retain their full asymmetric stretch. */
+  const diagonalBalance=1-.9*cross;
+  const horizontal=t*(12*h+diagonal)*diagonalBalance,vertical=t*(13*v+diagonal)*diagonalBalance;
+  let leftHalf=halfW,rightHalf=halfW,topHalf=halfH,bottomHalf=halfH;
+  if(dx<0){leftHalf+=horizontal;rightHalf-=horizontal*.34}
+  else if(dx>0){rightHalf+=horizontal;leftHalf-=horizontal*.34}
+  if(dy<0){topHalf+=vertical;bottomHalf-=vertical*.34}
+  else if(dy>0){bottomHalf+=vertical;topHalf-=vertical*.34}
+  leftHalf=Math.max(13,leftHalf);rightHalf=Math.max(13,rightHalf);
+  topHalf=Math.max(14,topHalf);bottomHalf=Math.max(14,bottomHalf);
+  /* A strong upward pull terminates in the pointed silhouette seen in the
+   * recording; downward pulls stay capsule-like instead of rotating it. */
+  if(allowPoint&&dy<0&&v>.82){
+    const tip=Math.min(48,26+t*22),base=Math.min(38,20+t*18),baseY=Math.min(34,16+t*17),side=Math.min(44,17+t*25);
+    ctx.beginPath();ctx.moveTo(0,-tip);ctx.quadraticCurveTo(-side*.62,-tip*.52,-side,baseY);
+    ctx.quadraticCurveTo(-side*.72,baseY+base*.12,0,base);ctx.quadraticCurveTo(side*.72,baseY+base*.12,side,baseY);
+    ctx.quadraticCurveTo(side*.62,-tip*.52,0,-tip);ctx.closePath();ctx.fill();return;
+  }
+  const left=-leftHalf,right=rightHalf,top=-topHalf,bottom=bottomHalf;
+  const corner=Math.min(10,leftHalf*.30,rightHalf*.30,topHalf*.38,bottomHalf*.38);
+  const edgeLean=t*8*h*v*diagonalBalance;
+  const sideBulge=edgeLean*Math.sign(dx);
+  const topBulge=dy<0?edgeLean*.5:0;
+  const bottomBulge=dy>0?edgeLean*.5:0;
+  const verticalBulge=edgeLean*Math.sign(dy)*.35;
+  /* Keep the top and bottom horizontal.  A diagonal pull changes side reach
+   * and curvature, not the mouth's rotation; the small outward bulge below
+   * is what makes the dragged corner irregular without tilting the shape. */
+  const topLeft=top,topRight=top,bottomRight=bottom,bottomLeft=bottom;
+  ctx.beginPath();
+  ctx.moveTo(left+corner,topLeft);
+  ctx.quadraticCurveTo((left+right)*.18,topRight-topBulge,right-corner*.62,topRight);
+  ctx.quadraticCurveTo(right+sideBulge*.35,topRight+(bottomRight-topRight)*.42+verticalBulge,right,bottomRight);
+  ctx.quadraticCurveTo(right,bottomRight,right-corner*.58,bottomRight);
+  ctx.quadraticCurveTo((left+right)*-.18,bottomLeft+bottomBulge,left+corner*.62,bottomLeft);
+  ctx.quadraticCurveTo(left-sideBulge*.18,bottomLeft+(topLeft-bottomLeft)*.42+verticalBulge,left,topLeft);
+  ctx.quadraticCurveTo(left,topLeft,left+corner,topLeft);
+  ctx.closePath();ctx.fill();
+}
+/* Keep a named live primitive at the dispatch seam.  It is intentionally a
+ * wrapper around the independent-edge contour so tests and future firmware
+ * ports have one obvious place to follow the real pointer-drag behaviour. */
+function liveVerticalPullMouth(t){
+  const halfW=21,halfH=20+t*22,left=-halfW,right=halfW,top=-halfH,bottom=halfH,corner=5;
+  ctx.beginPath();ctx.moveTo(left+corner,top);ctx.lineTo(right-corner,top);
+  ctx.quadraticCurveTo(right,top+12,right,bottom-16);
+  ctx.quadraticCurveTo(right,bottom-2,0,bottom);
+  ctx.quadraticCurveTo(left,bottom-2,left,bottom-16);
+  ctx.quadraticCurveTo(left,top+12,left+corner,top);ctx.closePath();ctx.fill();
+}
+function liveRoundPullMouth(dx,dy,mag,t){
+  /* Android's round family stretches along the actual pull axis instead of
+   * staying a tiny fixed circle.  Keep a soft ellipse at the start, then let
+   * the long axis grow to roughly the eye-gap scale while the short axis stays
+   * rounded.  The centre follows the finger only modestly so the mouth never
+   * climbs into the eyes. */
+  const m=mag||Math.hypot(dx,dy)||1,ux=dx/m,uy=dy/m;
+  const angle=Math.atan2(uy,ux);
+  const along=22+t*40,cross=20+t*26;
+  const cx=ux*t*20,cy=uy*t*16;
+  ctx.beginPath();ctx.ellipse(cx,cy,along,cross,angle,0,Math.PI*2);ctx.fill();
+}
+function liveTrianglePullMouth(dx,dy,mag,t){
+  // 208.5–211.0s: the SAME triangle narrows on vertical travel and widens
+  // on lateral travel. Independent axes, never rotation or radial scaling.
+  const tx=Math.min(1,Math.abs(dx)/84),ty=Math.min(1,Math.abs(dy)/84);
+  const tip=18+ty*12,base=14+ty*42,half=18+tx*48;
+  const flank=half*.8,controlY=(base-tip)/2;
+  ctx.beginPath();ctx.moveTo(0,-tip);
+  ctx.quadraticCurveTo(-flank,controlY,-half,base);
+  ctx.lineTo(half,base);
+  ctx.quadraticCurveTo(flank,controlY,0,-tip);ctx.closePath();ctx.fill();
+}
+function liveHorizontalPullMouth(t){
+  /* Keep the contour visibly wide from the first meaningful drag sample;
+   * growing height as quickly as width made the live mouth read as a square. */
+  const halfW=31+t*32,halfH=17+t*18,radius=Math.min(10,6+t*4);
+  roundedRectPath(-halfW,-halfH,halfW*2,halfH*2,radius);ctx.fill();
+}
+function liveDiagonalPullMouth(t){
+  const halfW=21+t*22,halfH=20+t*16,radius=Math.min(10,6+t*4);
+  roundedRectPath(-halfW,-halfH,halfW*2,halfH*2,radius);ctx.fill();
+}
+function liveSquarePullMouth(dx,dy,mag,t){
+  /* Keep the square family screen-aligned.  Its width/height and one-sided
+   * bulges follow the vector, but all four edges stay axis-aligned so the
+   * result cannot collapse into the old right-down diamond. */
+  const m=mag||Math.hypot(dx,dy)||1,h=Math.abs(dx)/m,v=Math.abs(dy)/m;
+  const halfW=24+t*(18+12*h),halfH=22+t*(18+12*v);
+  const leanX=Math.min(10,t*(4+6*h)),leanY=Math.min(10,t*(4+6*v));
+  const left=-(halfW+(dx<0?leanX:0)),right=halfW+(dx>0?leanX:0);
+  const top=-(halfH+(dy<0?leanY:0)),bottom=halfH+(dy>0?leanY:0);
+  const corner=Math.min(12,7+t*5);
+  ctx.beginPath();ctx.moveTo(left+corner,top);ctx.lineTo(right-corner,top);
+  ctx.quadraticCurveTo(right,top,right,top+corner);ctx.lineTo(right,bottom-corner);
+  ctx.quadraticCurveTo(right,bottom,right-corner,bottom);ctx.lineTo(left+corner,bottom);
+  ctx.quadraticCurveTo(left,bottom,left,bottom-corner);ctx.lineTo(left,top+corner);
+  ctx.quadraticCurveTo(left,top,left+corner,top);ctx.closePath();ctx.fill();
+}
+function liveSidePullMouth(dx=1,amount=1){
+  const t=Math.max(0,Math.min(1,amount));
+  const coreH=13+11*t,coreLeft=-7-5*t,coreRight=3+2*t;
+  const arcX=14+8*t,arcH=21+13*t,arcInner=7+3*t;
+  ctx.save();if(dx<0)ctx.scale(-1,1);
+  ctx.lineCap='round';ctx.lineJoin='round';ctx.lineWidth=8+2*t;
+  /* Keep the captured 3+arc contour stable while the whole mouth follows the
+   * finger.  Scaling this path by travel distance made it look larger merely
+   * because the pointer was farther from the mouth centre. */
+  ctx.beginPath();ctx.moveTo(coreRight,-coreH*.88);
+  ctx.quadraticCurveTo(coreLeft,-coreH-2,coreLeft,-coreH*.42);
+  ctx.quadraticCurveTo(coreLeft,-2,coreRight,0);
+  ctx.quadraticCurveTo(coreLeft,2,coreLeft,coreH*.42);
+  ctx.quadraticCurveTo(coreLeft,coreH+2,coreRight,coreH*.88);ctx.stroke();
+  const bridgeLeft=coreLeft+2,bridgeRight=8+4*t,bridgeHalf=2.5+1.5*t;
+  ctx.beginPath();ctx.moveTo(bridgeLeft,-bridgeHalf);
+  ctx.quadraticCurveTo(coreRight,-bridgeHalf*.8,bridgeRight,-bridgeHalf*.55);
+  ctx.quadraticCurveTo(bridgeRight+2,0,bridgeRight,bridgeHalf*.55);
+  ctx.quadraticCurveTo(coreRight,bridgeHalf*.8,bridgeLeft,bridgeHalf);ctx.closePath();ctx.fill();
+  /* The independent arc stays paired with the fixed-size 3. */
+  ctx.beginPath();ctx.moveTo(arcX,-arcH);ctx.quadraticCurveTo(arcX-arcInner,0,arcX,arcH);ctx.stroke();
+  ctx.restore();
+}
+function pullFamilyForVector(dx,dy){
+  const ax=Math.abs(dx),ay=Math.abs(dy);
+  if(ay>=ax*1.25)return dy<0?'upward':'vertical';
+  if(ax>=ay*1.25)return 'side';
+  return 'diagonal';
+}
+function liveStretchPullMouth(dx,dy,mag,t){
+  /* Stretch follows the pull axis: downward travel grows the capsule's
+   * height without widening it, while horizontal travel grows the broad
+   * reference blob.  The same family can therefore be sampled continuously
+   * as a gesture bends from vertical toward horizontal. */
+  const m=mag||Math.hypot(dx,dy)||1,family=pullFamilyForVector(dx,dy);
+  const h=family==='vertical'||family==='upward'?0:family==='side'?1:Math.abs(dx)/m;
+  const halfW=21+t*42*h,halfH=Math.min(42,20+t*(15+27*(1-h)));
+  let left=-halfW,right=halfW,top=-halfH,bottom=halfH;
+  /* Keep the opposite edge anchored.  A right pull grows only to the right,
+   * a left pull only to the left; vertical pulls use the same rule on Y. */
+  if(family==='side'){
+    if(dx>0){left=-21;right=left+halfW*2}
+    else if(dx<0){right=21;left=right-halfW*2}
+  }else if(family==='vertical'||family==='upward'){
+    if(dy>0){top=-20;bottom=top+halfH*2}
+    else if(dy<0){bottom=20;top=bottom-halfH*2}
+  }
+  ctx.beginPath();ctx.moveTo(left+11,top);ctx.lineTo(right-11,top);
+  ctx.quadraticCurveTo(right-2,top+7,right,top+20);
+  ctx.quadraticCurveTo(right,bottom-13,right-12,bottom-6);
+  ctx.quadraticCurveTo(0,bottom+1,left+12,bottom-6);
+  ctx.quadraticCurveTo(left,bottom-13,left,top+20);
+  ctx.quadraticCurveTo(left+2,top+7,left+11,top);ctx.closePath();ctx.fill();
+}
+const pullVariants=['round','stretch','square','triangle'];
+function choosePullVariant(){return pullVariants[Math.floor(Math.random()*pullVariants.length)]}
+function livePullMouth(dx,dy,mag,variant='auto'){
+  const m=mag||Math.hypot(dx,dy)||1,ax=Math.abs(dx),ay=Math.abs(dy),h=ax/m,v=ay/m;
+  const t=Math.min(1,Math.max(0,(m-4)/84));
+  if(variant==='round'){liveRoundPullMouth(dx,dy,mag,t);return}
+  if(variant==='stretch'){liveStretchPullMouth(dx,dy,mag,t);return}
+  if(variant==='square'){liveSquarePullMouth(dx,dy,mag,t);return}
+  if(variant==='triangle'){liveTrianglePullMouth(dx,dy,mag,t);return}
+  if(variant==='side'){liveSidePullMouth(dx,1);return}
+  /* The surprise/kiss mode stays locked against the side-pull 3+arc, but its
+   * contour family follows the current pointer vector when no random variant
+   * has been selected. */
+  const currentFamily=pullFamilyForVector(dx,dy);
+  if(currentFamily==='vertical'){liveVerticalPullMouth(t);return}
+  if(currentFamily==='side'){liveHorizontalPullMouth(t);return}
+  if(currentFamily==='diagonal'){liveSquarePullMouth(dx,dy,mag,t);return}
+  if(currentFamily==='upward'){liveTrianglePullMouth(dx,dy,mag,t);return}
+  irregularPullMouth(dx,dy,mag);
+}
+/* Four fixed reference silhouettes from the Android captures.  These are
+ * intentionally separate from the live drag primitive: the research buttons
+ * should show the broad blob, capsule, square and pointed shape rather than
+ * the extreme side-pull 3+arc mouth. */
+function referenceHorizontalPullMouth(){
+  const y=p.mouthY+20,left=233-63,right=233+63,top=y-34,bottom=y+35;
+  ctx.beginPath();ctx.moveTo(left+11,top);ctx.lineTo(right-11,top);
+  ctx.quadraticCurveTo(right-2,top+7,right,top+20);
+  ctx.quadraticCurveTo(right,bottom-13,right-12,bottom-6);
+  ctx.quadraticCurveTo(233,bottom+1,left+12,bottom-6);
+  ctx.quadraticCurveTo(left,bottom-13,left,top+20);
+  ctx.quadraticCurveTo(left+2,top+7,left+11,top);ctx.closePath();ctx.fill();
+}
+function referenceVerticalPullMouth(){
+  const y=p.mouthY+20,left=233-21,right=233+21,top=y-42,bottom=y+41;
+  ctx.beginPath();ctx.moveTo(left+5,top);ctx.lineTo(right-5,top);
+  ctx.quadraticCurveTo(right,top+12,right,bottom-16);
+  ctx.quadraticCurveTo(right,bottom-2,233,bottom);
+  ctx.quadraticCurveTo(left,bottom-2,left,bottom-16);
+  ctx.quadraticCurveTo(left,top+12,left+5,top);ctx.closePath();ctx.fill();
+}
+function referenceSquarePullMouth(){
+  const y=p.mouthY+20,left=233-43,right=233+43,top=y-36,bottom=y+37;
+  ctx.beginPath();ctx.moveTo(left+9,top);ctx.lineTo(right-9,top);
+  ctx.quadraticCurveTo(right,top,right,top+10);ctx.lineTo(right,bottom-10);
+  ctx.quadraticCurveTo(right,bottom,right-10,bottom);ctx.lineTo(left+10,bottom);
+  ctx.quadraticCurveTo(left,bottom,left,bottom-10);ctx.lineTo(left,top+10);
+  ctx.quadraticCurveTo(left,top,left+9,top);ctx.closePath();ctx.fill();
+}
+function referenceTrianglePullMouth(){
+  const y=p.mouthY+20,tip=y-41,base=y+35,half=44;
+  ctx.beginPath();ctx.moveTo(233,tip);
+  ctx.quadraticCurveTo(233-28,y-18,233-half,base);
+  ctx.quadraticCurveTo(233,base+2,233+half,base);
+  ctx.quadraticCurveTo(233+28,y-18,233,tip);ctx.closePath();ctx.fill();
+}
+function referencePullEye(cx){
+  ctx.beginPath();ctx.ellipse(cx,p.eyeY,p.eyeRadius,p.eyeRadius*.87,0,0,Math.PI*2);ctx.fill();
+}
+function pullMouthByVector(dx,dy,mode='auto'){
+  const ax=Math.abs(dx),ay=Math.abs(dy),mag=Math.hypot(dx,dy);
+  if(mag<10){if(mode==='auto'){kissMouth();return}if(mode==='surprised'){flatMouth();return}}
+  if(mag<10&&mode==='live'&&!(drag&&drag.mouthVariant)){kissMouth();return}
+  if(mode==='side'){
+    if(drag&&drag.mouth&&drag.mouthVariant){
+      ctx.save();
+      const m=mag||1,nx=dx/m,ny=dy/m,t=Math.min(1,m/110);
+      ctx.translate(233+nx*t*18,p.mouthY+20+ny*t*14);
+      livePullMouth(dx,dy,mag,drag.mouthVariant);ctx.restore();return;
+    }
+    ctx.save();ctx.translate(233+Math.sign(dx)*Math.min(18,mag*.28),p.mouthY+20);
+    liveSidePullMouth(dx,1);ctx.restore();return
+  }
+  if(mode==='live'){
+    ctx.save();
+    const m=mag||1,nx=dx/m,ny=dy/m,t=Math.min(1,m/110);
+    const triangle=drag&&drag.mouthVariant==='triangle';
+    ctx.translate(233+(triangle?dx*18/110:nx*t*18),p.mouthY+(triangle?6:20)+(triangle?dy*14/110:ny*t*14));
+    livePullMouth(dx,dy,mag,drag&&drag.mouthVariant);ctx.restore();return;
+  }
+  ctx.save();ctx.translate(233,p.mouthY+20);
+  if(dy< -18&&ay>ax*1.15){
+    const tip=Math.min(62,24+mag*.58),base=tip*.55,half=Math.min(38,16+ay*.45);
+    ctx.beginPath();ctx.moveTo(0,-tip);ctx.lineTo(half,base);ctx.quadraticCurveTo(0,base+half*.16,-half,base);ctx.closePath();ctx.fill();
+  } else {
+    irregularPullMouth(dx,dy,mag);
+  }
+  ctx.restore()
+}
+  /* The new pull recording shows two separate components: a filled left 3
+   * (including its white centre bridge) and an independent right arc.  Keep
+   * the small black gap between them instead of joining the silhouette. */
+  function pullSideMouth(){const y=p.mouthY+20;ctx.save();ctx.translate(233,y);liveSidePullMouth(1,1);ctx.restore()}
+function draw(){ctx.fillStyle='#000';ctx.fillRect(0,0,466,466);ctx.fillStyle=ctx.strokeStyle='#fff';const [lx,rx]=eyeCenters();
+ if(idlePlaying&&idleAtlas){drawIdleReference();updateExport();return}
+ if(drag&&drag.mouth&&drag.mouthVariant==='triangle'){for(const cx of [lx,rx]){ctx.save();ctx.beginPath();ctx.rect(cx-p.eyeRadius-2,p.eyeY-p.eyeRadius-2,p.eyeRadius*2+4,p.eyeRadius*1.8+2);ctx.clip();ellipse(cx,p.eyeY,p.eyeRadius,p.eyeRadius);ctx.restore()}}
+ else if(drag&&drag.mouth&&(state==='surprised'||state==='kiss'||state==='pullSide')){referencePullEye(lx);referencePullEye(rx)}
+ else if(state==='pullHorizontal'||state==='pullVertical'||state==='pullSquare'||state==='pullTriangle'){referencePullEye(lx);referencePullEye(rx)}
+ else if(state==='idle'||state==='surprised'||state==='caret'||state==='softSmile'){ellipse(lx,p.eyeY,p.eyeRadius,p.eyeRadius);ellipse(rx,p.eyeY,p.eyeRadius,p.eyeRadius)}
+ else if(state==='blink'){bottomClippedEye(lx);bottomClippedEye(rx)}
+ else if(state==='squish'){bottomClippedEye(lx);bottomClippedEye(rx)}
+ else if(state==='happy'||state==='kiss'||state==='closedNeutral'){closedEye(lx);closedEye(rx)}
+ else if(state==='mouthRelease'){pressedEye(lx,true);pressedEye(rx,false)}
+ else if(state==='headPat'){barEye(lx);barEye(rx)}
+ else if(state==='delighted'){upperClippedEye(lx);upperClippedEye(rx);blush()}
+ else if(state==='sad'){sadEye(lx,true);sadEye(rx,false)}
+ else if(state==='winkLeft'){pressedEye(lx,true);ellipse(rx,p.eyeY,p.eyeRadius,p.eyeRadius)}
+ else if(state==='winkRight'){ellipse(lx,p.eyeY,p.eyeRadius,p.eyeRadius);pressedEye(rx,false)}
+ else if(state==='angry'){angryEye(lx,true);angryEye(rx,false)}
+ else if(state==='sleepy'){sleepyEye(lx);sleepyEye(rx)}
+ else if(state==='dizzy'){dizzyEye(lx,dizzyPhase);dizzyEye(rx,dizzyPhase)}
+ else if(state==='cat'||state==='pullUp'){barEye(lx);barEye(rx)}
+ else if(state==='pressLeft'){ellipse(lx,p.eyeY,p.eyeRadius,p.eyeRadius);ctx.save();ctx.translate(rx,p.eyeY);ctx.rotate(-.28);ctx.beginPath();ctx.ellipse(0,0,p.eyeRadius,p.eyeRadius,0,0,Math.PI*2);ctx.clip();ctx.fillRect(-p.eyeRadius,-p.eyeRadius,p.eyeRadius*2,p.eyeRadius*1.45);ctx.restore()}
+ else if(state==='pressRight'){ctx.save();ctx.translate(lx,p.eyeY);ctx.rotate(.28);ctx.beginPath();ctx.ellipse(0,0,p.eyeRadius,p.eyeRadius,0,0,Math.PI*2);ctx.clip();ctx.fillRect(-p.eyeRadius,-p.eyeRadius,p.eyeRadius*2,p.eyeRadius*1.45);ctx.restore();ellipse(rx,p.eyeY,p.eyeRadius,p.eyeRadius)}
+ else if(state==='pullSide'){closedEye(lx);closedEye(rx)}
+ else if(state==='bothClip'||state==='elasticH'){bottomClippedEye(lx);bottomClippedEye(rx)}
+  if(state==='headPat')catMouth();else if(state==='delighted')delightedMouth();else if(state==='mouthRelease')neutralMouth();else if(state==='winkLeft'||state==='winkRight')caretMouth();else if(state==='softSmile')mouthCurve(true,28,12,4);else if(state==='happy'||state==='idle'||state==='blink'||state==='closedNeutral')sourceSmileMouth();else if(state==='squish')mouthCurve(true,34,15,5);else if(state==='sad'||state==='angry'||state==='sleepy')mouthCurve(false,state==='angry'?31:state==='sleepy'?20:25,state==='angry'?10:state==='sleepy'?3:8,state==='angry'?4:3);else if(state==='surprised')(drag&&drag.mouth?pullMouthByVector(pullDx,pullDy,'live'):flatMouth());else if(state==='kiss')(drag&&drag.mouth?pullMouthByVector(pullDx,pullDy,'live'):kissMouth());else if(state==='dizzy')neutralMouth();else if(state==='pullHorizontal')referenceHorizontalPullMouth();else if(state==='pullVertical')referenceVerticalPullMouth();else if(state==='pullSquare')referenceSquarePullMouth();else if(state==='pullTriangle')referenceTrianglePullMouth();else if(state==='bothClip')neutralMouth();else if(state==='elasticH')elasticHMouth();else if(state==='cat'||state==='pullUp')catMouth();else if(state==='caret'||state==='pressLeft'||state==='pressRight')caretMouth();else if(state==='pullSide')(drag&&drag.mouth?pullMouthByVector(pullDx,pullDy,'side'):pullSideMouth())
+ updateExport()}
+function updateExport(){document.querySelector('#export').value=`#define OUO_LEFT_EYE_X          ${Math.round(233-p.eyeGap/2)}\n#define OUO_RIGHT_EYE_X         ${Math.round(233+p.eyeGap/2)}\n#define OUO_EYE_Y               ${p.eyeY}\n#define OUO_MOUTH_Y             ${p.mouthY}\n/* preview: eye radius ${p.eyeRadius}, round mouth ${p.mouthWidth} x ${p.mouthHeight} */`}
+function pos(e){const r=canvas.getBoundingClientRect();return{x:(e.clientX-r.left)*466/r.width,y:(e.clientY-r.top)*466/r.height}}
+canvas.onpointerdown=e=>{
+   if(drag)return; // PACON's interaction path is intentionally single-contact.
+   resumeIdleAfterTouch=idlePlaying||resumeIdleAfterTouch;
+   stopIdlePlayback();
+   const q=pos(e),[lx,rx]=eyeCenters(),now=performance.now();
+  const leftEyeHit=((q.x-lx)/66)**2+((q.y-p.eyeY)/82)**2<=1;
+  const rightEyeHit=((q.x-rx)/66)**2+((q.y-p.eyeY)/82)**2<=1;
+  const mouthHit=((q.x-233)/100)**2+((q.y-p.mouthY)/70)**2<=1;
+  const headHit=q.y<145||(q.x>lx+66&&q.x<rx-66&&q.y<p.eyeY+4);
+  /* Match PACON: all feature settings entrances occupy the upper-right. */
+  const menuHit=!mouthHit&&q.x>=326&&q.x<448&&q.y>=24&&q.y<132;
+  pointerKind=menuHit?'menu':leftEyeHit&&!rightEyeHit?'eyeLeft':rightEyeHit&&!leftEyeHit?'eyeRight':leftEyeHit||rightEyeHit?'eyes':headHit?'head':mouthHit?'mouth':(q.x<205||q.x>466-205)&&q.y>=205&&q.y<=390?'cheek':'face';
+  if(pointerKind==='eyeLeft'||pointerKind==='eyeRight')activeEyePointers.set(e.pointerId,pointerKind);
+  if([...activeEyePointers.values()].includes('eyeLeft')&&[...activeEyePointers.values()].includes('eyeRight'))pointerKind='eyes';
+  pointerStartMs=now;pointerLastX=q.x;pointerLastY=q.y;pointerLastMotionX=0;pointerLastMotionY=0;pointerReversals=0;pointerWindowStartMs=now;pointerMoved=false;
+  pullDx=0;pullDy=0;
+  drag={pointerId:e.pointerId,x:q.x,y:q.y,mouth:pointerKind==='mouth',mouthSide:pointerKind==='mouth'&&Math.abs(q.x-233)>=10};
+  if(pointerKind==='eyeLeft')setState('winkLeft');
+  else if(pointerKind==='eyeRight')setState('winkRight');
+  else if(pointerKind==='eyes')setState('surprised');
+  else if(pointerKind==='head')setState('headPat');
+  else if(pointerKind==='mouth')setState('kiss');
+  else if(pointerKind==='cheek')setState('squish');
+  else if(pointerKind==='face')setState('happy');
+  if(pointerHoldTimer)clearTimeout(pointerHoldTimer);
+  canvas.setPointerCapture(e.pointerId);
+};
+canvas.onpointermove=e=>{
+  if(!drag||e.pointerId!==drag.pointerId)return;
+  const q=pos(e);
+  const now=performance.now(),dx=q.x-pointerLastX,dy=q.y-pointerLastY,motion=Math.abs(dx)+Math.abs(dy);
+  const elapsed=now-pointerStartMs;
+  if(now-pointerWindowStartMs>650){pointerWindowStartMs=now;pointerReversals=0;pointerLastMotionX=0;pointerLastMotionY=0}
+  if(!drag.mouth&&pointerKind!=='head'&&motion>=22){const previous=Math.abs(pointerLastMotionX)+Math.abs(pointerLastMotionY);if(previous>=22&&dx*pointerLastMotionX+dy*pointerLastMotionY<=-260)pointerReversals++;pointerLastMotionX=dx;pointerLastMotionY=dy;if(pointerReversals>=2){pointerKind='dizzy';setState('dizzy')}}
+  if(pointerKind==='menu'){
+    if(Math.hypot(q.x-drag.x,q.y-drag.y)>30){pointerKind='cheek';setState('squish')}
+  }else if(pointerKind==='eyeLeft'||pointerKind==='eyeRight'||pointerKind==='eyes'){
+    // A held eye remains a wink; elapsed time alone is not surprise.
+  }else if(pointerKind==='mouth'){
+    pullDx=Math.max(-120,Math.min(120,q.x-drag.x));pullDy=Math.max(-110,Math.min(110,q.y-drag.y));
+    const pullMagnitude=Math.hypot(pullDx,pullDy);
+    if(pullMagnitude>2){
+      pointerMoved=true;
+      if(!drag.mouthMode&&pullMagnitude>=10){
+        const firstFamily=pullFamilyForVector(pullDx,pullDy);
+        const sideGesture=drag.mouthSide&&firstFamily==='side';
+        /* Centre pulls use the random contour families.  Starting on either
+         * mouth edge and dragging horizontally is the explicit side-pull
+         * gesture, so the captured 3+arc can be triggered again. */
+        drag.mouthVariant=sideGesture?'side':firstFamily==='side'?'stretch':choosePullVariant();
+        drag.mouthMode=sideGesture?'side':'surprised';
+      }
+      if(drag.mouthMode)setState(drag.mouthMode==='side'?'pullSide':'surprised');else draw();
+    }else draw();
+  }else if(pointerKind==='head'){
+    setState('headPat');
+  }else if(pointerKind==='cheek'){
+    setState('squish');
+  }
+  pointerLastX=q.x;pointerLastY=q.y;
+  if(pointerKind!=='dizzy'&&pointerKind!=='mouth')draw();
+};
+canvas.onpointerup=e=>{
+  if(!drag||(e&&e.pointerId!==drag.pointerId))return;
+  if(e&&activeEyePointers.has(e.pointerId))activeEyePointers.delete(e.pointerId);
+  if(pointerHoldTimer){clearTimeout(pointerHoldTimer);pointerHoldTimer=null}
+  const kind=pointerKind,moved=pointerMoved;
+  drag=null;pullDx=0;pullDy=0;pointerKind='';pointerMoved=false;
+  if(kind==='head')releaseResponse('delighted',6000);
+  else if(kind==='eyeLeft'||kind==='eyeRight')releaseResponse('caret',700);
+  else if(kind==='mouth')releaseResponse(moved?'mouthRelease':'kiss',650);
+  else releaseResponse(state,900);
+};
+canvas.onpointercancel=e=>{
+  if(!drag||(e&&e.pointerId!==drag.pointerId))return;
+  if(e&&activeEyePointers.has(e.pointerId))activeEyePointers.delete(e.pointerId);
+  if(pointerHoldTimer){clearTimeout(pointerHoldTimer);pointerHoldTimer=null}
+  drag=null;pullDx=0;pullDy=0;pointerKind='';pointerMoved=false;setState('idle');
+};
+document.querySelector('#reset').onclick=()=>{Object.assign(p,defaults);controls.querySelectorAll('label').forEach(l=>{const i=l.querySelector('input');i.value=p[l.dataset.key];l.querySelector('output').value=p[l.dataset.key]});setState('idle')};
+document.querySelector('#animate').onclick=()=>{if(idlePlaying){stopIdlePlayback();setState('idle')}else startIdlePlayback()};
+document.querySelector('#shot').onclick=()=>{const a=document.createElement('a');a.download=`pacon-ouo-${state}.png`;a.href=canvas.toDataURL();a.click()};
+document.querySelector('#copy').onclick=async()=>{await navigator.clipboard.writeText(document.querySelector('#export').value);document.querySelector('#copy').textContent='已复制';setTimeout(()=>document.querySelector('#copy').textContent='复制 C 参数',900)};
+setState('idle');
+</script></body></html>

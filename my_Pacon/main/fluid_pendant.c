@@ -39,6 +39,8 @@
 #include "esp_vfs_fat.h"
 #include "esp_wifi.h"
 #include "ble_pacon.h"
+#include "pacon_preferences.h"
+#include "ouo_idle_reference.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "tinyusb.h"
@@ -142,16 +144,23 @@ extern const uint8_t kkd2_complication_start[]
 extern const uint8_t kkd2_complication_end[]
     asm("_binary_kkd2_complication_rgb565a_end");
 
-/* 0u0 face geometry: slightly oversized for the round 1.69-inch panel while
- * leaving generous black space at the rim. */
-#define OUO_LEFT_EYE_X          122
-#define OUO_RIGHT_EYE_X         353
-#define OUO_EYE_Y               196
-#define OUO_MOUTH_Y             271
+/* OuO 1.611 capture geometry normalized around the 2400x1080 screen centre
+ * into the 466px round face: open eyes are about 30px radius, 226px apart,
+ * and sit at y=216.  Keeping these values in sync with ouo-preview avoids
+ * the previous crowded 44px-eye rendering. */
+#define OUO_LEFT_EYE_X          120
+#define OUO_RIGHT_EYE_X         346
+#define OUO_FACE_CENTER_X       ((OUO_LEFT_EYE_X + OUO_RIGHT_EYE_X) / 2)
+#define OUO_EYE_Y               216
+#define OUO_MOUTH_Y             264
+#define OUO_EYE_RADIUS          30
 #define OUO_MENU_HOLD_MS        560
-#define OUO_MENU_HOLD_X         210
-#define OUO_MENU_HOLD_Y         276
 #define OUO_MENU_HOLD_TOLERANCE 30
+/* Feature-local settings entrances share one reachable upper-right region. */
+#define FEATURE_SETTINGS_X1     326
+#define FEATURE_SETTINGS_X2     448
+#define FEATURE_SETTINGS_Y1     24
+#define FEATURE_SETTINGS_Y2     132
 #define LCD_STRIPE_LINES        64
 #define LCD_STRIPE_BYTES        (LCD_WIDTH * LCD_STRIPE_LINES * sizeof(uint16_t))
 #define LCD_FRAME_PIXELS        (LCD_WIDTH * LCD_HEIGHT)
@@ -175,9 +184,9 @@ extern const uint8_t kkd2_complication_end[]
 #define APPS_DISMISS_STEPS      5
 #define APPS_ENTRANCE_STEPS     4
 #define FRAME_PERIOD_MS         30
+#define OUO_FRAME_PERIOD_MS     16
 #define HOME_REFRESH_MS         1000
 #define FLUID_PERF_REPORT_MS    2000
-#define FLUID_CONTROL_TIMEOUT_MS 15000
 #define SETTINGS_SCROLL_MAX      440
 #define SETTINGS_BRIGHTNESS_MIN  0x20U
 #define SETTINGS_BRIGHTNESS_MAX  0xD0U
@@ -266,6 +275,7 @@ typedef enum {
     UI_SCREEN_USB_DISK,
     UI_SCREEN_SKYORB,
     UI_SCREEN_WATCH,
+    UI_SCREEN_CAMERA,
     UI_SCREEN_SETTINGS,
     UI_SCREEN_WIFI_SETTINGS,
 } ui_screen_t;
@@ -347,7 +357,23 @@ typedef enum {
     OUO_EXPRESSION_SLEEPY,
     OUO_EXPRESSION_SAD,
     OUO_EXPRESSION_DIZZY,
+    OUO_EXPRESSION_KISS,
+    OUO_EXPRESSION_HEAD_PAT,
+    OUO_EXPRESSION_DELIGHTED,
+    OUO_EXPRESSION_CARET,
+    OUO_EXPRESSION_MOUTH_RELEASE,
 } ouo_expression_t;
+
+/* A mouth drag is sampled once and then stays in its selected family for the
+ * rest of that contact.  This is how the previewer avoids the jarring
+ * surprise/side-pull reclassification seen when a finger bends mid-drag. */
+typedef enum {
+    OUO_MOUTH_VARIANT_ROUND = 0,
+    OUO_MOUTH_VARIANT_STRETCH,
+    OUO_MOUTH_VARIANT_SQUARE,
+    OUO_MOUTH_VARIANT_TRIANGLE,
+    OUO_MOUTH_VARIANT_SIDE,
+} ouo_mouth_variant_t;
 
 static esp_lcd_panel_handle_t s_lcd_panel;
 static esp_lcd_panel_io_handle_t s_lcd_io;
@@ -385,16 +411,45 @@ static bool s_usb_msc_start_requested;
 static bool s_usb_msc_exit_requested;
 static esp_err_t s_usb_msc_result = ESP_ERR_INVALID_STATE;
 static ui_screen_t s_ui_screen = UI_SCREEN_HOME;
+/* BLE submits requests; only the display task may change screens.  The
+ * snapshot/result is protected separately from the queue for GET UI. */
+static QueueHandle_t s_ble_ui_requests;
+static portMUX_TYPE s_ble_ui_lock = portMUX_INITIALIZER_UNLOCKED;
+static ui_screen_t s_ble_ui_snapshot = UI_SCREEN_HOME;
+typedef enum { BLE_UI_IDLE, BLE_UI_PENDING, BLE_UI_DONE, BLE_UI_BUSY } ble_ui_state_t;
+static ble_ui_state_t s_ble_ui_state = BLE_UI_IDLE;
 static fluid_shape_t s_fluid_shape = FLUID_SHAPE_SIMPLE;
 static bool s_home_dirty = true;
 static bool s_apps_dirty;
 static bool s_settings_dirty;
 static bool s_colour_picker_dirty;
+/* This tag describes the shared canvas, not the selected page. Other screens
+ * invalidate it before using that canvas; wake also forces a full repaint. */
+static ui_screen_t s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+static int s_fluid_settings_drawn_shape = -1;
+static int s_colour_marker_drawn_x;
+static int s_colour_marker_drawn_y;
+static bool s_colour_dragging;
+static uint16_t *s_colour_wheel_cache;
+static bool s_colour_wheel_cache_attempted;
+static bool s_fluid_preferences_pending;
+static int64_t s_fluid_preferences_retry_us;
+static int64_t s_fluid_controls_input_us;
+static struct {
+    uint64_t draw_us, transfer_us, feedback_us, save_us, pixels;
+    uint32_t frames, feedbacks, saves, max_feedback_us;
+    int64_t report_us;
+} s_fluid_ui_perf;
 static bool s_ouo_dirty;
 static bool s_ouo_menu_dirty;
 static bool s_usb_disk_dirty;
 static bool s_skyorb_dirty;
 static bool s_watch_dirty;
+static bool s_camera_dirty;
+static TickType_t s_camera_feedback_started;
+static TickType_t s_camera_feedback_until;
+static TickType_t s_camera_last_frame;
+static esp_err_t s_camera_feedback_result = ESP_ERR_INVALID_STATE;
 static uint8_t s_watch_style;
 /* The BLE task may change the requested style while the UI task owns the
  * display.  Keeping the last style actually flushed lets the UI perform a
@@ -519,24 +574,43 @@ static bool s_display_wake_touch_suppressed;
 static bool s_ouo_canvas_valid;
 static ouo_expression_t s_ouo_expression = OUO_EXPRESSION_IDLE;
 static int s_ouo_mood = 68;
+static uint8_t s_ouo_preferred_mood = 68;
 static int s_ouo_eye_pokes;
 static int64_t s_ouo_expression_until_us;
-static int64_t s_ouo_next_blink_us;
+static int64_t s_ouo_idle_epoch_us;
+static uint8_t *s_ouo_idle_tiles;
+static uint32_t s_ouo_idle_frame = UINT32_MAX;
+static bool s_ouo_idle_visible;
 static int64_t s_ouo_last_gaze_update_us;
 static int64_t s_ouo_touch_started_us;
 static int64_t s_ouo_render_total_us;
 static uint32_t s_ouo_render_frames;
-static uint8_t s_ouo_idle_cycle;
+static uint16_t s_ouo_idle_palette[256];
+static bool s_ouo_idle_palette_ready;
+static int64_t s_ouo_paint_window_us;
+static int64_t s_ouo_flush_window_us;
+static int64_t s_ouo_work_window_us;
+static int64_t s_ouo_update_last_us;
+static int64_t s_ouo_decode_last_us;
+static int64_t s_ouo_decode_window_us;
 static int s_ouo_gaze_x;
 static int s_ouo_gaze_y;
 static int s_ouo_squish_pixels;
 static int s_ouo_mouth_stretch_pixels;
 static int s_ouo_mouth_x_offset;
 static int s_ouo_mouth_y_offset;
+static ouo_mouth_variant_t s_ouo_mouth_variant = OUO_MOUTH_VARIANT_STRETCH;
+static bool s_ouo_mouth_variant_selected;
+static bool s_ouo_mouth_side;
 static int s_ouo_shake_x;
 static int s_ouo_shake_y;
 static int64_t s_ouo_shake_until_us;
 static int64_t s_ouo_last_shake_us;
+/* DIZZY is a live animation, not a static eye glyph.  Keep its phase in the
+ * renderer state so both eyes rotate together and the dirty flag can request
+ * a fresh frame while the expression is active. */
+static float s_ouo_dizzy_phase;
+static int64_t s_ouo_last_dizzy_phase_us;
 /* A normal tilt is one smooth acceleration.  A deliberate shake alternates
  * direction several times in a short interval, so retain just enough motion
  * history to distinguish the two. */
@@ -545,6 +619,9 @@ static int s_ouo_last_motion_dy;
 static uint8_t s_ouo_shake_reversals;
 static int64_t s_ouo_shake_window_started_us;
 static bool s_ouo_mouth_touch_active;
+/* -1/1 remembers which eye was touched so a short tap can wink while a
+ * longer hold can still promote the same contact to surprised. */
+static int8_t s_ouo_eye_touch_side;
 static int s_ouo_touch_origin_x;
 static int s_ouo_touch_origin_y;
 static int s_ouo_last_touch_x;
@@ -649,8 +726,6 @@ static int16_t s_matrix_x[PARTICLE_COUNT];
 static int16_t s_matrix_y[PARTICLE_COUNT];
 static bool s_matrix_layout_ready;
 static bool s_fluid_canvas_valid;
-static bool s_fluid_controls_visible = true;
-static TickType_t s_last_fluid_interaction;
 static uint16_t s_hash_count[HASH_CELLS];
 static uint16_t s_hash_start[HASH_CELLS + 1];
 static uint16_t s_hash_cursor[HASH_CELLS];
@@ -668,6 +743,9 @@ static void skyorb_render_frame(void);
 static void watch_enter(void);
 static void watch_handle_touch(int x, int y);
 static void watch_render_frame(void);
+static void camera_enter(void);
+static void camera_handle_touch(int x, int y);
+static void camera_render_frame(void);
 static int32_t watch_advance_display_time(int32_t displayed, int32_t target,
                                           bool *catch_up_pending);
 static clock_time_t clock_read_rtc(void);
@@ -755,6 +833,72 @@ static const liquid_palette_t *active_palette(void)
 {
     return s_custom_palette_active ? &s_custom_palette :
            &s_liquid_palettes[s_palette_rotation];
+}
+
+static bool fluid_save_preferences(void)
+{
+    const pacon_fluid_preferences_t value = {
+        .shape = (uint8_t)s_fluid_shape,
+        .custom = s_custom_palette_active,
+        .hue = (uint16_t)clamp_int((int)lroundf(s_colour_hue * 10000.0f), 0, 9999),
+        .saturation = (uint16_t)clamp_int((int)lroundf(s_colour_saturation * 10000.0f), 1500, 10000),
+    };
+    return pacon_save_fluid_preferences(&value) == ESP_OK;
+}
+
+static void fluid_queue_preferences(void)
+{
+    s_fluid_preferences_pending = true;
+    if (s_fluid_controls_input_us == 0)
+        s_fluid_controls_input_us = esp_timer_get_time();
+}
+
+/* Called AFTER rendering. Keep the last dragged colour in RAM until release,
+ * then commit once. A failed commit stays pending and retries without a loop
+ * of flash writes. Works even if BLE switches away from the controls page. */
+static void fluid_service_preferences(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (!s_fluid_preferences_pending || s_touch_down ||
+        now < s_fluid_preferences_retry_us) return;
+    if (fluid_save_preferences()) {
+        s_fluid_preferences_pending = false;
+        s_fluid_preferences_retry_us = 0;
+    } else {
+        s_fluid_preferences_retry_us = now + 1000000;
+    }
+    s_fluid_ui_perf.save_us += esp_timer_get_time() - now;
+    ++s_fluid_ui_perf.saves;
+}
+
+static void ouo_save_preferences(void)
+{
+    const pacon_ouo_preferences_t value = {
+        .automatic = s_ouo_auto_expressions, .tilt = s_ouo_tilt_reactions,
+        .mood = s_ouo_preferred_mood,
+    };
+    (void)pacon_save_ouo_preferences(&value);
+}
+
+static void feature_load_preferences(void)
+{
+    pacon_fluid_preferences_t fluid = {
+        .shape = FLUID_SHAPE_SIMPLE, .custom = false, .hue = 5400, .saturation = 8600,
+    };
+    pacon_load_fluid_preferences(&fluid);
+    s_fluid_shape = (fluid_shape_t)fluid.shape;
+    s_colour_hue = (float)fluid.hue / 10000.0f;
+    s_colour_saturation = (float)fluid.saturation / 10000.0f;
+    if (fluid.custom) set_custom_palette(s_colour_hue, s_colour_saturation);
+    else s_custom_palette_active = false;
+    pacon_ouo_preferences_t ouo = {.automatic = true, .tilt = true, .mood = 68};
+    pacon_load_ouo_preferences(&ouo);
+    s_ouo_auto_expressions = ouo.automatic;
+    s_ouo_tilt_reactions = ouo.tilt;
+    s_ouo_preferred_mood = ouo.mood;
+    s_ouo_mood = ouo.mood;
+    ESP_LOGI(TAG, "Preferences restored: fluid=%u custom=%d ouo_auto=%d tilt=%d mood=%u",
+             fluid.shape, fluid.custom, ouo.automatic, ouo.tilt, ouo.mood);
 }
 
 static const sh8601_lcd_init_cmd_t s_lcd_init_cmds[] = {
@@ -875,8 +1019,12 @@ static void display_note_activity(void)
             switch (s_ui_screen) {
             case UI_SCREEN_HOME: s_home_dirty = true; break;
             case UI_SCREEN_APPS: s_apps_dirty = true; break;
-            case UI_SCREEN_FLUID_SETTINGS: s_settings_dirty = true; break;
-            case UI_SCREEN_COLOUR_PICKER: s_colour_picker_dirty = true; break;
+            case UI_SCREEN_FLUID_SETTINGS:
+                s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+                s_settings_dirty = true; break;
+            case UI_SCREEN_COLOUR_PICKER:
+                s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+                s_colour_picker_dirty = true; break;
             case UI_SCREEN_OUO: s_ouo_dirty = true; break;
             case UI_SCREEN_OUO_MENU: s_ouo_menu_dirty = true; break;
             case UI_SCREEN_USB_DISK: s_usb_disk_dirty = true; break;
@@ -2288,26 +2436,21 @@ static uint16_t apps_pixel(int x, int y)
     const int dy = y - center_y;
     const int glow = clamp_int(150 - (dx * dx + dy * dy) / 370, 0, 150);
     uint16_t colour = rgb565(glow / 45, glow / 30, glow / 18);
-    const int fluid_left = 101;
-    const int ouo_left = 292;
-    const int sky_left = 101;
-    const int disk_left = 292;
-    const int settings_left = 211;
-    const int settings_top = 237;
-    const int settings_size = 54;
-    const int top_row = 123;
-    const int bottom_row = 274;
+    /* Equal 3-3-1 honeycomb: every app owns the same 78 px circle and the
+     * same 88 px touch target. */
     const int icon_size = 82;
-    const int icon_radius = 41;
-    const int fluid_cx = fluid_left + icon_size / 2;
-    const int ouo_cx = ouo_left + icon_size / 2;
-    const int sky_cx = sky_left + icon_size / 2;
-    const int disk_cx = disk_left + icon_size / 2;
-    const int top_cy = top_row + icon_size / 2;
-    const int bottom_cy = bottom_row + icon_size / 2;
+    const int icon_radius = 39;
+    const int fluid_cx = 142;
+    const int ouo_cx = 333;
+    const int sky_cx = 142;
+    const int disk_cx = 333;
+    const int top_cy = 145;
+    const int bottom_cy = 265;
     const int watch_cx = LCD_WIDTH / 2;
     const int watch_cy = top_cy;
-    const int watch_radius = 34;
+    const int watch_radius = icon_radius;
+    const int settings_cx = LCD_WIDTH / 2;
+    const int settings_cy = bottom_cy;
 
     if (home_in_circle(x, y, fluid_cx, top_cy, icon_radius)) {
         const int ix = x - fluid_cx;
@@ -2321,6 +2464,7 @@ static uint16_t apps_pixel(int x, int y)
         if (blob_a < 440 || blob_b < 340 || blob_c < 200) {
             colour = rgb565(225, 252, 255);
         }
+        if (ix * ix + iy * iy >= 35 * 35) colour = rgb565(64, 214, 255);
     }
     if (home_in_circle(x, y, ouo_cx, top_cy, icon_radius)) {
         const int ix = x - ouo_cx;
@@ -2330,8 +2474,8 @@ static uint16_t apps_pixel(int x, int y)
          * white eyes on a diagonal, and a lower-left white crescent.  Keep the
          * same proportions here instead of inventing a random in-app face. */
         const int radius2 = ix * ix + iy * iy;
-        if (radius2 >= 37 * 37) {
-            colour = rgb565(42, 44, 52);
+        if (radius2 >= 35 * 35) {
+            colour = rgb565(191, 90, 242);
         } else {
             colour = rgb565(1, 1, 2);
         }
@@ -2352,7 +2496,8 @@ static uint16_t apps_pixel(int x, int y)
         const int ix = x - watch_cx;
         const int iy = y - watch_cy;
         const int radius2 = ix * ix + iy * iy;
-        colour = radius2 > 30 * 30 ? rgb565(174, 119, 36) :
+        colour = radius2 >= 35 * 35 ? rgb565(255, 196, 74) :
+                 radius2 > 30 * 30 ? rgb565(174, 119, 36) :
                  radius2 > 26 * 26 ? rgb565(241, 196, 91) :
                                      rgb565(25, 18, 13);
         const float angle = atan2f((float)iy, (float)ix);
@@ -2385,6 +2530,7 @@ static uint16_t apps_pixel(int x, int y)
             (ix < -2 || ix > 2)) {
             colour = rgb565(255, 80, 100);
         }
+        if (radius2 >= 35 * 35) colour = rgb565(69, 235, 165);
     }
     if (home_in_circle(x, y, disk_cx, bottom_cy, icon_radius)) {
         const int ix = x - (disk_cx - icon_size / 2);
@@ -2405,12 +2551,14 @@ static uint16_t apps_pixel(int x, int y)
                 colour = rgb565(50, 215, 75);
             }
         }
+        if ((x - disk_cx) * (x - disk_cx) +
+            (y - bottom_cy) * (y - bottom_cy) >= 35 * 35) {
+            colour = rgb565(90, 200, 250);
+        }
     }
-    const int settings_cx = settings_left + settings_size / 2;
-    const int settings_cy = settings_top + settings_size / 2;
-    if (home_in_circle(x, y, settings_cx, settings_cy, settings_size / 2)) {
-        const int ix = x - (settings_left + settings_size / 2);
-        const int iy = y - (settings_top + settings_size / 2);
+    if (home_in_circle(x, y, settings_cx, settings_cy, icon_radius)) {
+        const int ix = x - settings_cx;
+        const int iy = y - settings_cy;
         const int radius2 = ix * ix + iy * iy;
         colour = rgb565(34, 38, 49);
         if (radius2 >= 12 * 12 && radius2 <= 19 * 19) {
@@ -2425,6 +2573,28 @@ static uint16_t apps_pixel(int x, int y)
         if (radius2 <= 7 * 7) {
             colour = rgb565(34, 38, 49);
         }
+        if (radius2 >= 35 * 35) colour = rgb565(215, 220, 229);
+    }
+    /* Camera remote: a compact lens icon below Settings.  Its ring mirrors
+     * the live HID readiness used by the dedicated shutter page. */
+    const int camera_cx = LCD_WIDTH / 2;
+    const int camera_cy = 385;
+    const int camera_dx = x - camera_cx;
+    const int camera_dy = y - camera_cy;
+    const int camera_r2 = camera_dx * camera_dx + camera_dy * camera_dy;
+    if (camera_r2 <= icon_radius * icon_radius) {
+        const bool ready = ble_pacon_is_enabled() &&
+                           ble_pacon_is_camera_remote_ready();
+        colour = camera_r2 >= 35 * 35 ?
+                 (ready ? rgb565(48, 209, 88) : rgb565(255, 159, 10)) :
+                 rgb565(25, 27, 34);
+        if (home_in_round_rect(camera_dx + 39, camera_dy + 39,
+                               20, 27, 58, 52, 6) ||
+            home_in_round_rect(camera_dx + 39, camera_dy + 39,
+                               29, 22, 49, 30, 4)) {
+            colour = rgb565(238, 242, 247);
+        }
+        if (camera_r2 <= 9 * 9) colour = rgb565(25, 27, 34);
     }
     /* Small page/home pill, matching the unobtrusive watch navigation cue. */
     if (home_in_round_rect(x, y, 210, 432, 265, 438, 3)) {
@@ -2618,6 +2788,37 @@ static uint16_t fluid_settings_pixel(int x, int y)
     return colour;
 }
 
+/* Static 301x301 wheel costs ~177 KiB in PSRAM, not another full canvas.
+ * Allocation failure falls back to the exact same pixel formula. */
+static uint16_t fluid_colour_wheel_pixel(int dx, int dy)
+{
+    const float two_pi = 6.283185307f;
+    float hue = atan2f((float)dy, (float)dx) / two_pi;
+    if (hue < 0.0f) hue += 1.0f;
+    uint8_t red = 0, green = 0, blue = 0;
+    hsv_to_rgb(hue, sqrtf((float)(dx * dx + dy * dy)) / 150.0f,
+               0.96f, &red, &green, &blue);
+    return rgb565(red, green, blue);
+}
+
+static void fluid_colour_prepare_cache(void)
+{
+    if (s_colour_wheel_cache_attempted) return;
+    s_colour_wheel_cache_attempted = true;
+    s_colour_wheel_cache = heap_caps_malloc(301 * 301 * sizeof(uint16_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_colour_wheel_cache == NULL) {
+        ESP_LOGW(TAG, "Colour wheel cache unavailable; using pixel fallback");
+        return;
+    }
+    for (int dy = -150; dy <= 150; ++dy) {
+        for (int dx = -150; dx <= 150; ++dx) {
+            s_colour_wheel_cache[(dy + 150) * 301 + dx + 150] =
+                dx * dx + dy * dy <= 150 * 150 ? fluid_colour_wheel_pixel(dx, dy) : 0;
+        }
+    }
+}
+
 static uint16_t fluid_colour_picker_pixel(int x, int y)
 {
     const int center_x = LCD_WIDTH / 2;
@@ -2640,32 +2841,9 @@ static uint16_t fluid_colour_picker_pixel(int x, int y)
     }
 
     if (distance2 <= wheel_radius * wheel_radius) {
-        const float two_pi = 6.283185307f;
-        float hue = atan2f((float)dy, (float)dx) / two_pi;
-        if (hue < 0.0f) {
-            hue += 1.0f;
-        }
-        uint8_t red = 0;
-        uint8_t green = 0;
-        uint8_t blue = 0;
-        hsv_to_rgb(hue, sqrtf((float)distance2) / (float)wheel_radius,
-                   0.96f, &red, &green, &blue);
-        colour = rgb565(red, green, blue);
-
-        const int marker_x = wheel_x + (int)(cosf(s_colour_hue * two_pi) *
-                                               s_colour_saturation *
-                                               (float)(wheel_radius - 6));
-        const int marker_y = wheel_y + (int)(sinf(s_colour_hue * two_pi) *
-                                               s_colour_saturation *
-                                               (float)(wheel_radius - 6));
-        const int marker_dx = x - marker_x;
-        const int marker_dy = y - marker_y;
-        const int marker_distance2 = marker_dx * marker_dx + marker_dy * marker_dy;
-        if (marker_distance2 <= 36 && marker_distance2 >= 16) {
-            colour = rgb565(246, 252, 255);
-        } else if (marker_distance2 < 16) {
-            colour = rgb565(2, 9, 20);
-        }
+        colour = s_colour_wheel_cache != NULL ?
+            s_colour_wheel_cache[(dy + 150) * 301 + dx + 150] :
+            fluid_colour_wheel_pixel(dx, dy);
     }
 
     if (home_in_circle(x, y, 86, 73, 24)) {
@@ -2699,13 +2877,51 @@ static bool ouo_in_ellipse(int x, int y, int center_x, int center_y,
            radius_x * radius_x * radius_y * radius_y;
 }
 
-static bool ouo_closed_eye_pixel(int dx, int dy)
+/* OuO's sad face uses solid eyes with the upper lids sloping inward.  The
+ * small diagonal is more characteristic than a pair of thin closed arcs. */
+static bool ouo_sad_eye_pixel(int dx, int dy, bool left)
 {
-    if (dx < -50 || dx > 50) {
+    if (!ouo_in_ellipse(dx, dy, 0, 0, OUO_EYE_RADIUS, OUO_EYE_RADIUS)) {
         return false;
     }
-    const int curve = -(dx * dx) / 360;
-    return dy >= curve - 4 && dy <= curve + 4;
+    const int lid_y = -14 + (left ? -dx : dx) / 2;
+    return dy >= lid_y;
+}
+
+static bool ouo_kiss_eye_pixel(int dx, int dy)
+{
+    /* The captured upper-lid family is narrower than an open eye: about
+     * x=+-25 and y=-13..+7 in normalized 466px coordinates. */
+    if (dx < -25 || dx > 25) {
+        return false;
+    }
+    const int curve = -13 + (dx * dx) / 31;
+    return dy >= curve - 3 && dy <= curve + 3;
+}
+
+static bool ouo_pressed_eye_pixel(int dx, int dy, bool left)
+{
+    if (abs(dx) > 28) return false;
+    const int u = left ? dx : -dx;
+    const int curve = -7 + u * 34 / 100 + dx * dx * 9 / 1000;
+    const int width = 1 + 3 * (784 - dx * dx) / 784;
+    return abs(dy - curve) <= width;
+}
+
+/* The surprised mouth is a solid rounded shape with a nearly flat top, not a
+ * symmetric ellipse. */
+static bool ouo_flat_mouth_pixel(int dx, int dy, int half_width, int height)
+{
+    if (dx < -half_width || dx > half_width || dy < -height || dy > height) {
+        return false;
+    }
+    const int top = -(height * 3) / 5;
+    if (dy < top) {
+        return false;
+    }
+    const int lower = dy - top;
+    const int max_half = half_width - (lower * lower) / (height * height / 2 + 1);
+    return abs(dx) <= max_half;
 }
 
 /* OuO's most recognisable "closed" eye is not a thin line.  It is the lower
@@ -2714,14 +2930,7 @@ static bool ouo_closed_eye_pixel(int dx, int dy)
  * upper dome for the pressed-mouth animation. */
 static bool ouo_lower_dome_pixel(int dx, int dy, int radius_x, int radius_y)
 {
-    return dy >= 0 &&
-           dx * dx * radius_y * radius_y + dy * dy * radius_x * radius_x <=
-           radius_x * radius_x * radius_y * radius_y;
-}
-
-static bool ouo_upper_dome_pixel(int dx, int dy, int radius_x, int radius_y)
-{
-    return dy <= 0 &&
+    return dy >= -8 &&
            dx * dx * radius_y * radius_y + dy * dy * radius_x * radius_x <=
            radius_x * radius_x * radius_y * radius_y;
 }
@@ -2733,14 +2942,29 @@ static bool ouo_line_pixel(int x, int y, int x0, int y0, int x1, int y1,
  * Do not mirror one eye: that looks like paired brackets rather than the
  * familiar two coiled "mosquito" eyes from OuO.  Two radial solutions for
  * each angle make the curve complete nearly two turns inside a 33 px eye. */
-static bool ouo_dizzy_eye_pixel(int dx, int dy)
+static bool ouo_dizzy_eye_pixel(int dx, int dy, float phase)
 {
+    /* Reject the vast majority of face pixels with integer math before
+     * entering the expensive polar conversion.  Without this clip every
+     * 475x258 OuO frame performed sqrtf/atan2f for the black background too,
+     * stretching the real frame interval well beyond the 16 ms target. */
+    const int distance2 = dx * dx + dy * dy;
+    if (distance2 > 1089) { /* 33 px eye radius squared */
+        return false;
+    }
     const float radius = sqrtf((float)(dx * dx + dy * dy));
     if (radius > 33.0f) {
         return false;
     }
     float angle = atan2f((float)dy, (float)dx);
     if (angle < 0.0f) {
+        angle += 6.2831853f;
+    }
+    angle += phase;
+    while (angle >= 6.2831853f) {
+        angle -= 6.2831853f;
+    }
+    while (angle < 0.0f) {
         angle += 6.2831853f;
     }
     const float inner_turn = 3.5f + 2.35f * angle;
@@ -2798,21 +3022,353 @@ static bool ouo_line_pixel(int x, int y, int x0, int y0, int x1, int y1,
     return cross * cross <= (int64_t)half_width * half_width * length2;
 }
 
+/* OuO's kiss is a thick side-opening "3" stroke.  The two lobes peak near
+ * the centre-left and meet a short vertical on the right, matching the
+ * captured mouth rather than a typographic brace. */
+static bool ouo_kiss_mouth_pixel(int dx, int dy)
+{
+    return ouo_line_pixel(dx, dy, -9, -16, -6, -23, 4) ||
+           ouo_line_pixel(dx, dy, -6, -23, 0, -25, 4) ||
+           ouo_line_pixel(dx, dy, 0, -25, 10, -25, 4) ||
+           ouo_line_pixel(dx, dy, 10, -25, 16, -16, 4) ||
+           ouo_line_pixel(dx, dy, 16, -16, 16, -7, 4) ||
+           ouo_line_pixel(dx, dy, 16, -7, 3, 0, 4) ||
+           ouo_line_pixel(dx, dy, 3, 0, 16, 7, 4) ||
+           ouo_line_pixel(dx, dy, 16, 7, 16, 16, 4) ||
+           ouo_line_pixel(dx, dy, 16, 16, 10, 25, 4) ||
+           ouo_line_pixel(dx, dy, 10, 25, 0, 25, 4) ||
+           ouo_line_pixel(dx, dy, 0, 25, -6, 23, 4) ||
+           ouo_line_pixel(dx, dy, -6, 23, -9, 16, 4);
+}
+
+/* The pull recording shows a filled left-facing "3" plus a separate right
+ * arc.  The centre bridge is intentionally solid white, while the small gap
+ * before the arc remains black.  Mirroring keeps left and right drags
+ * symmetrical. */
+static bool ouo_pull_side_mouth_pixel(int dx, int dy, bool right, int stretch)
+{
+    if (!right) {
+        dx = -dx;
+    }
+    const int s = clamp_int(stretch, 0, 8);
+    const int core_h = 13 + s;
+    const int core_left = -7 - s / 2;
+    const int core_right = 3 + s / 4;
+    const int arc_x = 14 + s;
+    const int arc_h = 21 + s;
+    const int arc_inner = 7 + s / 2;
+    /* Keep the captured 3+arc contour stable while the whole mouth follows
+     * the finger.  Scaling this path by travel distance made it appear to
+     * grow merely because the pointer was farther from the mouth centre. */
+    if (ouo_line_pixel(dx, dy, core_right, -core_h * 9 / 10,
+                       core_left, -core_h - 2, 4) ||
+        ouo_line_pixel(dx, dy, core_left, -core_h - 2,
+                       core_left, -core_h * 42 / 100, 4) ||
+        ouo_line_pixel(dx, dy, core_left, -core_h * 42 / 100,
+                       core_right, 0, 4) ||
+        ouo_line_pixel(dx, dy, core_right, 0,
+                       core_left, core_h * 42 / 100, 4) ||
+        ouo_line_pixel(dx, dy, core_left, core_h * 42 / 100,
+                       core_left, core_h + 2, 4) ||
+        ouo_line_pixel(dx, dy, core_left, core_h + 2,
+                       core_right, core_h * 9 / 10, 4) ||
+        (dx >= core_left + 2 && dx <= 8 + s / 2 &&
+         dy >= -3 - s / 2 && dy <= 3 + s / 2)) {
+        return true;
+    }
+    /* Keep the independent arc paired with the fixed-size 3 and its small
+     * black gap. */
+    return ouo_line_pixel(dx, dy, arc_x, -arc_h, arc_x - arc_inner, 0, 4) ||
+           ouo_line_pixel(dx, dy, arc_x - arc_inner, 0, arc_x, arc_h, 4);
+}
+
+static bool ouo_rounded_rect_pixel(int x, int y, int half_width,
+                                   int half_height, int radius)
+{
+    if (abs(x) > half_width || abs(y) > half_height) {
+        return false;
+    }
+    const int corner_x = abs(x) - (half_width - radius);
+    const int corner_y = abs(y) - (half_height - radius);
+    if (corner_x > 0 && corner_y > 0) {
+        return corner_x * corner_x + corner_y * corner_y <= radius * radius;
+    }
+    return true;
+}
+
+/* Convert an axis-aligned box into the reference mouth contour.  The top is
+ * flat and the lower edge is a shallow U, matching the Android stretch frame
+ * rather than a rotated rectangle. */
+static bool ouo_flat_mouth_box_pixel(int dx, int dy, int left, int right,
+                                     int top, int bottom)
+{
+    const int half_width = (right - left) / 2;
+    const int box_height = bottom - top;
+    if (half_width <= 0 || box_height <= 0) {
+        return false;
+    }
+    /* ouo_flat_mouth_pixel's active contour is 1.6 * height tall.  Choose its
+     * local origin so the active top/bottom land on the requested box. */
+    const int local_height = clamp_int(box_height * 5 / 8, 1, 90);
+    const int center_x = (left + right) / 2;
+    const int center_y = top + local_height * 3 / 5;
+    return ouo_flat_mouth_pixel(dx - center_x, dy - center_y,
+                                half_width, local_height);
+}
+
+static int ouo_pull_t(int magnitude)
+{
+    if (magnitude <= 4) {
+        return 0;
+    }
+    return clamp_int((magnitude - 4) * 256 / 58, 0, 256);
+}
+
+/* The stretch family is continuous: a vertical pull grows a narrow capsule,
+ * while a horizontal pull grows the broad reference blob.  For diagonal
+ * vectors the two axes interpolate without rotating the mouth. */
+static bool ouo_stretch_mouth_pixel(int dx, int dy, int travel_x, int travel_y)
+{
+    const int ax = abs(travel_x);
+    const int ay = abs(travel_y);
+    const int magnitude = ax > ay ? ax : ay;
+    const int t = ouo_pull_t(magnitude);
+    const bool horizontal = ax * 4 >= ay * 5;
+    const bool vertical = ay * 4 >= ax * 5;
+    const int h = vertical ? 0 : (horizontal ? 256 :
+                                  (magnitude > 0 ? ax * 256 / magnitude : 0));
+    const int half_width = 21 + (42 * h * t) / (256 * 256);
+    const int half_height = clamp_int(
+        20 + t * (15 + 27 * (256 - h) / 256) / 256, 20, 42);
+    int left = -half_width;
+    int right = half_width;
+    int top = -half_height;
+    int bottom = half_height;
+
+    /* Anchor the edge opposite to the finger.  This prevents a right pull
+     * from mysteriously expanding to the left (and the same on Y). */
+    if (horizontal) {
+        if (travel_x > 0) {
+            left = -21;
+            right = left + half_width * 2;
+        } else if (travel_x < 0) {
+            right = 21;
+            left = right - half_width * 2;
+        }
+    } else if (vertical) {
+        if (travel_y > 0) {
+            top = -20;
+            bottom = top + half_height * 2;
+        } else if (travel_y < 0) {
+            bottom = 20;
+            top = bottom - half_height * 2;
+        }
+    }
+    return ouo_flat_mouth_box_pixel(dx, dy, left, right, top, bottom);
+}
+
+/* The square family is deliberately screen-aligned.  Its four edges remain
+ * horizontal/vertical while a small, direction-dependent bulge makes it an
+ * irregular shape instead of the old fixed diamond or perfect square. */
+static bool ouo_square_mouth_pixel(int dx, int dy, int travel_x, int travel_y)
+{
+    const int ax = abs(travel_x);
+    const int ay = abs(travel_y);
+    const int magnitude = ax > ay ? ax : ay;
+    const int t = ouo_pull_t(magnitude);
+    const int h = magnitude > 0 ? ax * 256 / magnitude : 0;
+    const int v = magnitude > 0 ? ay * 256 / magnitude : 0;
+    const int half_width = 24 + t * (18 + 12 * h / 256) / 256;
+    const int half_height = 22 + t * (18 + 12 * v / 256) / 256;
+    const int lean_x = (t * (4 + 6 * h / 256)) / 256;
+    const int lean_y = (t * (4 + 6 * v / 256)) / 256;
+    const int left = -(half_width + (travel_x < 0 ? lean_x : 0));
+    const int right = half_width + (travel_x > 0 ? lean_x : 0);
+    const int top = -(half_height + (travel_y < 0 ? lean_y : 0));
+    const int bottom = half_height + (travel_y > 0 ? lean_y : 0);
+    const int center_x = (left + right) / 2;
+    const int center_y = (top + bottom) / 2;
+    const int radius = clamp_int(7 + t * 5 / 256, 7, 12);
+    return ouo_rounded_rect_pixel(dx - center_x, dy - center_y,
+                                  (right - left) / 2,
+                                  (bottom - top) / 2, radius);
+}
+
+static bool ouo_round_mouth_pixel(int dx, int dy, int travel_x, int travel_y)
+{
+    const int ax = abs(travel_x);
+    const int ay = abs(travel_y);
+    const int magnitude = ax > ay ? ax : ay;
+    const int t = ouo_pull_t(magnitude);
+    /* Match the preview's larger round family.  The old 41x38px cap made a
+     * long Android-style drag look almost unchanged on the device. */
+    const int radius_x = 21 + t * 32 / 256;
+    const int radius_y = 20 + t * 26 / 256;
+    return ouo_in_ellipse(dx, dy, 0, 0, radius_x, radius_y);
+}
+
+static bool ouo_triangle_mouth_pixel(int dx, int dy, int travel_x, int travel_y)
+{
+    /* Touch-visible recording 208.5–211s: independent width/height, upright
+     * throughout. Same quadratic flanks as liveTrianglePullMouth in JS. */
+    const int ax = clamp_int(abs(travel_x), 0, 84);
+    const int ay = clamp_int(abs(travel_y), 0, 84);
+    const int tip = 18 + ay * 12 / 84;
+    const int base = 14 + ay * 42 / 84;
+    const int half = 18 + ax * 48 / 84;
+    if (dy < -tip || dy > base) {
+        return false;
+    }
+    const int u = (dy + tip) * 256 / (tip + base);
+    const int span = half * (8 * u * 256 - 3 * u * u) / (5 * 256 * 256);
+    return abs(dx) <= span;
+}
+
+/* Dispatch the variant selected on the first significant sample.  Once
+ * selected, subsequent jitter changes only the size/direction within this
+ * family; it cannot turn a side pull into a square or vice versa. */
+static bool ouo_drag_mouth_pixel(int dx, int dy, int travel_x, int travel_y,
+                                 ouo_mouth_variant_t variant)
+{
+    const int ax = abs(travel_x);
+    const int ay = abs(travel_y);
+    if (ax < 10 && ay < 10 && variant != OUO_MOUTH_VARIANT_TRIANGLE) {
+        return ouo_flat_mouth_pixel(dx, dy, 31, 29);
+    }
+    switch (variant) {
+    case OUO_MOUTH_VARIANT_SIDE:
+        return ouo_pull_side_mouth_pixel(dx, dy, travel_x >= 0,
+                                         s_ouo_mouth_stretch_pixels);
+    case OUO_MOUTH_VARIANT_ROUND:
+        return ouo_round_mouth_pixel(dx, dy, travel_x, travel_y);
+    case OUO_MOUTH_VARIANT_SQUARE:
+        return ouo_square_mouth_pixel(dx, dy, travel_x, travel_y);
+    case OUO_MOUTH_VARIANT_TRIANGLE:
+        return ouo_triangle_mouth_pixel(dx, dy, travel_x, travel_y);
+    case OUO_MOUTH_VARIANT_STRETCH:
+    default:
+        return ouo_stretch_mouth_pixel(dx, dy, travel_x, travel_y);
+    }
+}
+
 static bool ouo_eye_hit(int x, int y, int center_x, int center_y)
 {
     return ouo_in_ellipse(x, y, center_x, center_y, 66, 82);
 }
 
+/* Passive playback is separate from interactive expressions. Decode only when
+ * a reference event changes; long recorded holds do not redraw every tick. */
+static void ouo_idle_step(int64_t now)
+{
+    s_ouo_decode_last_us = 0;
+    if (!s_ouo_auto_expressions || s_ouo_touch_active ||
+        s_ouo_expression != OUO_EXPRESSION_IDLE ||
+        s_ouo_mouth_x_offset || s_ouo_mouth_y_offset || s_ouo_squish_pixels) {
+        if (s_ouo_idle_visible) s_ouo_dirty = true;
+        s_ouo_idle_visible = false;
+        s_ouo_idle_epoch_us = 0;
+        return;
+    }
+    if (s_ouo_idle_tiles == NULL) return;
+    if (s_ouo_idle_epoch_us == 0) s_ouo_idle_epoch_us = now;
+    const uint32_t ms = (uint32_t)(((now - s_ouo_idle_epoch_us) / 1000LL) % OUO_IDLE_DURATION_MS);
+    uint32_t low = 0, high = OUO_IDLE_EVENT_COUNT;
+    while (low + 1 < high) {
+        const uint32_t mid = (low + high) / 2;
+        if (ouo_idle_events[mid][0] <= ms) low = mid;
+        else high = mid;
+    }
+    const uint32_t frame = ouo_idle_events[low][1];
+    if (frame != s_ouo_idle_frame) {
+        const int64_t decode_start_us = esp_timer_get_time();
+        uint32_t pos = 0;
+        for (uint32_t i = ouo_idle_offsets[frame]; i < ouo_idle_offsets[frame + 1]; i += 2) {
+            const uint32_t count = ouo_idle_rle[i];
+            if (pos + count > OUO_IDLE_TILE_PIXELS) return; // Generated-data guard.
+            memset(s_ouo_idle_tiles + pos, ouo_idle_rle[i + 1] * 17, count);
+            pos += count;
+        }
+        if (pos != OUO_IDLE_TILE_PIXELS) return;
+        s_ouo_idle_frame = frame;
+        s_ouo_dirty = true;
+        s_ouo_decode_last_us = esp_timer_get_time() - decode_start_us;
+    }
+    if (!s_ouo_idle_visible) s_ouo_dirty = true;
+    s_ouo_idle_visible = true;
+}
+
+static uint16_t ouo_idle_pixel(int x, int y)
+{
+    uint8_t gray = 0;
+    int tx = x - (OUO_LEFT_EYE_X - 48), ty = y - (OUO_EYE_Y - 42);
+    if (tx >= 0 && tx < 96 && ty >= 0 && ty < 84) gray = s_ouo_idle_tiles[ty * 96 + tx];
+    tx = x - (OUO_RIGHT_EYE_X - 48);
+    if (tx >= 0 && tx < 96 && ty >= 0 && ty < 84) {
+        const uint8_t value = s_ouo_idle_tiles[96 * 84 + ty * 96 + tx];
+        if (value > gray) gray = value;
+    }
+    tx = x - (OUO_FACE_CENTER_X - 48); ty = y - (OUO_MOUTH_Y - 50);
+    if (tx >= 0 && tx < 96 && ty >= 0 && ty < 100) {
+        const uint8_t value = s_ouo_idle_tiles[96 * 168 + ty * 96 + tx];
+        if (value > gray) gray = value;
+    }
+    return rgb565(gray, gray, gray);
+}
+
+/* Already-decoded idle tiles do not need the general expression evaluator.
+ * Preserve its exact max-gray compositing, coordinates and clipping, but
+ * visit only the 25,728 tile pixels (not 122,550 mostly-black face pixels).
+ * The palette is internal RAM; the original 25KB PSRAM decode buffer stays
+ * unchanged, and no allocation happens on the per-frame path. */
+static void ouo_blit_idle_tiles(const dirty_rect_t *dirty)
+{
+    if (!s_ouo_idle_palette_ready) {
+        for (int gray = 0; gray < 256; ++gray) {
+            s_ouo_idle_palette[gray] = rgb565(gray, gray, gray);
+        }
+        s_ouo_idle_palette_ready = true;
+    }
+    const int shift_x = s_ouo_gaze_x + s_ouo_shake_x;
+    const int shift_y = s_ouo_gaze_y + s_ouo_shake_y;
+    const int lefts[3] = {OUO_LEFT_EYE_X - 48 + shift_x,
+                          OUO_RIGHT_EYE_X - 48 + shift_x,
+                          OUO_FACE_CENTER_X - 48 + shift_x};
+    const int tops[3] = {OUO_EYE_Y - 42 + shift_y, OUO_EYE_Y - 42 + shift_y,
+                         OUO_MOUTH_Y - 50 + shift_y};
+    const int heights[3] = {84, 84, 100};
+    const int offsets[3] = {0, 96 * 84, 96 * 168};
+    for (int tile = 0; tile < 3; ++tile) {
+        const int left = lefts[tile], top = tops[tile];
+        const int x0 = left < dirty->x1 ? dirty->x1 - left : 0;
+        const int x1 = left + 96 > dirty->x2 ? dirty->x2 - left : 96;
+        const int y0 = top < dirty->y1 ? dirty->y1 : top;
+        const int y1 = top + heights[tile] > dirty->y2 ? dirty->y2 : top + heights[tile];
+        if (x0 >= x1 || y0 >= y1) continue;
+        for (int y = y0; y < y1; ++y) {
+            const uint8_t *source = s_ouo_idle_tiles + offsets[tile] + (y - top) * 96 + x0;
+            uint16_t *target = s_lcd_canvas + (size_t)y * LCD_WIDTH + left + x0;
+            for (int x = 0; x < x1 - x0; ++x) {
+                const uint16_t colour = s_ouo_idle_palette[source[x]];
+                if (colour > target[x]) target[x] = colour;
+            }
+        }
+    }
+}
+
 static uint16_t ouo_pixel(int x, int y)
 {
-    const int center_x = LCD_WIDTH / 2;
+    const int center_x = OUO_FACE_CENTER_X;
     const uint16_t ink = rgb565(0, 0, 0);
     const uint16_t white = rgb565(250, 250, 250);
-    /* Reference layout from OuO's public Android screenshots: two very short
-     * horizontal eyes and a tiny omega-like mouth.  The empty black space is
-     * part of the design, so resist filling it with a face outline or panels. */
+    /* Geometry is scaled from captures of OuO 1.611 rather than reconstructed
+     * from the launcher icon. */
     const int face_shift_x = s_ouo_gaze_x + s_ouo_shake_x;
     const int face_shift_y = s_ouo_gaze_y + s_ouo_shake_y;
+    if (s_ouo_idle_visible && s_ouo_idle_tiles != NULL &&
+        s_ouo_auto_expressions && !s_ouo_touch_active &&
+        s_ouo_expression == OUO_EXPRESSION_IDLE) {
+        return ouo_idle_pixel(x - face_shift_x, y - face_shift_y);
+    }
     const int squish = s_ouo_squish_pixels;
     const int eye_squeeze = squish / 2;
     const int left_center_x = OUO_LEFT_EYE_X + face_shift_x + eye_squeeze;
@@ -2821,39 +3377,63 @@ static uint16_t ouo_pixel(int x, int y)
     const int left_dx = x - left_center_x;
     const int right_dx = x - right_center_x;
     const int eye_dy = y - eye_center_y;
+    const bool triangle_drag = s_ouo_mouth_touch_active && s_ouo_mouth_variant_selected &&
+                               s_ouo_mouth_variant == OUO_MOUTH_VARIANT_TRIANGLE;
     const bool tilt_left = s_ouo_tilt_reactions && s_ouo_expression == OUO_EXPRESSION_IDLE &&
                            s_ouo_gaze_x < -46;
     const bool tilt_right = s_ouo_tilt_reactions && s_ouo_expression == OUO_EXPRESSION_IDLE &&
                             s_ouo_gaze_x > 46;
     const bool lower_left = s_ouo_expression == OUO_EXPRESSION_BLINK ||
-                            s_ouo_expression == OUO_EXPRESSION_WINK_LEFT ||
-                            s_ouo_expression == OUO_EXPRESSION_SQUISH || tilt_left;
+                             s_ouo_expression == OUO_EXPRESSION_SQUISH || tilt_left;
     const bool lower_right = s_ouo_expression == OUO_EXPRESSION_BLINK ||
-                             s_ouo_expression == OUO_EXPRESSION_WINK_RIGHT ||
-                             s_ouo_expression == OUO_EXPRESSION_SQUISH || tilt_right;
+                               s_ouo_expression == OUO_EXPRESSION_SQUISH || tilt_right;
     /* The original face's open eyes are plain solid white circles.  Do not
      * add pupils: its charm is the very restrained black-and-white geometry. */
-    const bool solid_left = (s_ouo_expression == OUO_EXPRESSION_IDLE && !tilt_left) ||
-                            s_ouo_expression == OUO_EXPRESSION_HAPPY ||
+    const bool solid_left =
+                            s_ouo_expression == OUO_EXPRESSION_IDLE ||
+                            s_ouo_expression == OUO_EXPRESSION_CARET ||
                             s_ouo_expression == OUO_EXPRESSION_WINK_RIGHT ||
                             s_ouo_expression == OUO_EXPRESSION_SURPRISED || tilt_right;
-    const bool solid_right = (s_ouo_expression == OUO_EXPRESSION_IDLE && !tilt_right) ||
-                             s_ouo_expression == OUO_EXPRESSION_HAPPY ||
+    const bool solid_right =
+                             s_ouo_expression == OUO_EXPRESSION_IDLE ||
+                             s_ouo_expression == OUO_EXPRESSION_CARET ||
                              s_ouo_expression == OUO_EXPRESSION_WINK_LEFT ||
                              s_ouo_expression == OUO_EXPRESSION_SURPRISED || tilt_left;
-    if ((lower_left && ouo_lower_dome_pixel(left_dx, eye_dy, 33, 29)) ||
-        (lower_right && ouo_lower_dome_pixel(right_dx, eye_dy, 33, 29))) {
+    if ((lower_left && ouo_lower_dome_pixel(left_dx, eye_dy,
+                                             OUO_EYE_RADIUS, OUO_EYE_RADIUS)) ||
+        (lower_right && ouo_lower_dome_pixel(right_dx, eye_dy,
+                                              OUO_EYE_RADIUS, OUO_EYE_RADIUS))) {
         return white;
     }
 
-    if ((solid_left && ouo_in_ellipse(x, y, left_center_x, eye_center_y, 31, 31)) ||
-        (solid_right && ouo_in_ellipse(x, y, right_center_x, eye_center_y, 31, 31))) {
+    if ((!triangle_drag || eye_dy <= OUO_EYE_RADIUS * 4 / 5) &&
+        ((solid_left && ouo_in_ellipse(x, y, left_center_x, eye_center_y,
+                                      OUO_EYE_RADIUS, OUO_EYE_RADIUS)) ||
+        (solid_right && ouo_in_ellipse(x, y, right_center_x, eye_center_y,
+                                       OUO_EYE_RADIUS, OUO_EYE_RADIUS)))) {
         return white;
     }
 
-    if (s_ouo_expression == OUO_EXPRESSION_DIZZY) {
-        if (ouo_dizzy_eye_pixel(left_dx, eye_dy) ||
-            ouo_dizzy_eye_pixel(right_dx, eye_dy)) {
+    if ((s_ouo_expression == OUO_EXPRESSION_WINK_LEFT &&
+         ouo_pressed_eye_pixel(left_dx, eye_dy, true)) ||
+        (s_ouo_expression == OUO_EXPRESSION_WINK_RIGHT &&
+         ouo_pressed_eye_pixel(right_dx, eye_dy, false))) return white;
+
+    if (s_ouo_expression == OUO_EXPRESSION_MOUTH_RELEASE) {
+        if (ouo_pressed_eye_pixel(left_dx, eye_dy, true) ||
+            ouo_pressed_eye_pixel(right_dx, eye_dy, false)) return white;
+    } else if (s_ouo_expression == OUO_EXPRESSION_HEAD_PAT) {
+        if (abs(eye_dy) <= 4 && (abs(left_dx) <= OUO_EYE_RADIUS ||
+                                 abs(right_dx) <= OUO_EYE_RADIUS)) return white;
+    } else if (s_ouo_expression == OUO_EXPRESSION_DELIGHTED) {
+        if (eye_dy <= OUO_EYE_RADIUS * 2 / 5 &&
+            (ouo_in_ellipse(x, y, left_center_x, eye_center_y, OUO_EYE_RADIUS, OUO_EYE_RADIUS) ||
+             ouo_in_ellipse(x, y, right_center_x, eye_center_y, OUO_EYE_RADIUS, OUO_EYE_RADIUS))) return white;
+        if (ouo_in_ellipse(left_dx, eye_dy, -28, 29, 13, 5) ||
+            ouo_in_ellipse(right_dx, eye_dy, 28, 29, 13, 5)) return rgb565(69, 69, 69);
+    } else if (s_ouo_expression == OUO_EXPRESSION_DIZZY) {
+        if (ouo_dizzy_eye_pixel(left_dx, eye_dy, s_ouo_dizzy_phase) ||
+            ouo_dizzy_eye_pixel(right_dx, eye_dy, s_ouo_dizzy_phase)) {
             return white;
         }
     } else if (s_ouo_expression == OUO_EXPRESSION_ANGRY) {
@@ -2865,14 +3445,20 @@ static uint16_t ouo_pixel(int x, int y)
             ouo_line_pixel(right_dx, eye_dy, 27, 21, -10, 0, 5)) {
             return white;
         }
+    } else if (s_ouo_expression == OUO_EXPRESSION_KISS ||
+               s_ouo_expression == OUO_EXPRESSION_HAPPY) {
+        if (ouo_kiss_eye_pixel(left_dx, eye_dy) ||
+            ouo_kiss_eye_pixel(right_dx, eye_dy)) {
+            return white;
+        }
     } else if (s_ouo_expression == OUO_EXPRESSION_SLEEPY) {
         if (ouo_lower_dome_pixel(left_dx, eye_dy - 12, 30, 19) ||
             ouo_lower_dome_pixel(right_dx, eye_dy - 12, 30, 19)) {
             return white;
         }
     } else if (s_ouo_expression == OUO_EXPRESSION_SAD) {
-        if (ouo_closed_eye_pixel(left_dx, eye_dy + 8) ||
-            ouo_closed_eye_pixel(right_dx, eye_dy + 8)) {
+        if (ouo_sad_eye_pixel(left_dx, eye_dy, true) ||
+            ouo_sad_eye_pixel(right_dx, eye_dy, false)) {
             return white;
         }
     }
@@ -2880,45 +3466,73 @@ static uint16_t ouo_pixel(int x, int y)
     /* A grabbed mouth follows the fingertip.  This is intentionally separate
      * from its width: dragging left or right should pull the whole mouth,
      * rather than make the same oval increasingly wide. */
-    const int mouth_dx = x - (center_x + face_shift_x + s_ouo_mouth_x_offset);
+    const int triangle_x = clamp_int(s_ouo_last_touch_x - s_ouo_touch_origin_x, -120, 120);
+    const int triangle_y = clamp_int(s_ouo_last_touch_y - s_ouo_touch_origin_y, -110, 110);
+    /* For this family, use the real gesture vector for deformation and only
+     * a small translation for placement, just like the preview. Clipped
+     * placement offsets must never double as the deformation input. */
+    const int mouth_dx = x - (center_x + face_shift_x +
+        (triangle_drag ? triangle_x * 18 / 110 : s_ouo_mouth_x_offset));
     const int mouth_dy = y - (OUO_MOUTH_Y + face_shift_y + squish / 8 +
-                              s_ouo_mouth_y_offset);
+        (triangle_drag ? 6 + triangle_y * 14 / 110 : s_ouo_mouth_y_offset));
     const int resting_mouth_width = clamp_int(25 + s_ouo_mouth_stretch_pixels, 14, 52);
     const int resting_mouth_depth = clamp_int(8 - s_ouo_mouth_stretch_pixels / 6, 4, 11);
     bool mouth = false;
-    if (s_ouo_expression == OUO_EXPRESSION_HAPPY) {
-        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 43, 20, 7, true);
+    if (s_ouo_expression == OUO_EXPRESSION_HEAD_PAT) {
+        /* Two smooth valleys matching catMouth(), not the angular old W. */
+        const int a = abs(mouth_dx);
+        if (a <= 32) {
+            const int u = (32 - a) * 256 / 32;
+            const int curve = -6 + (52 * u * 256 - 48 * u * u) / (256 * 256);
+            mouth = abs(mouth_dy - curve) <= 3;
+        }
+    } else if (s_ouo_expression == OUO_EXPRESSION_DELIGHTED) {
+        mouth = mouth_dy >= -23 && ouo_in_ellipse(mouth_dx, mouth_dy, 0, 1, 32, 30);
+    } else if (s_ouo_expression == OUO_EXPRESSION_MOUTH_RELEASE) {
+        mouth = ouo_line_pixel(mouth_dx, mouth_dy, -18, 0, 18, 0, 3);
+    } else if (s_ouo_expression == OUO_EXPRESSION_IDLE ||
+        s_ouo_expression == OUO_EXPRESSION_BLINK ||
+        s_ouo_expression == OUO_EXPRESSION_HAPPY) {
+        /* Normal/cheerful OuO is a compact, deep U smile.  The earlier
+         * 32x14 stroke was too wide and shallow on the round panel. */
+        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 29, 17, 4, true);
     } else if (s_ouo_expression == OUO_EXPRESSION_ANGRY) {
         mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 31, 10, 4, false);
     } else if (s_ouo_expression == OUO_EXPRESSION_SAD) {
-        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 38, 13, 5, false);
+        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 25, 8, 3, false);
     } else if (s_ouo_expression == OUO_EXPRESSION_SLEEPY) {
         mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 20, 3, 3, false);
     } else if (s_ouo_expression == OUO_EXPRESSION_SURPRISED) {
-        const int pull_width = clamp_int(29 + s_ouo_mouth_stretch_pixels, 22, 39);
-        const int pull_height = clamp_int(23 - s_ouo_mouth_y_offset / 3, 14, 35);
-        /* A mouth drag has three visibly different outcomes: sideways pulls
-         * move a compact solid dome, an upward pull becomes a thick frown,
-         * and a downward pull becomes a thick U.  None is just an ellipse
-         * with a larger radius. */
-        if (s_ouo_mouth_touch_active && s_ouo_mouth_y_offset <= -12) {
-            mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 35, 17, 7, false);
-        } else if (s_ouo_mouth_touch_active && s_ouo_mouth_y_offset >= 12) {
-            mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 35, 17, 7, true);
+        /* A live mouth pull follows the full contact vector.  This preserves
+         * the filled side-pull at the far horizontal limit while adding the
+         * vertical pill, diagonal square and upward triangle families. */
+        if (triangle_drag) {
+            mouth = ouo_triangle_mouth_pixel(mouth_dx, mouth_dy, triangle_x, triangle_y);
+        } else if (s_ouo_mouth_touch_active &&
+            (abs(s_ouo_mouth_x_offset) >= 10 ||
+             abs(s_ouo_mouth_y_offset) >= 10)) {
+            mouth = ouo_drag_mouth_pixel(mouth_dx, mouth_dy,
+                                         s_ouo_mouth_x_offset,
+                                         s_ouo_mouth_y_offset,
+                                         s_ouo_mouth_variant);
         } else {
-            mouth = ouo_upper_dome_pixel(mouth_dx, mouth_dy, pull_width, pull_height);
+            mouth = ouo_flat_mouth_pixel(mouth_dx, mouth_dy, 31, 29);
         }
+    } else if (s_ouo_expression == OUO_EXPRESSION_KISS) {
+        mouth = ouo_kiss_mouth_pixel(mouth_dx, mouth_dy);
     } else if (s_ouo_expression == OUO_EXPRESSION_SQUISH) {
         /* Cheek squeezing is a compact, friendly response: flat-topped lower
          * dome eyes and a thick U smile.  The previous upper domes plus a
          * giant filled bowl read as a horror mask on the round panel. */
-        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 39, 17, 7, true);
+        mouth = ouo_curve_mouth_pixel(mouth_dx, mouth_dy, 34, 15, 5, true);
     } else if (s_ouo_expression == OUO_EXPRESSION_DIZZY) {
         mouth = ouo_line_pixel(mouth_dx, mouth_dy, -24, 10, 0, -12, 3) ||
                 ouo_line_pixel(mouth_dx, mouth_dy, 0, -12, 24, 10, 3);
     } else if (s_ouo_expression == OUO_EXPRESSION_WINK_LEFT ||
-               s_ouo_expression == OUO_EXPRESSION_WINK_RIGHT) {
-        mouth = ouo_w_mouth_pixel(mouth_dx, mouth_dy, 32, 10, 3);
+               s_ouo_expression == OUO_EXPRESSION_WINK_RIGHT ||
+               s_ouo_expression == OUO_EXPRESSION_CARET) {
+        mouth = ouo_line_pixel(mouth_dx, mouth_dy, -27, 12, 0, -13, 3) ||
+                ouo_line_pixel(mouth_dx, mouth_dy, 0, -13, 27, 12, 3);
     } else {
         mouth = ouo_w_mouth_pixel(mouth_dx, mouth_dy, resting_mouth_width + 4,
                                    resting_mouth_depth + 1, 3);
@@ -3015,6 +3629,16 @@ static uint16_t ouo_menu_pixel(int x, int y)
 
 static void ouo_set_expression(ouo_expression_t expression, int duration_ms)
 {
+    s_ouo_idle_visible = false;
+    s_ouo_idle_epoch_us = 0;
+    if (expression == OUO_EXPRESSION_DIZZY &&
+        s_ouo_expression != OUO_EXPRESSION_DIZZY) {
+        s_ouo_dizzy_phase = 0.0f;
+        s_ouo_last_dizzy_phase_us = 0;
+    } else if (expression != OUO_EXPRESSION_DIZZY) {
+        s_ouo_dizzy_phase = 0.0f;
+        s_ouo_last_dizzy_phase_us = 0;
+    }
     s_ouo_expression = expression;
     s_ouo_expression_until_us = esp_timer_get_time() + (int64_t)duration_ms * 1000LL;
     s_ouo_dirty = true;
@@ -3063,12 +3687,17 @@ static void ouo_handle_touch(int x, int y)
     s_ouo_last_touch_x = x;
     s_ouo_last_touch_y = y;
     s_ouo_touch_started_us = esp_timer_get_time();
-    /* This matches the Android app's hidden-menu gesture: a still long press
-     * in the bottom-left quadrant.  Do not trigger an expression first. */
-    /* The original control is intentionally unobtrusive.  Use a broad
-     * bottom-left candidate area so the rounded bezel and touch-controller
-     * coordinate jitter do not make the long press feel like a dead button. */
-    s_ouo_menu_hold_armed = x < OUO_MENU_HOLD_X && y > OUO_MENU_HOLD_Y;
+    s_ouo_eye_touch_side = 0;
+    /* Use the same generous visual hit region as the previewer. */
+    const bool mouth_hit = ouo_in_ellipse(x, y,
+                                          OUO_FACE_CENTER_X + s_ouo_gaze_x + s_ouo_shake_x,
+                                          OUO_MOUTH_Y + s_ouo_gaze_y + s_ouo_shake_y,
+                                          100, 70);
+    /* Settings is consistently in the upper-right. Keep the established still
+     * hold so an accidental face tap cannot open a modal menu. */
+    s_ouo_menu_hold_armed = x >= FEATURE_SETTINGS_X1 && x < FEATURE_SETTINGS_X2 &&
+                            y >= FEATURE_SETTINGS_Y1 && y < FEATURE_SETTINGS_Y2 &&
+                            !mouth_hit;
     if (s_ouo_menu_hold_armed) {
         return;
     }
@@ -3077,20 +3706,30 @@ static void ouo_handle_touch(int x, int y)
                                       OUO_EYE_Y + s_ouo_gaze_y);
     const bool right_eye = ouo_eye_hit(x, y, OUO_RIGHT_EYE_X + s_ouo_gaze_x,
                                        OUO_EYE_Y + s_ouo_gaze_y);
-    const bool mouth_hit = ouo_in_ellipse(x, y, LCD_WIDTH / 2 + s_ouo_gaze_x + s_ouo_shake_x,
-                                          OUO_MOUTH_Y + s_ouo_gaze_y + s_ouo_shake_y,
-                                          78, 52);
-    if (left_eye || right_eye) {
+    if (left_eye && !right_eye) {
         ++s_ouo_eye_pokes;
         s_ouo_mood = clamp_int(s_ouo_mood - 9, 0, 100);
-        ouo_set_expression(s_ouo_eye_pokes >= 4 ? OUO_EXPRESSION_ANGRY :
-                           (left_eye ? OUO_EXPRESSION_WINK_LEFT : OUO_EXPRESSION_WINK_RIGHT),
-                           s_ouo_eye_pokes >= 4 ? 1500 : 950);
+        s_ouo_eye_touch_side = -1;
+        ouo_set_expression(OUO_EXPRESSION_WINK_LEFT, 950);
+        ESP_LOGI(TAG, "0u0: left eye poke, mood=%d", s_ouo_mood);
+    } else if (right_eye && !left_eye) {
+        ++s_ouo_eye_pokes;
+        s_ouo_mood = clamp_int(s_ouo_mood - 9, 0, 100);
+        s_ouo_eye_touch_side = 1;
+        ouo_set_expression(OUO_EXPRESSION_WINK_RIGHT, 950);
+        ESP_LOGI(TAG, "0u0: right eye poke, mood=%d", s_ouo_mood);
+    } else if (left_eye || right_eye) {
+        ++s_ouo_eye_pokes;
+        s_ouo_mood = clamp_int(s_ouo_mood - 9, 0, 100);
+        ouo_set_expression(OUO_EXPRESSION_SURPRISED, 950);
         ESP_LOGI(TAG, "0u0: eye poke, mood=%d", s_ouo_mood);
-    } else if (y < 145) {
+    } else if (y < 145 ||
+               (x > OUO_LEFT_EYE_X + s_ouo_gaze_x + 66 &&
+                x < OUO_RIGHT_EYE_X + s_ouo_gaze_x - 66 &&
+                y < OUO_EYE_Y + s_ouo_gaze_y + 4)) {
         s_ouo_mood = clamp_int(s_ouo_mood + 8, 0, 100);
         s_ouo_eye_pokes = s_ouo_eye_pokes > 0 ? s_ouo_eye_pokes - 1 : 0;
-        ouo_set_expression(OUO_EXPRESSION_HAPPY, 1100);
+        ouo_set_expression(OUO_EXPRESSION_HEAD_PAT, 1100);
         ESP_LOGI(TAG, "0u0: head pat, mood=%d", s_ouo_mood);
     } else if (mouth_hit) {
         /* Keep the pressed upper-dome mouth visible for the entire hold.  A
@@ -3100,7 +3739,10 @@ static void ouo_handle_touch(int x, int y)
         s_ouo_mouth_stretch_pixels = 0;
         s_ouo_mouth_x_offset = 0;
         s_ouo_mouth_y_offset = 0;
-        ouo_set_expression(OUO_EXPRESSION_SURPRISED, 3000);
+        s_ouo_mouth_side = abs(x - OUO_FACE_CENTER_X) >= 10;
+        s_ouo_mouth_variant = OUO_MOUTH_VARIANT_STRETCH;
+        s_ouo_mouth_variant_selected = false;
+        ouo_set_expression(OUO_EXPRESSION_KISS, 950);
         ESP_LOGI(TAG, "0u0: mouth touch");
     } else if ((x < 205 || x > LCD_WIDTH - 205) && y >= 205 && y <= 390) {
         s_ouo_mood = clamp_int(s_ouo_mood + 2, 0, 100);
@@ -3129,23 +3771,54 @@ static void ouo_handle_touch_move(int x, int y)
             return;
         }
     }
-    const bool head_stroke = s_ouo_touch_origin_y < 150 && y < 170;
+    if (s_ouo_eye_touch_side != 0) {
+        /* The held eye stays closed; elapsed time alone is not surprise. */
+        s_ouo_last_touch_x = x;
+        s_ouo_last_touch_y = y;
+        s_ouo_dirty = true;
+        return;
+    }
+    const bool head_stroke = s_ouo_expression == OUO_EXPRESSION_HEAD_PAT;
     const bool cheek_stroke = (s_ouo_touch_origin_x < 205 ||
                                s_ouo_touch_origin_x > LCD_WIDTH - 205) &&
                               y >= 190 && y <= 390;
     if (s_ouo_mouth_touch_active) {
-        /* Pull the compact mouth with the finger.  Horizontal movement is a
-         * position change with only a slight elastic stretch; vertical motion
-         * selects a frown/U shape in ouo_pixel(). */
+        /* Lock the family on the first meaningful sample.  A horizontal pull
+         * from the mouth centre deliberately picks the stretch family so the
+         * wide reference blob is easy to reach; starting in either side half
+         * selects the captured filled-3/independent-arc side family. */
+        const int ax = abs(travel_x);
+        const int ay = abs(travel_y);
+        if (!s_ouo_mouth_variant_selected && (ax >= 10 || ay >= 10)) {
+            if (s_ouo_mouth_side && ax * 4 >= ay * 5) {
+                s_ouo_mouth_variant = OUO_MOUTH_VARIANT_SIDE;
+            } else if (ax * 4 >= ay * 5) {
+                s_ouo_mouth_variant = OUO_MOUTH_VARIANT_STRETCH;
+            } else {
+                s_ouo_mouth_variant = (ouo_mouth_variant_t)(esp_random() % 4U);
+            }
+            s_ouo_mouth_variant_selected = true;
+            ESP_LOGD(TAG, "0u0: mouth variant=%d side=%d", (int)s_ouo_mouth_variant,
+                     s_ouo_mouth_side);
+        }
+        /* Pull the compact mouth with the finger.  The pixel renderer keeps
+         * the selected family stable while its contour follows the vector. */
         s_ouo_mouth_x_offset = clamp_int(travel_x, -62, 62);
-        s_ouo_mouth_stretch_pixels = clamp_int(abs(travel_x) / 12, 0, 8);
-        s_ouo_mouth_y_offset = clamp_int(travel_y, -45, 45);
+        if (s_ouo_mouth_variant == OUO_MOUTH_VARIANT_SIDE) {
+            /* Side-pull uses a fixed 3+arc contour; travel moves it but does
+             * not scale it with distance from the mouth centre. */
+            s_ouo_mouth_stretch_pixels = 0;
+            /* The captured side-pull keeps a fixed vertical contour.  Allow
+             * only the previewer's small baseline drift; never move the
+             * complete mouth by the full diagonal travel toward the eyes. */
+            s_ouo_mouth_y_offset = clamp_int(travel_y / 8, -6, 6);
+        } else {
+            s_ouo_mouth_stretch_pixels = clamp_int(abs(travel_x) / 12, 0, 8);
+            s_ouo_mouth_y_offset = clamp_int(travel_y, -45, 45);
+        }
         ouo_set_expression(OUO_EXPRESSION_SURPRISED, 3000);
     } else if (head_stroke) {
-        if ((travel_x * travel_x + travel_y * travel_y) > 36) {
-            s_ouo_mood = clamp_int(s_ouo_mood + 1, 0, 100);
-        }
-        ouo_set_expression(OUO_EXPRESSION_HAPPY, 750);
+        ouo_set_expression(OUO_EXPRESSION_HEAD_PAT, 1100);
     } else if (cheek_stroke) {
         const int inward = s_ouo_touch_origin_x < LCD_WIDTH / 2 ? travel_x : -travel_x;
         s_ouo_squish_pixels = clamp_int(20 + inward / 2, 16, 48);
@@ -3156,35 +3829,37 @@ static void ouo_handle_touch_move(int x, int y)
     s_ouo_dirty = true;
 }
 
-static void ouo_handle_two_touches(int x0, int y0, int x1, int y1)
-{
-    const int left_x = x0 < x1 ? x0 : x1;
-    const int right_x = x0 < x1 ? x1 : x0;
-    const int average_y = (y0 + y1) / 2;
-    if (left_x < 205 && right_x > LCD_WIDTH - 205 && average_y >= 190 && average_y <= 390) {
-        s_ouo_squish_pixels = clamp_int((390 - (right_x - left_x)) / 2 + 20, 20, 48);
-        s_ouo_mood = clamp_int(s_ouo_mood + 1, 0, 100);
-        ouo_set_expression(OUO_EXPRESSION_SQUISH, 1100);
-    }
-}
-
 static void ouo_end_touch(void)
 {
     const bool open_menu = s_ouo_menu_hold_armed &&
                            esp_timer_get_time() - s_ouo_touch_started_us >=
                                (int64_t)OUO_MENU_HOLD_MS * 1000LL;
     const bool mouth_was_held = s_ouo_mouth_touch_active;
+    const bool eye_was_held = s_ouo_eye_touch_side != 0;
+    const bool head_was_held = s_ouo_expression == OUO_EXPRESSION_HEAD_PAT;
+    const bool mouth_was_pulled = s_ouo_mouth_variant_selected;
     s_ouo_touch_active = false;
     s_ouo_menu_hold_armed = false;
     s_ouo_mouth_touch_active = false;
+    s_ouo_mouth_variant_selected = false;
+    s_ouo_mouth_side = false;
+    s_ouo_mouth_variant = OUO_MOUTH_VARIANT_STRETCH;
+    s_ouo_eye_touch_side = 0;
     if (open_menu) {
         ouo_open_menu();
         return;
     }
-    if (mouth_was_held && s_ouo_expression == OUO_EXPRESSION_SURPRISED) {
-        s_ouo_expression = OUO_EXPRESSION_IDLE;
-        s_ouo_expression_until_us = 0;
-        s_ouo_dirty = true;
+    if (head_was_held) ouo_set_expression(OUO_EXPRESSION_DELIGHTED, 6000);
+    else if (eye_was_held) ouo_set_expression(OUO_EXPRESSION_CARET, 700);
+    else if (mouth_was_held) {
+        // Release returns to a compact baseline before idle, not a smile
+        // translated by the old drag offset for another half second.
+        s_ouo_mouth_x_offset = 0;
+        s_ouo_mouth_y_offset = 0;
+        s_ouo_mouth_stretch_pixels = 0;
+        ouo_set_expression(mouth_was_pulled ? OUO_EXPRESSION_MOUTH_RELEASE : OUO_EXPRESSION_KISS, 650);
+    } else if (s_ouo_expression != OUO_EXPRESSION_IDLE) {
+        s_ouo_expression_until_us = esp_timer_get_time() + 900000LL;
     }
 }
 
@@ -3196,7 +3871,7 @@ static void ouo_handle_menu_touch(int x, int y)
         s_ui_screen = UI_SCREEN_OUO;
         s_ouo_canvas_valid = false;
         ouo_apply_mood_expression(2600);
-        s_ouo_next_blink_us = esp_timer_get_time() + 5200000LL;
+        s_ouo_idle_epoch_us = 0;
         s_ouo_dirty = true;
         ESP_LOGI(TAG, "0u0 menu: returned to face");
         return;
@@ -3206,21 +3881,22 @@ static void ouo_handle_menu_touch(int x, int y)
         const int slider_right = LCD_WIDTH - 86;
         s_ouo_mood = clamp_int((x - slider_left) * 100 /
                                (slider_right - slider_left), 0, 100);
+        s_ouo_preferred_mood = (uint8_t)s_ouo_mood;
+        ouo_save_preferences();
         s_ouo_eye_pokes = 0;
         ouo_apply_mood_expression(2600);
         s_ouo_menu_dirty = true;
         ESP_LOGI(TAG, "0u0 menu: mood=%d", s_ouo_mood);
     } else if (y >= 286 && y <= 331) {
         s_ouo_auto_expressions = !s_ouo_auto_expressions;
-        if (!s_ouo_auto_expressions && s_ouo_expression == OUO_EXPRESSION_IDLE) {
-            s_ouo_next_blink_us = INT64_MAX;
-        } else if (s_ouo_auto_expressions) {
-            s_ouo_next_blink_us = esp_timer_get_time() + 5200000LL;
-        }
+        ouo_save_preferences();
+        s_ouo_idle_visible = false;
+        s_ouo_idle_epoch_us = 0;
         s_ouo_menu_dirty = true;
         ESP_LOGI(TAG, "0u0 menu: auto idle=%d", s_ouo_auto_expressions);
     } else if (y >= 332 && y <= 378) {
         s_ouo_tilt_reactions = !s_ouo_tilt_reactions;
+        ouo_save_preferences();
         if (!s_ouo_tilt_reactions) {
             s_ouo_gaze_x = 0;
             s_ouo_gaze_y = 0;
@@ -3237,6 +3913,29 @@ static void step_ouo(void)
         now - s_ouo_touch_started_us >= (int64_t)OUO_MENU_HOLD_MS * 1000LL) {
         ouo_open_menu();
         return;
+    }
+
+    /* Rotate the two dizzy spirals at a time-based rate so the animation is
+     * stable across render-loop cadence and remains visible on the OLED. */
+    if (s_ouo_expression == OUO_EXPRESSION_DIZZY) {
+        if (s_ouo_last_dizzy_phase_us == 0) {
+            s_ouo_last_dizzy_phase_us = now;
+        }
+        const int64_t phase_delta_us = now - s_ouo_last_dizzy_phase_us;
+        if (phase_delta_us >= 16000LL) {
+            /* Match the previewer's visible rotation: about 0.18 rad per
+             * 16 ms frame.  The old 9e-9 coefficient advanced only 0.000144
+             * rad per frame, which looked like a frozen spiral on-device. */
+            s_ouo_dizzy_phase += (float)phase_delta_us * 0.00001125f;
+            while (s_ouo_dizzy_phase >= 6.2831853f) {
+                s_ouo_dizzy_phase -= 6.2831853f;
+            }
+            s_ouo_last_dizzy_phase_us = now;
+            s_ouo_dirty = true;
+        }
+    } else {
+        s_ouo_dizzy_phase = 0.0f;
+        s_ouo_last_dizzy_phase_us = 0;
     }
 
     int gravity_x = 0;
@@ -3294,12 +3993,12 @@ static void step_ouo(void)
         s_ouo_last_motion_dx = 0;
         s_ouo_last_motion_dy = 0;
     }
-    if (s_ouo_tilt_reactions && s_ouo_shake_reversals >= 2 &&
+    if (!s_ouo_touch_active && s_ouo_tilt_reactions && s_ouo_shake_reversals >= 2 &&
         now - s_ouo_last_shake_us >= 2800000LL) {
         s_ouo_mood = clamp_int(s_ouo_mood + 2, 0, 100);
         s_ouo_last_shake_us = now;
         s_ouo_shake_until_us = now + 1000000LL;
-        ouo_set_expression(OUO_EXPRESSION_DIZZY, 900);
+        ouo_set_expression(OUO_EXPRESSION_DIZZY, 1000);
         ESP_LOGI(TAG, "0u0: dizzy shake reversals=%u, motion=%d, gravity=%d/%d",
                  s_ouo_shake_reversals, motion, gravity_x, gravity_y);
         s_ouo_shake_reversals = 0;
@@ -3344,22 +4043,12 @@ static void step_ouo(void)
                                  (s_ouo_mouth_y_offset < 0 ? 1 : 0);
         s_ouo_dirty = true;
     }
-    if (s_ouo_expression != OUO_EXPRESSION_IDLE &&
-        !(s_ouo_mouth_touch_active && s_ouo_expression == OUO_EXPRESSION_SURPRISED) &&
+    if (s_ouo_expression != OUO_EXPRESSION_IDLE && !s_ouo_touch_active &&
         now >= s_ouo_expression_until_us) {
         s_ouo_expression = OUO_EXPRESSION_IDLE;
         s_ouo_dirty = true;
     }
-    if (s_ouo_auto_expressions && s_ouo_expression == OUO_EXPRESSION_IDLE &&
-        now >= s_ouo_next_blink_us) {
-        /* Passive idle is almost always the neutral face.  A short blink is
-         * enough to prevent it looking frozen; cycling happy/sad/surprised
-         * made the implementation feel like a slideshow rather than OuO. */
-        ouo_set_expression(OUO_EXPRESSION_BLINK, 180);
-        ++s_ouo_idle_cycle;
-        s_ouo_next_blink_us = now + 5200000LL +
-                               (int64_t)(s_ouo_idle_cycle % 4U) * 700000LL;
-    }
+    ouo_idle_step(now);
 }
 
 static uint32_t mix32(uint32_t value)
@@ -4219,8 +4908,6 @@ static void read_tilt(int *gravity_x, int *gravity_y)
 static void enter_fluid_screen(void)
 {
     s_ui_screen = UI_SCREEN_FLUID;
-    s_fluid_controls_visible = true;
-    s_last_fluid_interaction = xTaskGetTickCount();
     s_fluid_canvas_valid = false;
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
@@ -4241,10 +4928,15 @@ static void enter_ouo_screen(void)
     s_ouo_mouth_stretch_pixels = 0;
     s_ouo_mouth_x_offset = 0;
     s_ouo_mouth_y_offset = 0;
+    s_ouo_mouth_variant = OUO_MOUTH_VARIANT_STRETCH;
+    s_ouo_mouth_variant_selected = false;
+    s_ouo_mouth_side = false;
     s_ouo_shake_x = 0;
     s_ouo_shake_y = 0;
     s_ouo_shake_until_us = 0;
     s_ouo_last_shake_us = 0;
+    s_ouo_dizzy_phase = 0.0f;
+    s_ouo_last_dizzy_phase_us = 0;
     s_ouo_last_motion_dx = 0;
     s_ouo_last_motion_dy = 0;
     s_ouo_shake_reversals = 0;
@@ -4255,12 +4947,68 @@ static void enter_ouo_screen(void)
     s_ouo_last_gravity_x = 0;
     s_ouo_last_gravity_y = 0;
     s_ouo_last_gaze_update_us = 0;
-    s_ouo_idle_cycle = 0;
-    s_ouo_next_blink_us = esp_timer_get_time() + 5200000LL;
+    s_ouo_idle_epoch_us = 0;
+    s_ouo_idle_visible = false;
+    if (s_ouo_idle_tiles == NULL) {
+        s_ouo_idle_tiles = heap_caps_malloc(OUO_IDLE_TILE_PIXELS, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_ouo_idle_tiles == NULL) s_ouo_idle_tiles = heap_caps_malloc(OUO_IDLE_TILE_PIXELS, MALLOC_CAP_8BIT);
+        if (s_ouo_idle_tiles == NULL) ESP_LOGW(TAG, "0u0 idle: no buffer; using static face");
+    }
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
     block_touch_until_release();
     ESP_LOGI(TAG, "Apps: entered 0u0");
+}
+
+static const char *ble_ui_screen_name(ui_screen_t screen)
+{
+    switch (screen) {
+    case UI_SCREEN_HOME: return "HOME";
+    case UI_SCREEN_FLUID: return "FLUID";
+    case UI_SCREEN_OUO: return "OUO";
+    default: return "OTHER";
+    }
+}
+
+static void apply_ble_ui_request(void)
+{
+    ui_screen_t target;
+    if (s_ble_ui_requests != NULL && xQueueReceive(s_ble_ui_requests, &target, 0) == pdTRUE) {
+        bool busy = s_ble_media_transfer_active || s_usb_msc_started || s_usb_msc_start_requested;
+        if (!busy) {
+            /* Clear in-flight local gestures before entering the requested
+             * screen, but preserve all user settings and uploaded media. */
+            s_home_slide_active = false;
+            s_home_slide_waiting = false;
+            s_apps_dismiss_active = false;
+            s_apps_entrance_active = false;
+            s_apps_canvas_valid = false;
+            s_apps_home_transition_frame = NULL;
+            s_ouo_touch_active = false;
+            s_ouo_mouth_touch_active = false;
+            s_ouo_menu_hold_armed = false;
+            s_ouo_canvas_valid = false;
+            s_settings_touch_dragging = false;
+            s_touch_energy = 0;
+            if (target == UI_SCREEN_FLUID) enter_fluid_screen();
+            else if (target == UI_SCREEN_OUO) enter_ouo_screen();
+            else {
+                s_ui_screen = UI_SCREEN_HOME;
+                s_home_dirty = true;
+                block_touch_until_release();
+            }
+            display_note_activity();
+            ESP_LOGI(TAG, "BLE UI: switched to %s", ble_ui_screen_name(target));
+        }
+        portENTER_CRITICAL(&s_ble_ui_lock);
+        s_ble_ui_snapshot = s_ui_screen;
+        s_ble_ui_state = busy ? BLE_UI_BUSY : BLE_UI_DONE;
+        portEXIT_CRITICAL(&s_ble_ui_lock);
+    } else {
+        portENTER_CRITICAL(&s_ble_ui_lock);
+        s_ble_ui_snapshot = s_ui_screen;
+        portEXIT_CRITICAL(&s_ble_ui_lock);
+    }
 }
 
 static void enter_usb_disk_screen(void)
@@ -4300,6 +5048,44 @@ static void begin_apps_dismiss(void)
     ESP_LOGI(TAG, "Apps: upward swipe, starting return animation");
 }
 
+static bool fluid_colour_picker_select(int x, int y)
+{
+    const int dx = x - LCD_WIDTH / 2;
+    const int dy = y - 270;
+    const int distance2 = dx * dx + dy * dy;
+    if (distance2 > 150 * 150) return false;
+    float hue = atan2f((float)dy, (float)dx) / 6.283185307f;
+    if (hue < 0.0f) hue += 1.0f;
+    float saturation = sqrtf((float)distance2) / 150.0f;
+    if (saturation < 0.15f) saturation = 0.15f;
+    if (!s_custom_palette_active || hue != s_colour_hue || saturation != s_colour_saturation) {
+        set_custom_palette(hue, saturation);
+        fluid_queue_preferences();
+        s_colour_picker_dirty = true;
+        s_fluid_canvas_valid = false;
+    }
+    return true;
+}
+
+static void fluid_colour_picker_touch(int x, int y)
+{
+    if (!s_touch_down) {
+        if (y < 106) {
+            s_ui_screen = UI_SCREEN_FLUID_SETTINGS;
+            s_settings_dirty = true;
+            s_colour_dragging = false;
+            block_touch_until_release();
+            return;
+        }
+        s_colour_dragging = fluid_colour_picker_select(x, y);
+    } else if (s_colour_dragging) {
+        /* A drag that began inside the wheel stays a colour gesture, even
+         * over the back button. Leaving/re-entering the wheel is safe. */
+        (void)fluid_colour_picker_select(x, y);
+    }
+    s_touch_down = true;
+}
+
 static void poll_touch(void)
 {
     if (!s_touch_ready) {
@@ -4311,6 +5097,7 @@ static void poll_touch(void)
     }
     const uint8_t touch_count = count & 0x0F;
     if (touch_count == 0) {
+        s_colour_dragging = false;
         s_display_wake_touch_suppressed = false;
         if (s_ui_screen == UI_SCREEN_OUO && s_touch_down) {
             ouo_end_touch();
@@ -4328,8 +5115,9 @@ static void poll_touch(void)
         return;
     }
 
-    /* FT3168 exposes up to two contacts at 0x03 and 0x09.  The other screens
-     * still use the primary point; 0u0 uses both to emulate cheek pinching. */
+    /* Only the primary contact is consumed.  The current PACON interaction
+     * model deliberately stays single-pointer; a second reported contact is
+     * ignored instead of entering a separate squeeze state. */
     uint8_t point[10] = {0};
     if (i2c_read(ADDR_TOUCH, 0x03, point, sizeof(point)) != ESP_OK) {
         return;
@@ -4365,13 +5153,6 @@ static void poll_touch(void)
             ouo_handle_touch(x, y);
         } else {
             ouo_handle_touch_move(x, y);
-        }
-        if (touch_count >= 2) {
-            const int x2 = ((point[6] & 0x0F) << 8) | point[7];
-            const int y2 = ((point[8] & 0x0F) << 8) | point[9];
-            if (x2 >= 0 && x2 < LCD_WIDTH && y2 >= 0 && y2 < LCD_HEIGHT) {
-                ouo_handle_two_touches(x, y, x2, y2);
-            }
         }
         s_touch_down = true;
         return;
@@ -4448,18 +5229,20 @@ static void poll_touch(void)
             s_apps_swipe_origin_x = x;
             s_apps_swipe_origin_y = y;
             s_apps_swipe_handled = false;
-            if (home_in_round_rect(x, y, 101, 123, 183, 205, 22)) {
+            if (home_in_circle(x, y, 142, 145, 44)) {
                 enter_fluid_screen();
-            } else if (home_in_round_rect(x, y, 292, 123, 374, 205, 22)) {
+            } else if (home_in_circle(x, y, 333, 145, 44)) {
                 enter_ouo_screen();
-            } else if (home_in_round_rect(x, y, 204, 130, 271, 198, 24)) {
+            } else if (home_in_circle(x, y, LCD_WIDTH / 2, 145, 44)) {
                 watch_enter();
-            } else if (home_in_round_rect(x, y, 101, 274, 183, 356, 22)) {
+            } else if (home_in_circle(x, y, 142, 265, 44)) {
                 skyorb_enter();
-            } else if (home_in_round_rect(x, y, 292, 274, 374, 356, 22)) {
+            } else if (home_in_circle(x, y, 333, 265, 44)) {
                 enter_usb_disk_screen();
-            } else if (home_in_round_rect(x, y, 211, 237, 265, 291, 18)) {
+            } else if (home_in_circle(x, y, LCD_WIDTH / 2, 265, 44)) {
                 settings_enter();
+            } else if (home_in_circle(x, y, LCD_WIDTH / 2, 385, 44)) {
+                camera_enter();
             } else if (y >= 438) {
                 begin_apps_dismiss();
             }
@@ -4517,6 +5300,12 @@ static void poll_touch(void)
         return;
     }
 
+    if (s_ui_screen == UI_SCREEN_CAMERA) {
+        if (!s_touch_down) camera_handle_touch(x, y);
+        s_touch_down = true;
+        return;
+    }
+
     if (s_ui_screen == UI_SCREEN_SETTINGS) {
         if (!s_touch_down) {
             s_settings_touch_origin_y = y;
@@ -4549,80 +5338,48 @@ static void poll_touch(void)
         return;
     }
 
-    /* A first touch after the timeout only wakes the two navigation icons.
-     * This avoids an accidental page change or impulse while the controls are
-     * still hidden.  A held touch also keeps their timer alive. */
-    if (s_ui_screen == UI_SCREEN_FLUID) {
-        const bool was_hidden = !s_fluid_controls_visible;
-        s_fluid_controls_visible = true;
-        s_last_fluid_interaction = xTaskGetTickCount();
-        if (was_hidden) {
-            s_fluid_canvas_valid = false;
-            s_touch_down = true;
-            ESP_LOGI(TAG, "Fluid controls: shown");
-            return;
-        }
+    /* Fluid navigation is invisible but its original touch rectangles remain
+     * active on the first press. Display-wake suppression above is unchanged. */
+    if (s_ui_screen == UI_SCREEN_COLOUR_PICKER) {
+        fluid_colour_picker_touch(x, y);
+        return;
     }
-
     if (!s_touch_down) {
         if (s_ui_screen == UI_SCREEN_FLUID_SETTINGS) {
             if (y < 92) {
                 s_ui_screen = UI_SCREEN_FLUID;
-                s_fluid_controls_visible = true;
-                s_last_fluid_interaction = xTaskGetTickCount();
                 s_fluid_canvas_valid = false;
                 ESP_LOGI(TAG, "Fluid settings: returned to fluid");
             } else if (y >= 112 && y < 172) {
                 s_fluid_shape = FLUID_SHAPE_SIMPLE;
+                fluid_queue_preferences();
                 s_settings_dirty = true;
                 s_fluid_canvas_valid = false;
                 ESP_LOGI(TAG, "Fluid shape: simple");
             } else if (y >= 182 && y < 242) {
                 s_fluid_shape = FLUID_SHAPE_BLOCKS;
+                fluid_queue_preferences();
                 s_settings_dirty = true;
                 s_fluid_canvas_valid = false;
                 ESP_LOGI(TAG, "Fluid shape: blocks");
             } else if (y >= 252 && y < 312) {
                 s_fluid_shape = FLUID_SHAPE_MATRIX;
+                fluid_queue_preferences();
                 s_settings_dirty = true;
                 s_fluid_canvas_valid = false;
                 ESP_LOGI(TAG, "Fluid shape: matrix");
             } else if (y >= 338 && y <= 430) {
                 s_ui_screen = UI_SCREEN_COLOUR_PICKER;
                 s_colour_picker_dirty = true;
+                block_touch_until_release();
                 ESP_LOGI(TAG, "Fluid settings: opened colour palette");
-            }
-        } else if (s_ui_screen == UI_SCREEN_COLOUR_PICKER) {
-            if (y < 106) {
-                s_ui_screen = UI_SCREEN_FLUID_SETTINGS;
-                s_settings_dirty = true;
-                ESP_LOGI(TAG, "Colour palette: returned to settings");
-            } else {
-                const int wheel_x = LCD_WIDTH / 2;
-                const int wheel_y = 270;
-                const int wheel_radius = 150;
-                const int dx = x - wheel_x;
-                const int dy = y - wheel_y;
-                const int distance2 = dx * dx + dy * dy;
-                if (distance2 <= wheel_radius * wheel_radius) {
-                    const float two_pi = 6.283185307f;
-                    float hue = atan2f((float)dy, (float)dx) / two_pi;
-                    if (hue < 0.0f) {
-                        hue += 1.0f;
-                    }
-                    set_custom_palette(hue,
-                                       sqrtf((float)distance2) / (float)wheel_radius);
-                    s_colour_picker_dirty = true;
-                    s_fluid_canvas_valid = false;
-                    ESP_LOGI(TAG, "Fluid custom colour: hue=%.2f saturation=%.2f",
-                             (double)s_colour_hue, (double)s_colour_saturation);
-                }
             }
         } else if (y >= 68 && y < 125 && x >= 55 && x < 215) {
             s_ui_screen = UI_SCREEN_HOME;
             s_home_dirty = true;
             ESP_LOGI(TAG, "Fluid: returned home");
-        } else if (y >= 68 && y < 125 && x > 270 && x < 425) {
+        } else if (x >= FEATURE_SETTINGS_X1 && x < FEATURE_SETTINGS_X2 &&
+                   y >= FEATURE_SETTINGS_Y1 && y < FEATURE_SETTINGS_Y2) {
             s_ui_screen = UI_SCREEN_FLUID_SETTINGS;
             s_settings_dirty = true;
             ESP_LOGI(TAG, "Fluid: opened settings");
@@ -5046,12 +5803,6 @@ static void dirty_rect_include_particle(dirty_rect_t *rect, int center_x, int ce
                        center_x + pad + 1, center_y + pad + 1);
 }
 
-static bool dirty_rect_intersects(const dirty_rect_t *rect,
-                                  int x1, int y1, int x2, int y2)
-{
-    return rect->x1 < x2 && rect->x2 > x1 && rect->y1 < y2 && rect->y2 > y1;
-}
-
 static void clear_canvas_rect(const dirty_rect_t *rect)
 {
     for (int y = rect->y1; y < rect->y2; ++y) {
@@ -5253,82 +6004,6 @@ static void render_fluid_shape_into_canvas(const dirty_rect_t *clip)
     }
 }
 
-static void render_home_control_into_canvas(const dirty_rect_t *clip)
-{
-    if (!s_fluid_controls_visible) {
-        return;
-    }
-    const uint16_t home_colour = rgb565(245, 245, 247);
-    const uint16_t settings_colour = rgb565(10, 132, 255);
-    /* Keep controls inside the round active area.  Compact icons sit quietly
-     * over the liquid, unlike the old text labels and wide rectangular bars. */
-    const int home_center_x = 86;
-    const int settings_center_x = LCD_WIDTH - 86;
-    const int control_center_y = 92;
-    const int control_radius = 22;
-    const int home_x1 = home_center_x - control_radius;
-    const int home_y1 = control_center_y - control_radius;
-    const int home_x2 = home_center_x + control_radius + 1;
-    const int home_y2 = control_center_y + control_radius + 1;
-    const int settings_x1 = settings_center_x - control_radius;
-    const int settings_x2 = settings_center_x + control_radius + 1;
-    if (clip != NULL &&
-        !dirty_rect_intersects(clip, home_x1, home_y1, home_x2, home_y2) &&
-        !dirty_rect_intersects(clip, settings_x1, home_y1, settings_x2, home_y2)) {
-        return;
-    }
-
-    const int top = clip == NULL ? home_y1 : clamp_int(home_y1, clip->y1, clip->y2);
-    const int bottom = clip == NULL ? home_y2 : clamp_int(home_y2, clip->y1, clip->y2);
-    const int left = clip == NULL ? home_x1 : clamp_int(home_x1, clip->x1, clip->x2);
-    const int right = clip == NULL ? settings_x2 : clamp_int(settings_x2, clip->x1, clip->x2);
-    for (int y = top; y < bottom; ++y) {
-        uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
-        for (int x = left; x < right; ++x) {
-            const int home_dx = x - home_center_x;
-            const int home_dy = y - control_center_y;
-            const int settings_dx = x - settings_center_x;
-            const int settings_dy = y - control_center_y;
-            const int home_distance2 = home_dx * home_dx + home_dy * home_dy;
-            const int settings_distance2 = settings_dx * settings_dx + settings_dy * settings_dy;
-            const bool is_home = home_distance2 <= control_radius * control_radius;
-            const bool is_settings = settings_distance2 <= control_radius * control_radius;
-            if (!is_home && !is_settings) {
-                continue;
-            }
-
-            const int distance2 = is_home ? home_distance2 : settings_distance2;
-            const int dx = is_home ? home_dx : settings_dx;
-            const int dy = is_home ? home_dy : settings_dy;
-            const bool edge = distance2 >= (control_radius - 2) * (control_radius - 2);
-            line[x] = rgb565_blend(line[x], rgb565(28, 28, 30), edge ? 245 : 220);
-
-            bool glyph = false;
-            if (is_home) {
-                const bool roof = dy >= -11 && dy <= -4 &&
-                                  (dx < 0 ? -dx : dx) <= dy + 11;
-                const bool body = dy >= -4 && dy <= 10 &&
-                                  (dx < 0 ? -dx : dx) <= 7;
-                const bool door = dy >= 4 && dy <= 10 &&
-                                  (dx < 0 ? -dx : dx) <= 2;
-                glyph = (roof || body) && !door;
-            } else {
-                /* Three short slider tracks and staggered knobs. */
-                const bool track = ((dy >= -8 && dy <= -6) ||
-                                    (dy >= -1 && dy <= 1) ||
-                                    (dy >= 6 && dy <= 8)) &&
-                                   (dx >= -10 && dx <= 10);
-                const bool knob = ((dx >= -6 && dx <= -2) && dy >= -10 && dy <= -4) ||
-                                  ((dx >= 3 && dx <= 7) && dy >= -3 && dy <= 3) ||
-                                  ((dx >= -2 && dx <= 2) && dy >= 4 && dy <= 10);
-                glyph = track || knob;
-            }
-            if (glyph) {
-                line[x] = rgb565_blend(line[x], is_home ? home_colour : settings_colour, 255);
-            }
-        }
-    }
-}
 
 static void sync_drawn_particle_positions(void)
 {
@@ -5753,6 +6428,48 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
         return media_command_result;
     }
 
+    if (strcasecmp(text, "GET UI") == 0) {
+        portENTER_CRITICAL(&s_ble_ui_lock);
+        const ui_screen_t screen = s_ble_ui_snapshot;
+        const ble_ui_state_t state = s_ble_ui_state;
+        portEXIT_CRITICAL(&s_ble_ui_lock);
+        const char *state_name = state == BLE_UI_PENDING ? "pending" :
+                                 state == BLE_UI_DONE ? "done" :
+                                 state == BLE_UI_BUSY ? "busy" : "idle";
+        snprintf(response, response_size,
+                 "{\"ok\":true,\"screen\":\"%s\",\"state\":\"%s\"}\r\n",
+                 ble_ui_screen_name(screen), state_name);
+        return ESP_OK;
+    }
+    if (strncasecmp(text, "SET UI ", 7U) == 0) {
+        ui_screen_t target;
+        if (strcasecmp(text + 7, "HOME") == 0) target = UI_SCREEN_HOME;
+        else if (strcasecmp(text + 7, "FLUID") == 0) target = UI_SCREEN_FLUID;
+        else if (strcasecmp(text + 7, "OUO") == 0) target = UI_SCREEN_OUO;
+        else {
+            snprintf(response, response_size, "ERR UI expects HOME|FLUID|OUO\r\n");
+            return ESP_ERR_INVALID_ARG;
+        }
+        portENTER_CRITICAL(&s_ble_ui_lock);
+        bool pending = s_ble_ui_state == BLE_UI_PENDING;
+        if (!pending) s_ble_ui_state = BLE_UI_PENDING;
+        portEXIT_CRITICAL(&s_ble_ui_lock);
+        if (pending) {
+            snprintf(response, response_size, "ERR UI busy\r\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (s_ble_ui_requests == NULL || s_ble_media_transfer_active || s_usb_msc_started ||
+            s_usb_msc_start_requested || xQueueSend(s_ble_ui_requests, &target, 0) != pdTRUE) {
+            portENTER_CRITICAL(&s_ble_ui_lock);
+            s_ble_ui_state = BLE_UI_BUSY;
+            portEXIT_CRITICAL(&s_ble_ui_lock);
+            snprintf(response, response_size, "ERR UI busy\r\n");
+            return ESP_ERR_INVALID_STATE;
+        }
+        snprintf(response, response_size, "OK UI QUEUED %s\r\n", ble_ui_screen_name(target));
+        return ESP_OK;
+    }
+
     skyorb_config_t config;
     ble_snapshot_skyorb_config(&config);
     if (strcasecmp(text, "GET RADAR") == 0) {
@@ -5856,7 +6573,7 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
     }
     if (strcasecmp(text, "GET HELP") == 0) {
         snprintf(response, response_size,
-                 "GET STATUS; GET RADAR; GET CLOCK; SET BRIGHTNESS 0..100; "
+                 "GET UI; SET UI HOME|FLUID|OUO; GET STATUS; GET RADAR; GET CLOCK; SET BRIGHTNESS 0..100; "
                  "SET SCREEN TIMEOUT 0|15|30|60|120|300; SET RANGE 0..5; "
                  "CAMERA SHUTTER; SET CAMERA REMOTE ON|OFF; "
                  "SET LOCATION lat lon; SET AUTO_LOCATION; SET WIFI ssid|password; "
@@ -6086,6 +6803,7 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
         const bool deleted_active = config.wifi_selected == index;
         (void)wifi_config_delete_profile(&config, (uint8_t)index);
         ble_store_skyorb_config(&config);
+        if (deleted_active) (void)pacon_save_switch("wifi_join", false);
         if (deleted_active && s_skyorb_wifi_connected) (void)esp_wifi_disconnect();
         memset(s_wifi_profile_visible, 0, sizeof(s_wifi_profile_visible));
         memset(s_wifi_profile_ap_valid, 0, sizeof(s_wifi_profile_ap_valid));
@@ -6165,6 +6883,7 @@ static bool wifi_request_profile_connection(uint8_t index)
 
     wifi_config_select_profile(&config, index);
     ble_store_skyorb_config(&config);
+    (void)pacon_save_switch("wifi_join", true);
 
     /* Stop the old station link's disconnect callback from racing a reconnect while the
      * selected profile is being changed.  The network task owns the actual
@@ -6187,6 +6906,7 @@ static bool wifi_request_profile_connection(uint8_t index)
 static void skyorb_disable_network(void)
 {
     s_skyorb_wifi_enabled = false;
+    (void)pacon_save_switch("wifi_on", false);
     s_wifi_should_connect = false;
     s_wifi_connect_requested = false;
     s_wifi_connect_after_scan = false;
@@ -7538,6 +8258,7 @@ static void watch_handle_touch(int x, int y)
 static void skyorb_start_network_task(void)
 {
     s_skyorb_wifi_enabled = true;
+    (void)pacon_save_switch("wifi_on", true);
     skyorb_mark_dirty();
     if (s_skyorb_mutex == NULL) {
         s_skyorb_mutex = xSemaphoreCreateMutex();
@@ -7612,7 +8333,7 @@ static void device_settings_compose_canvas(bool full_refresh)
     }
 
     /* Scrollable watchOS-style cards. */
-    const int cards[][2] = {{104, 172}, {292, 132}, {440, 126}, {582, 108}};
+    const int cards[][2] = {{104, 126}, {246, 132}, {394, 126}, {536, 108}};
     for (size_t i = 0; i < sizeof(cards) / sizeof(cards[0]); ++i) {
         const int top = settings_screen_y(cards[i][0]);
         fill_canvas_rect(54, top, 421, top + cards[i][1], panel, &viewport);
@@ -7636,39 +8357,32 @@ static void device_settings_compose_canvas(bool full_refresh)
                   270, 208, &lv_font_montserrat_14,
                   ble_pacon_is_enabled() ? green : secondary);
     settings_switch(200, ble_pacon_is_enabled(), rgb565(90, 200, 250));
-    settings_text("Camera shutter", 86, 249, &lv_font_montserrat_14, white);
-    const bool camera_ready = ble_pacon_is_enabled() && ble_pacon_is_connected() &&
-                              ble_pacon_is_camera_remote_enabled();
-    settings_text(camera_ready ? "READY" : "CONNECT",
-                  315, 253, &lv_font_montserrat_14,
-                  camera_ready ? green : secondary);
-
-    settings_text("DISPLAY", 86, 308, &lv_font_montserrat_18, white);
-    settings_text("Brightness", 86, 348, &lv_font_montserrat_14, white);
+    settings_text("DISPLAY", 86, 262, &lv_font_montserrat_18, white);
+    settings_text("Brightness", 86, 302, &lv_font_montserrat_14, white);
     char brightness[12];
     snprintf(brightness, sizeof(brightness), "%u%%",
              (unsigned)(((uint16_t)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 100U) /
                         (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)));
-    settings_text(brightness, 350, 348, &lv_font_montserrat_14, orange);
-    const int slider_y = settings_screen_y(386);
+    settings_text(brightness, 350, 302, &lv_font_montserrat_14, orange);
+    const int slider_y = settings_screen_y(340);
     fill_canvas_rect(92, slider_y, 382, slider_y + 8, rgb565(74, 74, 78), &viewport);
     const int knob_x = 92 + ((int)(s_user_brightness - SETTINGS_BRIGHTNESS_MIN) * 290) /
                               (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN);
     fill_canvas_rect(92, slider_y, knob_x, slider_y + 8, orange, &viewport);
     skyorb_circle_dot(knob_x, slider_y + 4, 12, white);
 
-    skyorb_circle_dot(84, settings_screen_y(466), 16, rgb565(110, 80, 220));
-    settings_text("SKYORB", 110, 450, &lv_font_montserrat_18, white);
-    settings_text("BLE app config; AP is transitional", 86, 490,
+    skyorb_circle_dot(84, settings_screen_y(420), 16, rgb565(110, 80, 220));
+    settings_text("SKYORB", 110, 404, &lv_font_montserrat_18, white);
+    settings_text("BLE app config; AP is transitional", 86, 444,
                   &lv_font_montserrat_14, secondary);
     settings_text(s_skyorb_config.location_valid ? "LOCATION READY" : "LOCATION NOT SET",
-                  86, 522, &lv_font_montserrat_14,
+                  86, 476, &lv_font_montserrat_14,
                   s_skyorb_config.location_valid ? green : orange);
 
-    settings_text("SYSTEM", 86, 594, &lv_font_montserrat_18, white);
-    settings_text("USB media and battery status", 86, 635,
+    settings_text("SYSTEM", 86, 548, &lv_font_montserrat_18, white);
+    settings_text("USB media and battery status", 86, 589,
                   &lv_font_montserrat_14, secondary);
-    settings_text(s_vbus_present ? "USB POWER" : "BATTERY POWER", 86, 664,
+    settings_text(s_vbus_present ? "USB POWER" : "BATTERY POWER", 86, 618,
                   &lv_font_montserrat_14, s_vbus_present ? green : secondary);
 
     /* Repaint the fixed header so scrolled cards cannot cover it. */
@@ -7843,6 +8557,7 @@ static void wifi_settings_delete_profile(uint8_t index)
     (void)wifi_config_delete_profile(&config, index);
     ble_store_skyorb_config(&config);
     if (deleted_active) {
+        (void)pacon_save_switch("wifi_join", false);
         s_wifi_should_connect = false;
         s_wifi_connect_requested = false;
         if (s_skyorb_wifi_connected) (void)esp_wifi_disconnect();
@@ -7926,6 +8641,113 @@ static void wifi_settings_handle_release(void)
     s_wifi_touch_long_handled = false;
 }
 
+static void camera_enter(void)
+{
+    s_ui_screen = UI_SCREEN_CAMERA;
+    s_camera_dirty = true;
+    s_camera_feedback_until = 0;
+    s_camera_last_frame = 0;
+    s_apps_canvas_valid = false;
+    s_apps_home_transition_frame = NULL;
+    block_touch_until_release();
+    ESP_LOGI(TAG, "Apps: entered Camera Remote");
+}
+
+static void camera_handle_touch(int x, int y)
+{
+    if (x < 120 && y < 105) {
+        s_ui_screen = UI_SCREEN_APPS;
+        s_apps_dirty = true;
+        s_apps_canvas_valid = false;
+        s_apps_home_transition_frame = NULL;
+        block_touch_until_release();
+        ESP_LOGI(TAG, "Camera: returned to app launcher");
+        return;
+    }
+    const int dx = x - LCD_WIDTH / 2;
+    const int dy = y - 255;
+    if (dx * dx + dy * dy > 92 * 92) return;
+
+    s_camera_feedback_result = ble_pacon_camera_shutter();
+    s_camera_feedback_started = xTaskGetTickCount();
+    s_camera_feedback_until = s_camera_feedback_started + pdMS_TO_TICKS(850);
+    s_camera_dirty = true;
+    block_touch_until_release();
+    if (s_camera_feedback_result == ESP_OK) {
+        ESP_LOGI(TAG, "Camera page: shutter sent");
+    } else {
+        ESP_LOGW(TAG, "Camera page: shutter unavailable (%s)",
+                 esp_err_to_name(s_camera_feedback_result));
+    }
+}
+
+static void camera_render_frame(void)
+{
+    if (s_lcd_canvas == NULL) return;
+    const TickType_t now = xTaskGetTickCount();
+    const bool ready = ble_pacon_is_enabled() &&
+                       ble_pacon_is_camera_remote_ready();
+    const bool feedback = s_camera_feedback_until != 0 &&
+                          (int32_t)(s_camera_feedback_until - now) > 0;
+    const bool success = feedback && s_camera_feedback_result == ESP_OK;
+    const uint32_t age_ms = feedback ?
+        (uint32_t)((now - s_camera_feedback_started) * portTICK_PERIOD_MS) : 0U;
+    const bool pressed = feedback && age_ms < 130U;
+    const bool flash = success && age_ms >= 130U && age_ms < 320U;
+    const uint16_t black = rgb565(0, 0, 0);
+    const uint16_t white = rgb565(245, 245, 247);
+    const uint16_t secondary = rgb565(142, 142, 147);
+    const uint16_t green = rgb565(48, 209, 88);
+    const uint16_t red = rgb565(255, 69, 58);
+    const uint16_t ring = success ? green :
+        (feedback ? red : (ready ? green : rgb565(92, 92, 98)));
+
+    for (int py = 0; py < LCD_HEIGHT; ++py) {
+        uint16_t *line = s_lcd_canvas + (size_t)py * LCD_WIDTH;
+        for (int px = 0; px < LCD_WIDTH; ++px) {
+            const int dx = px - LCD_WIDTH / 2;
+            const int dy = py - LCD_HEIGHT / 2;
+            line[px] = dx * dx + dy * dy <= 230 * 230 ? black : 0;
+        }
+    }
+    skyorb_line(84, 62, 70, 76, white, 255);
+    skyorb_line(70, 76, 84, 90, white, 255);
+    skyorb_text("CAMERA", 176, 48, &lv_font_montserrat_18, white);
+    skyorb_text(ready ? "PHONE CONNECTED" : "PHONE NOT CONNECTED",
+                ready ? 153 : 132, 105, &lv_font_montserrat_14,
+                ready ? green : secondary);
+
+    const int button_y = 255;
+    const int radius = pressed ? 72 : 82;
+    skyorb_circle_dot(LCD_WIDTH / 2, button_y, radius + 12, ring);
+    skyorb_circle_dot(LCD_WIDTH / 2, button_y, radius + 5,
+                      flash ? white : rgb565(24, 25, 31));
+    skyorb_circle_dot(LCD_WIDTH / 2, button_y, radius,
+                      flash ? rgb565(220, 255, 229) : rgb565(46, 48, 57));
+    /* Camera glyph. */
+    fill_canvas_round_rect(194, button_y - 24, 281, button_y + 31, 12,
+                           flash ? rgb565(35, 45, 38) : white, NULL);
+    fill_canvas_round_rect(215, button_y - 35, 260, button_y - 18, 7,
+                           flash ? rgb565(35, 45, 38) : white, NULL);
+    skyorb_circle_dot(LCD_WIDTH / 2, button_y + 3, 19,
+                      flash ? white : rgb565(46, 48, 57));
+    skyorb_circle_dot(LCD_WIDTH / 2, button_y + 3, 11,
+                      flash ? green : rgb565(20, 22, 28));
+
+    const char *message = feedback ?
+        (success ? "CAPTURED" : "NOT CONNECTED") : "TAP TO CAPTURE";
+    skyorb_text(message, success ? 181 : (feedback ? 153 : 164), 375,
+                 &lv_font_montserrat_18,
+                 feedback ? (success ? green : red) : white);
+    skyorb_text("The ring shows the phone link", 124, 408,
+                 &lv_font_montserrat_14, secondary);
+
+    const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
+    (void)flush_canvas_rect(&full);
+    s_camera_dirty = false;
+    s_camera_last_frame = now;
+}
+
 static void settings_enter(void)
 {
     s_ui_screen = UI_SCREEN_SETTINGS;
@@ -7984,19 +8806,7 @@ static void settings_handle_touch(int x, int y)
         ESP_LOGI(TAG, "Settings: Bluetooth %s", ble_pacon_is_enabled() ? "enabled" : "disabled");
         return;
     }
-    if (content_y >= 235 && content_y <= 282 && !s_settings_touch_dragging) {
-        const esp_err_t shutter_err = ble_pacon_camera_shutter();
-        if (shutter_err == ESP_OK) {
-            ESP_LOGI(TAG, "Settings: camera shutter requested");
-        } else {
-            ESP_LOGW(TAG, "Settings: camera shutter unavailable (%s)",
-                     esp_err_to_name(shutter_err));
-        }
-        s_device_settings_dirty = true;
-        block_touch_until_release();
-        return;
-    }
-    if (content_y >= 360 && content_y <= 420 && !s_settings_touch_dragging) {
+    if (content_y >= 314 && content_y <= 374 && !s_settings_touch_dragging) {
         const int slider = clamp_int(x, 92, 382);
         s_user_brightness = (uint8_t)(SETTINGS_BRIGHTNESS_MIN +
             ((slider - 92) * (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)) / 290);
@@ -8386,60 +9196,167 @@ static void render_usb_disk_frame(void)
     s_usb_disk_dirty = false;
 }
 
-static void render_fluid_settings_frame(void)
+/* Both controls pages use the existing native canvas + double DMA stripes.
+ * Keep full-width bands for the panel's verified QSPI addressing behaviour. */
+static void fluid_controls_render_band(int y1, int y2, bool picker)
 {
-    if (s_lcd_panel == NULL || s_lcd_stripe == NULL || s_lcd_done == NULL) {
-        return;
+    for (int y = y1; y < y2; ++y) {
+        for (int x = 0; x < LCD_WIDTH; ++x) {
+            s_lcd_canvas[(size_t)y * LCD_WIDTH + x] = picker ?
+                fluid_colour_picker_pixel(x, y) : fluid_settings_pixel(x, y);
+        }
     }
+}
 
-    for (int stripe_y = 0; stripe_y < LCD_HEIGHT; stripe_y += LCD_STRIPE_LINES) {
-        int stripe_end = clamp_int(stripe_y + LCD_STRIPE_LINES, 0, LCD_HEIGHT);
-        for (int y = stripe_y; y < stripe_end; ++y) {
-            uint16_t *line = s_lcd_stripe + (size_t)(y - stripe_y) * LCD_WIDTH;
-            for (int x = 0; x < LCD_WIDTH; ++x) {
-                line[x] = rgb565_for_sh8601(fluid_settings_pixel(x, y));
+static size_t s_fluid_controls_transfer_pixels;
+
+static bool fluid_controls_flush_band(int y1, int y2)
+{
+    const dirty_rect_t rect = {.x1 = 0, .y1 = y1, .x2 = LCD_WIDTH, .y2 = y2};
+    s_fluid_controls_transfer_pixels += (size_t)LCD_WIDTH * (y2 - y1);
+    return flush_canvas_rect(&rect);
+}
+
+static void fluid_colour_restore_marker(int cx, int cy)
+{
+    for (int y = cy - 6; y <= cy + 6; ++y) {
+        for (int x = cx - 6; x <= cx + 6; ++x) {
+            s_lcd_canvas[(size_t)y * LCD_WIDTH + x] = fluid_colour_picker_pixel(x, y);
+        }
+    }
+}
+
+static void fluid_colour_draw_marker(int cx, int cy)
+{
+    for (int y = cy - 6; y <= cy + 6; ++y) {
+        for (int x = cx - 6; x <= cx + 6; ++x) {
+            const int dx = x - cx;
+            const int dy = y - cy;
+            const int d2 = dx * dx + dy * dy;
+            /* Match the original wheel clip, including the outermost pixel. */
+            const int wx = x - LCD_WIDTH / 2;
+            const int wy = y - 270;
+            if (d2 <= 36 && wx * wx + wy * wy <= 150 * 150) {
+                s_lcd_canvas[(size_t)y * LCD_WIDTH + x] = d2 >= 16 ?
+                    rgb565(246, 252, 255) : rgb565(2, 9, 20);
             }
         }
-        esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, stripe_y,
-                                                   LCD_WIDTH, stripe_end, s_lcd_stripe);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Fluid settings transfer failed: %s", esp_err_to_name(err));
-            return;
-        }
-        if (xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(250)) != pdTRUE) {
-            ESP_LOGE(TAG, "Fluid settings DMA completion timed out");
-            return;
-        }
     }
+}
+
+static void fluid_controls_record_frame(int64_t started, int64_t drawn)
+{
+    const int64_t done = esp_timer_get_time();
+    s_fluid_ui_perf.draw_us += drawn - started;
+    s_fluid_ui_perf.transfer_us += done - drawn;
+    s_fluid_ui_perf.pixels += s_fluid_controls_transfer_pixels;
+    ++s_fluid_ui_perf.frames;
+    if (s_fluid_controls_input_us != 0) {
+        const uint32_t elapsed = (uint32_t)(done - s_fluid_controls_input_us);
+        s_fluid_ui_perf.feedback_us += elapsed;
+        ++s_fluid_ui_perf.feedbacks;
+        if (elapsed > s_fluid_ui_perf.max_feedback_us)
+            s_fluid_ui_perf.max_feedback_us = elapsed;
+        s_fluid_controls_input_us = 0;
+    }
+}
+
+static void fluid_controls_report_perf(void)
+{
+    const int64_t now = esp_timer_get_time();
+    if (now < s_fluid_ui_perf.report_us) return;
+    if (s_fluid_ui_perf.frames || s_fluid_ui_perf.saves) {
+        const double frames = s_fluid_ui_perf.frames ? s_fluid_ui_perf.frames : 1;
+        const double feedbacks = s_fluid_ui_perf.feedbacks ? s_fluid_ui_perf.feedbacks : 1;
+        const double saves = s_fluid_ui_perf.saves ? s_fluid_ui_perf.saves : 1;
+        ESP_LOGI(TAG, "[FLUID-UI-PERF] frames=%lu draw=%.2fms transfer=%.2fms pixels=%.0f "
+                 "feedback=%.2fms max=%.2fms saves=%lu save=%.2fms pending=%d",
+                 (unsigned long)s_fluid_ui_perf.frames,
+                 s_fluid_ui_perf.draw_us / frames / 1000.0,
+                 s_fluid_ui_perf.transfer_us / frames / 1000.0,
+                 s_fluid_ui_perf.pixels / frames,
+                 s_fluid_ui_perf.feedback_us / feedbacks / 1000.0,
+                 s_fluid_ui_perf.max_feedback_us / 1000.0,
+                 (unsigned long)s_fluid_ui_perf.saves,
+                 s_fluid_ui_perf.save_us / saves / 1000.0,
+                 s_fluid_preferences_pending);
+        memset(&s_fluid_ui_perf, 0, sizeof(s_fluid_ui_perf));
+    }
+    s_fluid_ui_perf.report_us = now + 2000000;
+}
+
+static void render_fluid_settings_frame(void)
+{
+    if (s_lcd_canvas == NULL) return;
+    const int64_t started = esp_timer_get_time();
+    const bool full = s_fluid_controls_canvas_screen != UI_SCREEN_FLUID_SETTINGS;
+    const int old_shape = s_fluid_settings_drawn_shape;
+    const int new_shape = (int)s_fluid_shape;
+    s_fluid_controls_transfer_pixels = 0;
+    if (full) {
+        fluid_controls_render_band(0, LCD_HEIGHT, false);
+    } else if (old_shape != new_shape) {
+        fluid_controls_render_band(112 + old_shape * 70, 172 + old_shape * 70, false);
+        fluid_controls_render_band(112 + new_shape * 70, 172 + new_shape * 70, false);
+    }
+    const int64_t drawn = esp_timer_get_time();
+    bool ok = true;
+    if (full) {
+        ok = fluid_controls_flush_band(0, LCD_HEIGHT);
+    } else if (old_shape != new_shape) {
+        ok = fluid_controls_flush_band(112 + old_shape * 70, 172 + old_shape * 70);
+        if (ok) ok = fluid_controls_flush_band(112 + new_shape * 70, 172 + new_shape * 70);
+    }
+    if (!ok) {
+        s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+        return;
+    }
+    s_fluid_settings_drawn_shape = new_shape;
+    s_fluid_controls_canvas_screen = UI_SCREEN_FLUID_SETTINGS;
     s_settings_dirty = false;
+    fluid_controls_record_frame(started, drawn);
 }
 
 static void render_fluid_colour_picker_frame(void)
 {
-    if (s_lcd_panel == NULL || s_lcd_stripe == NULL || s_lcd_done == NULL) {
+    if (s_lcd_canvas == NULL) return;
+    const int64_t started = esp_timer_get_time();
+    fluid_colour_prepare_cache();
+    const bool full = s_fluid_controls_canvas_screen != UI_SCREEN_COLOUR_PICKER;
+    const float angle = s_colour_hue * 6.283185307f;
+    const int cx = LCD_WIDTH / 2 + (int)(cosf(angle) * s_colour_saturation * 144.0f);
+    const int cy = 270 + (int)(sinf(angle) * s_colour_saturation * 144.0f);
+    const int old_y = s_colour_marker_drawn_y;
+    const bool moved = cx != s_colour_marker_drawn_x || cy != old_y;
+    s_fluid_controls_transfer_pixels = 0;
+    if (full) {
+        fluid_controls_render_band(0, LCD_HEIGHT, true);
+    } else if (moved) {
+        fluid_colour_restore_marker(s_colour_marker_drawn_x, old_y);
+    }
+    if (full || moved) fluid_colour_draw_marker(cx, cy);
+    const int64_t drawn = esp_timer_get_time();
+    bool ok = true;
+    if (full) {
+        ok = fluid_controls_flush_band(0, LCD_HEIGHT);
+    } else if (moved) {
+        if (abs(cy - old_y) <= 13) {
+            ok = fluid_controls_flush_band((cy < old_y ? cy : old_y) - 6,
+                                           (cy > old_y ? cy : old_y) + 7);
+        } else {
+            ok = fluid_controls_flush_band(old_y - 6, old_y + 7);
+            if (ok) ok = fluid_controls_flush_band(cy - 6, cy + 7);
+        }
+    }
+    if (!ok) {
+        s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
         return;
     }
-
-    for (int stripe_y = 0; stripe_y < LCD_HEIGHT; stripe_y += LCD_STRIPE_LINES) {
-        int stripe_end = clamp_int(stripe_y + LCD_STRIPE_LINES, 0, LCD_HEIGHT);
-        for (int y = stripe_y; y < stripe_end; ++y) {
-            uint16_t *line = s_lcd_stripe + (size_t)(y - stripe_y) * LCD_WIDTH;
-            for (int x = 0; x < LCD_WIDTH; ++x) {
-                line[x] = rgb565_for_sh8601(fluid_colour_picker_pixel(x, y));
-            }
-        }
-        esp_err_t err = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, stripe_y,
-                                                   LCD_WIDTH, stripe_end, s_lcd_stripe);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Colour palette transfer failed: %s", esp_err_to_name(err));
-            return;
-        }
-        if (xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(250)) != pdTRUE) {
-            ESP_LOGE(TAG, "Colour palette DMA completion timed out");
-            return;
-        }
-    }
+    s_colour_marker_drawn_x = cx;
+    s_colour_marker_drawn_y = cy;
+    s_fluid_controls_canvas_screen = UI_SCREEN_COLOUR_PICKER;
     s_colour_picker_dirty = false;
+    fluid_controls_record_frame(started, drawn);
 }
 
 static void render_ouo_frame(void)
@@ -8449,6 +9366,10 @@ static void render_ouo_frame(void)
         return;
     }
 
+    const int64_t render_start_us = esp_timer_get_time();
+    const bool idle_fast = s_ouo_idle_visible && s_ouo_idle_tiles != NULL &&
+                           s_ouo_auto_expressions && !s_ouo_touch_active &&
+                           s_ouo_expression == OUO_EXPRESSION_IDLE;
     /* This panel is reliable with full-width QSPI transfers.  The previous
      * implementation sent every one of its 221,350 pixels even though OuO
      * changes only its central face.  Keep the safe full-width window but
@@ -8465,23 +9386,40 @@ static void render_ouo_frame(void)
     } else {
         clear_canvas_rect(&dirty);
     }
-    for (int y = dirty.y1; y < dirty.y2; ++y) {
-        uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
-        for (int x = 0; x < LCD_WIDTH; ++x) {
-            line[x] = ouo_pixel(x, y);
+    if (idle_fast) {
+        ouo_blit_idle_tiles(&dirty);
+    } else {
+        for (int y = dirty.y1; y < dirty.y2; ++y) {
+            uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
+            for (int x = 0; x < LCD_WIDTH; ++x) {
+                line[x] = ouo_pixel(x, y);
+            }
         }
     }
-    const int64_t render_start_us = esp_timer_get_time();
+    const int64_t flush_start_us = esp_timer_get_time();
     if (flush_canvas_rect(&dirty)) {
-        const int64_t elapsed_us = esp_timer_get_time() - render_start_us;
+        const int64_t render_end_us = esp_timer_get_time();
+        const int64_t elapsed_us = render_end_us - render_start_us;
         s_ouo_render_total_us += elapsed_us;
+        s_ouo_paint_window_us += flush_start_us - render_start_us;
+        s_ouo_flush_window_us += render_end_us - flush_start_us;
+        s_ouo_work_window_us += elapsed_us + s_ouo_update_last_us;
+        s_ouo_decode_window_us += s_ouo_decode_last_us;
         ++s_ouo_render_frames;
         if ((s_ouo_render_frames % 20U) == 0U) {
-            ESP_LOGI(TAG, "[0u0-PERF] frames=%lu avg render=%lldus region=%d px (%d%%)",
+            ESP_LOGI(TAG, "[0u0-PERF] frames=%lu avg render=%lldus draw=%lldus flush=%lldus work=%lldus decode=%lldus idle=%d region=%d px (%d%%)",
                      (unsigned long)s_ouo_render_frames,
                      (long long)(s_ouo_render_total_us / s_ouo_render_frames),
+                     (long long)(s_ouo_paint_window_us / 20),
+                     (long long)(s_ouo_flush_window_us / 20),
+                     (long long)(s_ouo_work_window_us / 20),
+                     (long long)(s_ouo_decode_window_us / 20), idle_fast,
                      LCD_WIDTH * (dirty.y2 - dirty.y1),
                      100 * (dirty.y2 - dirty.y1) / LCD_HEIGHT);
+            s_ouo_paint_window_us = 0;
+            s_ouo_flush_window_us = 0;
+            s_ouo_work_window_us = 0;
+            s_ouo_decode_window_us = 0;
         }
         s_ouo_canvas_valid = true;
         s_ouo_dirty = false;
@@ -8531,7 +9469,6 @@ static void render_frame(void)
         dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
         memset(s_lcd_canvas, 0, LCD_FRAME_BYTES);
         render_fluid_shape_into_canvas(NULL);
-        render_home_control_into_canvas(NULL);
         if (flush_canvas_rect(&full)) {
             sync_drawn_particle_positions();
             s_fluid_canvas_valid = true;
@@ -8569,7 +9506,6 @@ static void render_frame(void)
 
     clear_canvas_rect(&dirty);
     render_fluid_shape_into_canvas(&dirty);
-    render_home_control_into_canvas(&dirty);
     if (flush_canvas_rect(&dirty)) {
         sync_drawn_particle_positions();
         s_fluid_transfer_pixels = (size_t)(dirty.x2 - dirty.x1) *
@@ -8595,6 +9531,7 @@ void app_main(void)
      * internal-DMA stripes for the SH8601. */
     settings_load_preferences();
     clock_load_preferences();
+    feature_load_preferences();
 
     /* Bring up the shared I2C bus and PMIC first.  The panel power gate stays
      * low until init_lcd(), so its OLED matrix cannot light during rail setup. */
@@ -8619,6 +9556,8 @@ void app_main(void)
     }
     /* Start the phone control channel after the display's internal DMA
      * allocations so BLE cannot starve the SH8601 panel setup. */
+    s_ble_ui_requests = xQueueCreate(1, sizeof(ui_screen_t));
+    if (s_ble_ui_requests == NULL) ESP_LOGE(TAG, "BLE UI request queue allocation failed");
     ble_pacon_set_command_handler(fluid_ble_command);
     ble_pacon_set_binary_handler(fluid_ble_media_binary);
     ble_pacon_init();
@@ -8628,6 +9567,16 @@ void app_main(void)
     init_sd_nand_read_only_probe();
     if (!init_home_external_media()) {
         ESP_LOGW(TAG, "Media: NAND assets unavailable; continuing with Miku-teal fallback");
+    }
+
+    /* Restore network intent only after LCD DMA, BLE and media allocations.
+     * Never persist live link state or open USB storage automatically. */
+    skyorb_load_config();
+    if (pacon_load_switch("wifi_on", false)) {
+        skyorb_start_network_task();
+        if (pacon_load_switch("wifi_join", false) && s_skyorb_config.wifi_valid) {
+            (void)wifi_request_profile_connection(s_skyorb_config.wifi_selected);
+        }
     }
 
     TickType_t last_frame = xTaskGetTickCount();
@@ -8644,6 +9593,12 @@ void app_main(void)
     while (true) {
         TickType_t now = xTaskGetTickCount();
         apply_ble_brightness_if_pending();
+        apply_ble_ui_request();
+        if (s_ui_screen != UI_SCREEN_FLUID_SETTINGS && s_ui_screen != UI_SCREEN_COLOUR_PICKER) {
+            s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+            s_colour_dragging = false;
+            s_fluid_controls_input_us = 0;
+        }
         clock_service(now);
         apply_home_media_rescan_if_pending();
         home_update_burnin_offsets(now);
@@ -8703,8 +9658,10 @@ void app_main(void)
                 render_fluid_colour_picker_frame();
             }
         } else if (s_ui_screen == UI_SCREEN_OUO) {
+            const int64_t update_start_us = esp_timer_get_time();
             poll_touch();
             step_ouo();
+            s_ouo_update_last_us = esp_timer_get_time() - update_start_us;
             if (s_ui_screen == UI_SCREEN_OUO && s_ouo_dirty) {
                 render_ouo_frame();
             }
@@ -8734,6 +9691,17 @@ void app_main(void)
                 s_watch_last_frame = now;
                 watch_render_frame();
             }
+        } else if (s_ui_screen == UI_SCREEN_CAMERA) {
+            poll_touch();
+            now = xTaskGetTickCount();
+            const bool feedback_active = s_camera_feedback_until != 0 &&
+                (int32_t)(s_camera_feedback_until - now) > 0;
+            if (s_ui_screen == UI_SCREEN_CAMERA &&
+                (s_camera_dirty || feedback_active || s_camera_last_frame == 0 ||
+                 (int32_t)(now - s_camera_last_frame) >= pdMS_TO_TICKS(250))) {
+                camera_render_frame();
+            }
+            vTaskDelay(pdMS_TO_TICKS(feedback_active ? 35 : 80));
         } else if (s_ui_screen == UI_SCREEN_SETTINGS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_SETTINGS && s_device_settings_dirty) {
@@ -8757,18 +9725,6 @@ void app_main(void)
             physics_total_us += esp_timer_get_time() - physics_start_us;
 
             now = xTaskGetTickCount();
-            if (s_fluid_controls_visible && s_last_fluid_interaction != 0 &&
-                (int32_t)(now - s_last_fluid_interaction) >=
-                    (int32_t)pdMS_TO_TICKS(FLUID_CONTROL_TIMEOUT_MS)) {
-                s_fluid_controls_visible = false;
-                /* The controls are part of the persistent canvas.  A single
-                 * full paint cleanly removes them without unsafe narrow-QSPI
-                 * windows or residual pixels. */
-                s_fluid_canvas_valid = false;
-                ESP_LOGI(TAG, "Fluid controls: hidden after %d ms idle",
-                         FLUID_CONTROL_TIMEOUT_MS);
-            }
-
             int64_t render_start_us = esp_timer_get_time();
             render_frame();
             render_total_us += esp_timer_get_time() - render_start_us;
@@ -8791,11 +9747,18 @@ void app_main(void)
             }
         }
 
+        fluid_service_preferences();
+        fluid_controls_report_perf();
         now = xTaskGetTickCount();
         if (s_axp2101_ready && (int32_t)(now - next_pmic_status) >= 0) {
             log_axp2101_charge_status();
             next_pmic_status += pdMS_TO_TICKS(PMIC_STATUS_PERIOD_MS);
         }
-        vTaskDelayUntil(&last_frame, pdMS_TO_TICKS(FRAME_PERIOD_MS));
+        /* OuO's animated eyes need the previewer's ~60 FPS cadence.  Keep the
+         * heavier Fluid/home loop at its original 30 ms period. */
+        const uint32_t frame_period_ms = (s_ui_screen == UI_SCREEN_OUO ||
+            s_ui_screen == UI_SCREEN_FLUID_SETTINGS || s_ui_screen == UI_SCREEN_COLOUR_PICKER) ?
+                                         OUO_FRAME_PERIOD_MS : FRAME_PERIOD_MS;
+        vTaskDelayUntil(&last_frame, pdMS_TO_TICKS(frame_period_ms));
     }
 }

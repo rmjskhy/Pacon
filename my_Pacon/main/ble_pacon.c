@@ -1,4 +1,5 @@
 #include "ble_pacon.h"
+#include "pacon_preferences.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,6 +19,9 @@
 #include "freertos/task.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+
+/* NimBLE's persistent peer-store helper is provided by the host component. */
+void ble_store_config_init(void);
 
 static const char *TAG = "PACON_BLE";
 
@@ -73,7 +77,10 @@ static uint8_t s_hid_protocol_mode = 0x01;
 static uint8_t s_hid_control_point;
 static uint8_t s_hid_report_value;
 static uint16_t s_hid_report_value_handle;
-static TaskHandle_t s_camera_shutter_task;
+static bool s_hid_notify_handles[2];
+static struct ble_npl_event s_camera_shutter_event;
+static struct ble_npl_callout s_camera_release_callout;
+/* Legacy diagnostic flag: RAM-only, enabled on every boot. */
 static bool s_camera_remote_enabled = true;
 
 enum {
@@ -86,7 +93,10 @@ enum {
 };
 
 static uint16_t s_response_value_handle;
-static uint16_t s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+#define PACON_MAX_CONNECTIONS 2
+static uint16_t s_connection_handles[PACON_MAX_CONNECTIONS] = {
+    BLE_HS_CONN_HANDLE_NONE, BLE_HS_CONN_HANDLE_NONE,
+};
 static uint8_t s_own_addr_type;
 static bool s_enabled = true;
 static bool s_synced;
@@ -104,6 +114,41 @@ static uint8_t s_binary_data[512];
 static char s_binary_response[96];
 
 static void ble_start_advertising(void);
+
+static int connection_slot(uint16_t conn_handle)
+{
+    for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+        if (s_connection_handles[index] == conn_handle) return index;
+    }
+    return -1;
+}
+
+static int free_connection_slot(void)
+{
+    for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+        if (s_connection_handles[index] == BLE_HS_CONN_HANDLE_NONE) return index;
+    }
+    return -1;
+}
+
+static bool any_connection(void)
+{
+    for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+        if (s_connection_handles[index] != BLE_HS_CONN_HANDLE_NONE) return true;
+    }
+    return false;
+}
+
+static bool any_hid_notification(void)
+{
+    for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+        if (s_connection_handles[index] != BLE_HS_CONN_HANDLE_NONE &&
+            s_hid_notify_handles[index]) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static int hid_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                          struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -179,19 +224,19 @@ static const struct ble_gatt_chr_def s_hid_characteristics[] = {
         .uuid = &s_hid_info_uuid.u,
         .access_cb = hid_access_cb,
         .arg = (void *)(uintptr_t)HID_ATTR_INFO,
-        .flags = BLE_GATT_CHR_F_READ,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
     },
     {
         .uuid = &s_hid_report_map_uuid.u,
         .access_cb = hid_access_cb,
         .arg = (void *)(uintptr_t)HID_ATTR_REPORT_MAP,
-        .flags = BLE_GATT_CHR_F_READ,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
     },
     {
         .uuid = &s_hid_control_point_uuid.u,
         .access_cb = hid_access_cb,
         .arg = (void *)(uintptr_t)HID_ATTR_CONTROL_POINT,
-        .flags = BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC,
     },
     {
         .uuid = &s_hid_report_uuid.u,
@@ -199,51 +244,65 @@ static const struct ble_gatt_chr_def s_hid_characteristics[] = {
         .arg = (void *)(uintptr_t)HID_ATTR_REPORT,
         .val_handle = &s_hid_report_value_handle,
         .descriptors = (struct ble_gatt_dsc_def *)s_hid_report_descriptors,
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY |
+                 BLE_GATT_CHR_F_READ_ENC,
     },
     {
         .uuid = &s_hid_protocol_mode_uuid.u,
         .access_cb = hid_access_cb,
         .arg = (void *)(uintptr_t)HID_ATTR_PROTOCOL_MODE,
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP |
+                 BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_ENC,
     },
     { 0 },
 };
 
 static esp_err_t hid_notify_report(uint8_t value)
 {
-    if (s_connection_handle == BLE_HS_CONN_HANDLE_NONE ||
-        s_hid_report_value_handle == 0U) {
+    if (s_hid_report_value_handle == 0U) {
         return ESP_ERR_INVALID_STATE;
     }
     s_hid_report_value = value;
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(&s_hid_report_value, 1);
-    if (om == NULL) return ESP_ERR_NO_MEM;
-    const int rc = ble_gatts_notify_custom(s_connection_handle,
-                                           s_hid_report_value_handle, om);
-    /* ble_gatts_notify_custom() consumes om on every outcome. */
-    if (rc != 0) {
-        ESP_LOGW(TAG, "camera HID report=%u failed rc=%d", (unsigned)value, rc);
-        return ESP_FAIL;
-    }
-    return ESP_OK;
-}
-
-static void camera_shutter_task(void *argument)
-{
-    (void)argument;
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        if (!s_camera_remote_enabled ||
-            s_connection_handle == BLE_HS_CONN_HANDLE_NONE) {
+    bool sent = false;
+    for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+        if (s_connection_handles[index] == BLE_HS_CONN_HANDLE_NONE ||
+            !s_hid_notify_handles[index]) {
             continue;
         }
-        if (hid_notify_report(0x01) == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(35));
-            if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
-                (void)hid_notify_report(0x00);
-            }
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(&s_hid_report_value, 1);
+        if (om == NULL) return sent ? ESP_OK : ESP_ERR_NO_MEM;
+        const int rc = ble_gatts_notify_custom(s_connection_handles[index],
+                                                s_hid_report_value_handle, om);
+        /* ble_gatts_notify_custom() consumes om on every outcome. */
+        if (rc != 0) {
+            ESP_LOGW(TAG, "camera HID report=%u conn=%u failed rc=%d",
+                     (unsigned)value, (unsigned)s_connection_handles[index], rc);
+        } else {
+            sent = true;
         }
+    }
+    return sent ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+static void camera_release_event(struct ble_npl_event *event)
+{
+    (void)event;
+    if (any_hid_notification()) {
+        (void)hid_notify_report(0x00);
+    }
+}
+
+static void camera_shutter_event(struct ble_npl_event *event)
+{
+    (void)event;
+    if (!s_camera_remote_enabled || !any_hid_notification()) return;
+    if (hid_notify_report(0x01) == ESP_OK) {
+        /* Both press and release execute on NimBLE's event queue.  Calling
+         * ble_gatts_notify_custom() from a separate FreeRTOS task can race a
+         * response notification in the GATT callback and corrupt the host's
+         * mbuf / heap state. */
+        (void)ble_npl_callout_reset(&s_camera_release_callout,
+                                    ble_npl_time_ms_to_ticks32(35));
     }
 }
 
@@ -253,14 +312,14 @@ static int append_text(struct os_mbuf *om, const char *text)
            BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
-static void notify_response(const char *response)
+static void notify_response(uint16_t conn_handle, const char *response)
 {
     if (response == NULL || response[0] == '\0' ||
-        s_connection_handle == BLE_HS_CONN_HANDLE_NONE ||
+        connection_slot(conn_handle) < 0 ||
         s_response_value_handle == 0U) {
         return;
     }
-    const uint16_t mtu = ble_att_mtu(s_connection_handle);
+    const uint16_t mtu = ble_att_mtu(conn_handle);
     const size_t max_payload = mtu > 3U ? (size_t)mtu - 3U : 20U;
     const size_t response_length = strlen(response);
     char size_error[72];
@@ -276,7 +335,7 @@ static void notify_response(const char *response)
     }
     struct os_mbuf *om = ble_hs_mbuf_from_flat(payload, strlen(payload));
     if (om == NULL) return;
-    const int rc = ble_gatts_notify_custom(s_connection_handle,
+    const int rc = ble_gatts_notify_custom(conn_handle,
                                            s_response_value_handle, om);
     /* ble_gatts_notify_custom() consumes om on every outcome. */
     if (rc != 0) {
@@ -318,7 +377,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             snprintf(s_command_response, sizeof(s_command_response), "RX %u bytes: %s\r\n",
                      (unsigned)copy_length, (char *)s_command_data);
         }
-        notify_response(s_command_response);
+        notify_response(conn_handle, s_command_response);
         return 0;
     }
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR && kind == 4U) {
@@ -330,7 +389,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         memset(s_binary_response, 0, sizeof(s_binary_response));
         if (s_binary_handler == NULL) {
             snprintf(s_binary_response, sizeof(s_binary_response), "ERR binary media unavailable\r\n");
-            notify_response(s_binary_response);
+            notify_response(conn_handle, s_binary_response);
             return BLE_ATT_ERR_UNLIKELY;
         }
         const esp_err_t handler_err = s_binary_handler(s_binary_data, length,
@@ -339,7 +398,7 @@ static int gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
             snprintf(s_binary_response, sizeof(s_binary_response), "ERR %s\r\n",
                      esp_err_to_name(handler_err));
         }
-        notify_response(s_binary_response);
+        notify_response(conn_handle, s_binary_response);
         return 0;
     }
     return BLE_ATT_ERR_UNLIKELY;
@@ -387,8 +446,19 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            s_connection_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "CONNECTED conn=%u", (unsigned)s_connection_handle);
+            const int slot = free_connection_slot();
+            if (slot < 0) {
+                ESP_LOGW(TAG, "rejecting extra connection conn=%u",
+                         (unsigned)event->connect.conn_handle);
+                (void)ble_gap_terminate(event->connect.conn_handle,
+                                         BLE_ERR_CONN_LIMIT);
+                return 0;
+            }
+            s_connection_handles[slot] = event->connect.conn_handle;
+            s_hid_notify_handles[slot] = false;
+            ESP_LOGI(TAG, "CONNECTED conn=%u slot=%d",
+                     (unsigned)event->connect.conn_handle, slot);
+            if (s_enabled) ble_start_advertising();
         } else if (s_enabled) {
             ble_start_advertising();
         }
@@ -397,8 +467,27 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         ESP_LOGW(TAG, "DISCONNECTED conn=%u reason=0x%02X",
                  (unsigned)event->disconnect.conn.conn_handle,
                  (unsigned)event->disconnect.reason);
-        s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
+        const int slot = connection_slot(event->disconnect.conn.conn_handle);
+        if (slot >= 0) {
+            s_connection_handles[slot] = BLE_HS_CONN_HANDLE_NONE;
+            s_hid_notify_handles[slot] = false;
+        }
         if (s_enabled) ble_start_advertising();
+        return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE: {
+        const int slot = connection_slot(event->subscribe.conn_handle);
+        if (slot >= 0 && event->subscribe.attr_handle == s_hid_report_value_handle) {
+            s_hid_notify_handles[slot] = event->subscribe.cur_notify != 0;
+            ESP_LOGI(TAG, "camera HID notify conn=%u %s",
+                     (unsigned)event->subscribe.conn_handle,
+                     s_hid_notify_handles[slot] ? "enabled" : "disabled");
+        }
+        return 0;
+    }
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        ESP_LOGI(TAG, "SECURITY conn=%u status=%d",
+                 (unsigned)event->enc_change.conn_handle,
+                 event->enc_change.status);
         return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         if (s_enabled) ble_start_advertising();
@@ -410,7 +499,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
 static void ble_start_advertising(void)
 {
-    if (!s_synced || !s_enabled) return;
+    if (!s_synced || !s_enabled || free_connection_slot() < 0) return;
     struct ble_hs_adv_fields fields = {0};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.name = (const uint8_t *)"PACON-BLE-TEST";
@@ -469,36 +558,48 @@ static void ble_host_task(void *param)
 void ble_pacon_init(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        (void)nvs_flash_erase();
-        err = nvs_flash_init();
-    }
+    /* Do not erase user settings and pairing records to recover an NVS error. */
     if (err != ESP_OK && err != ESP_ERR_NVS_INVALID_STATE) {
         ESP_LOGE(TAG, "NVS init rc=%s", esp_err_to_name(err));
         return;
     }
+    s_enabled = pacon_load_switch("ble_on", true);
     ESP_ERROR_CHECK(nimble_port_init());
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set("PACON-BLE-TEST");
     ble_hs_cfg.sync_cb = ble_on_sync;
+    /* HOGP requires the HID service to run over an encrypted, bondable link.
+     * No-input/no-output gives Android's normal Just Works pairing flow. */
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                 BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC |
+                                   BLE_SM_PAIR_KEY_DIST_ID;
+    ble_store_config_init();
     int rc = ble_gatts_count_cfg(s_services);
     ESP_ERROR_CHECK(rc == 0 ? ESP_OK : ESP_FAIL);
     rc = ble_gatts_add_svcs(s_services);
     ESP_ERROR_CHECK(rc == 0 ? ESP_OK : ESP_FAIL);
-    if (xTaskCreate(camera_shutter_task, "camera_hid", 3072, NULL, 4,
-                    &s_camera_shutter_task) != pdPASS) {
-        s_camera_shutter_task = NULL;
-        ESP_LOGE(TAG, "camera HID task allocation failed");
-    }
+    ble_npl_event_init(&s_camera_shutter_event, camera_shutter_event, NULL);
+    ble_npl_callout_init(&s_camera_release_callout,
+                         nimble_port_get_dflt_eventq(),
+                         camera_release_event, NULL);
     ESP_LOGI(TAG, "BLE ready; scan for PACON-BLE-TEST");
     nimble_port_freertos_init(ble_host_task);
 }
 
 bool ble_pacon_is_enabled(void) { return s_enabled; }
-bool ble_pacon_is_connected(void) { return s_connection_handle != BLE_HS_CONN_HANDLE_NONE; }
+bool ble_pacon_is_connected(void) { return any_connection(); }
 
 bool ble_pacon_is_camera_remote_enabled(void) { return s_camera_remote_enabled; }
+bool ble_pacon_is_camera_remote_ready(void)
+{
+    return s_camera_remote_enabled && any_hid_notification();
+}
 
 esp_err_t ble_pacon_set_camera_remote_enabled(bool enabled)
 {
@@ -509,11 +610,11 @@ esp_err_t ble_pacon_set_camera_remote_enabled(bool enabled)
 esp_err_t ble_pacon_camera_shutter(void)
 {
     if (!s_camera_remote_enabled) return ESP_ERR_INVALID_STATE;
-    if (s_connection_handle == BLE_HS_CONN_HANDLE_NONE ||
-        s_camera_shutter_task == NULL) {
+    if (!any_hid_notification()) {
         return ESP_ERR_INVALID_STATE;
     }
-    xTaskNotifyGive(s_camera_shutter_task);
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(),
+                       &s_camera_shutter_event);
     return ESP_OK;
 }
 
@@ -530,16 +631,20 @@ void ble_pacon_set_binary_handler(ble_pacon_binary_handler_t handler)
 esp_err_t ble_pacon_set_enabled(bool enabled)
 {
     s_enabled = enabled;
-    if (!s_synced) return ESP_OK;
+    const esp_err_t saved = pacon_save_switch("ble_on", enabled);
+    if (!s_synced) return saved;
     if (!enabled) {
-        if (s_connection_handle != BLE_HS_CONN_HANDLE_NONE) {
-            (void)ble_gap_terminate(s_connection_handle,
-                                     BLE_ERR_REM_USER_CONN_TERM);
+        for (int index = 0; index < PACON_MAX_CONNECTIONS; index++) {
+            if (s_connection_handles[index] != BLE_HS_CONN_HANDLE_NONE) {
+                (void)ble_gap_terminate(s_connection_handles[index],
+                                         BLE_ERR_REM_USER_CONN_TERM);
+                s_connection_handles[index] = BLE_HS_CONN_HANDLE_NONE;
+                s_hid_notify_handles[index] = false;
+            }
         }
-        s_connection_handle = BLE_HS_CONN_HANDLE_NONE;
         const int rc = ble_gap_adv_stop();
-        return (rc == 0 || rc == BLE_HS_EALREADY) ? ESP_OK : ESP_ERR_INVALID_STATE;
+        return (rc == 0 || rc == BLE_HS_EALREADY) ? saved : ESP_ERR_INVALID_STATE;
     }
     ble_start_advertising();
-    return ESP_OK;
+    return saved;
 }

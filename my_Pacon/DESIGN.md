@@ -202,6 +202,9 @@ Consumer Control 的 `Volume Increment` 输入报告。BLE 广播同时携带 PA
 手机首次使用需在系统蓝牙设置中把 `PACON-BLE-TEST` 配对为输入设备，并在
 相机应用中启用“音量键快门”（若该相机提供此选项）；仅通过自定义 GATT 工具
 连接不能让工具自身成为系统 HID 主机。
+Android 工具的 `拍照 / 音量键快门` 按钮通过 PACON 自定义服务发送
+`CAMERA SHUTTER`；因此手机需同时保留系统 HID 连接和工具连接。固件允许两条
+NimBLE 连接，并按连接跟踪 HID 通知订阅，避免工具连接覆盖系统相机连接。
 
 ### 9.6 USB Disk
 

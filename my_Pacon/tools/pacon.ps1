@@ -64,6 +64,14 @@ function Invoke-SourceTests {
 
 function Invoke-FirmwareBuild {
     Test-Environment
+    $env:IDF_PATH = $idfPath
+    $env:IDF_TOOLS_PATH = $toolsPath
+    $env:IDF_PYTHON_ENV_PATH = $pythonEnv
+    $toolchainBin = Join-Path $toolsPath 'tools\xtensa-esp-elf\esp-14.2.0_20250730\xtensa-esp-elf\bin'
+    Require-Path $toolchainBin 'ESP32-S3 toolchain binaries'
+    if (($env:PATH -split ';') -notcontains $toolchainBin) {
+        $env:PATH = "$toolchainBin;$env:PATH"
+    }
     Invoke-Checked $ninja @('-C', $buildDir, '-j', "$Jobs") 'firmware build'
 }
 
