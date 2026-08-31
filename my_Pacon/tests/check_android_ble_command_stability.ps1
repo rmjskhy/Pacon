@@ -28,6 +28,11 @@ if ($android -notmatch 'AUTO_MEDIA_REFRESH_ON_CONNECT\s*=\s*false') {
     $failures.Add('Current A/B diagnostic build must leave the new GATT link idle.')
 }
 
+if ($android -notmatch 'expectedDeleteResponse' -or
+    $android -notmatch 'expectedDeleteResponse\.equals\(response\)') {
+    $failures.Add('Android must match the deleted filename, not only the generic response prefix.')
+}
+
 if ($android -notmatch 'setPreferredPhy\(BluetoothDevice\.PHY_LE_1M_MASK,\s*BluetoothDevice\.PHY_LE_1M_MASK') {
     $failures.Add('PACON connection does not explicitly retain the robust BLE 1M PHY.')
 }

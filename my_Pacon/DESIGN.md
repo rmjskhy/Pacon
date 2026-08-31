@@ -120,7 +120,8 @@ flowchart TD
 | `UI_SCREEN_OUO_MENU` | 表情/心情菜单 | 选择预设状态后返回表情页 |
 | `UI_SCREEN_SKYORB` | 飞机雷达 | 使用保存的网络、位置与量程配置 |
 | `UI_SCREEN_WATCH` | 机械模拟表盘 | 读取 PCF85063；表盘样式由 Android 设置明确选择，左上角隐藏热区返回 |
-| `UI_SCREEN_SETTINGS` | 设备设置 | 启动临时配置 AP 和网页 |
+| `UI_SCREEN_SETTINGS` | 设备设置 | 管理板端设置；快速点击顶部 `SETTINGS` 标题三次进入隐藏诊断页 |
+| `UI_SCREEN_MIC_TEST` | 隐藏麦克风诊断 | 显示实时波形、RMS/峰值/底噪/削波；可录制最长 10 秒的单声道 WAV 到 SD NAND |
 | `UI_SCREEN_USB_DISK` | USB U 盘交接 | 安全弹出后返回会软重启 |
 
 ### 7.1 统一视觉规范
@@ -274,7 +275,7 @@ Type-C 正反插不能作为“串口/U 盘模式”选择信号。两种模式�
 | SkyOrb 空数据状态 | 明确显示 | 请求成功但所选经纬度与量程内没有飞机时显示 `NO AIRCRAFT / IN SELECTED RANGE`；OLED 从保护性息屏唤醒时强制重绘当前界面 |
 | 系统界面统一 watchOS 启发式视觉 | 已编译，待板上确认 | 检查圆屏边缘、图标可辨识度和触摸命中 |
 | PCF85063 与 GPIO48 蜂鸣器 | 已合入正式固件，待本轮板上验证 | 支持 RTC、自定义/BLE/Wi-Fi 校时和每日闹钟 |
-| 数字麦克风 | 测试工程已验证 | 尚未合入正式功能 |
+| 数字麦克风 | 已合入隐藏诊断页并完成编译、烧录和启动验证 | 16 kHz/16-bit 单声道，实时电平与波形；录音保存为 `/sdnand/MIC_TEST.WAV`，通过 USB Disk 导出后试听 |
 
 ## 14. 开发约束与后续重构
 

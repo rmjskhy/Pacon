@@ -9,11 +9,7 @@ list(APPEND CMAKE_MODULE_PATH "${PACON_CMAKE_UTILITIES}")
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_LIST_DIR}/../Pacon/managed_components/espressif__cmake_utilities"
     "${CMAKE_CURRENT_LIST_DIR}/../Pacon/components/esp_lcd_sh8601"
-    "${CMAKE_CURRENT_LIST_DIR}/../Pacon/components/lvgl__lvgl"
-    "${CMAKE_CURRENT_LIST_DIR}/../../smartknob/superdial_port/references/superdial-upstream/idf_code/components/espressif__esp_tinyusb"
-    "${CMAKE_CURRENT_LIST_DIR}/../../smartknob/superdial_port/references/superdial-upstream/idf_code/components/espressif__tinyusb"
-    "${CMAKE_CURRENT_LIST_DIR}/../../smartknob/superdial_port/references/superdial-upstream/idf_code/components/espressif__esp_tinyusb"
-    "${CMAKE_CURRENT_LIST_DIR}/../../smartknob/superdial_port/references/superdial-upstream/idf_code/components/espressif__tinyusb")
+    "${CMAKE_CURRENT_LIST_DIR}/../Pacon/components/lvgl__lvgl")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(pacon_fluid_pendant)

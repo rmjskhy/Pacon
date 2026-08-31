@@ -594,6 +594,33 @@ public class MainActivity extends Activity {
         mediaListView.setBackgroundColor(Color.TRANSPARENT);
         mediaListView.setClipToPadding(false);
         mediaListView.setAdapter(mediaAdapter);
+        final float[] mediaListTouchY = {0f};
+        mediaListView.setOnTouchListener((view, event) -> {
+            android.view.ViewParent parent = view.getParent();
+            if (parent == null) return false;
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    mediaListTouchY[0] = event.getY();
+                    parent.requestDisallowInterceptTouchEvent(true);
+                    break;
+                case MotionEvent.ACTION_MOVE:
+                    boolean keepListGesture = NestedListScrollPolicy.disallowParentIntercept(
+                            mediaListTouchY[0], event.getY(),
+                            mediaListView.canScrollVertically(-1),
+                            mediaListView.canScrollVertically(1));
+                    parent.requestDisallowInterceptTouchEvent(keepListGesture);
+                    mediaListTouchY[0] = event.getY();
+                    break;
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    parent.requestDisallowInterceptTouchEvent(false);
+                    break;
+                default:
+                    break;
+            }
+            // Preserve ListView scrolling, item clicks and long-press deletion.
+            return false;
+        });
         LinearLayout catalogCard = card(mediaPage, "设备上的素材", "点击播放 · 长按删除");
         TextView mediaEmpty = label("还没有素材记录\n连接设备后，点击「刷新素材」");
         mediaEmpty.setGravity(Gravity.CENTER);
@@ -2268,7 +2295,10 @@ public class MainActivity extends Activity {
         mediaExecutor.execute(() -> {
             try {
                 String response = sendCommandAndWait("MEDIA_DELETE " + name, 5000);
-                requireResponse(response, "OK MEDIA_DELETED");
+                String expectedDeleteResponse = "OK MEDIA_DELETED " + name;
+                if (!expectedDeleteResponse.equals(response)) {
+                    throw new IOException("删除确认与所选文件不一致: " + response);
+                }
                 log("已删除素材：" + name);
                 refreshMediaList();
             } catch (Exception e) {

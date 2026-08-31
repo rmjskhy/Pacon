@@ -35,11 +35,13 @@
 #include "esp_sntp.h"
 #include "esp_crt_bundle.h"
 #include "esp_system.h"
+#include "esp_private/usb_phy.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "esp_wifi.h"
 #include "ble_pacon.h"
 #include "pacon_preferences.h"
+#include "pacon_mic_test.h"
 #include "ouo_idle_reference.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -79,6 +81,8 @@ static const char *TAG = "FLUID_PENDANT";
 #define PIN_SD_D0               GPIO_NUM_18
 #define PIN_SD_D1               GPIO_NUM_21
 #define SD_NAND_MOUNT_POINT     "/sdnand"
+#define MIC_TEST_WAV_PATH       SD_NAND_MOUNT_POINT "/MIC_TEST.WAV"
+#define USB_MSC_BOOT_MAGIC      UINT32_C(0x554D5343) /* "UMSC" */
 
 #define I2C_PORT                I2C_NUM_0
 #define I2C_TIMEOUT_MS          50
@@ -276,6 +280,7 @@ typedef enum {
     UI_SCREEN_SKYORB,
     UI_SCREEN_WATCH,
     UI_SCREEN_CAMERA,
+    UI_SCREEN_MIC_TEST,
     UI_SCREEN_SETTINGS,
     UI_SCREEN_WIFI_SETTINGS,
 } ui_screen_t;
@@ -407,8 +412,17 @@ static sdmmc_card_t *s_usb_msc_card;
 static bool s_usb_msc_host_initialized;
 static bool s_usb_msc_storage_initialized;
 static bool s_usb_msc_started;
+/* Visual intent is separate from driver readiness so the dedicated boot can
+ * paint ON before TinyUSB owns the USB PHY. */
+static bool s_usb_msc_ui_on;
 static bool s_usb_msc_start_requested;
-static bool s_usb_msc_exit_requested;
+static bool s_usb_msc_reboot_requested;
+static volatile bool s_usb_msc_exit_requested;
+static bool s_usb_msc_exit_armed;
+static TickType_t s_usb_msc_exit_arm_after;
+static TickType_t s_usb_msc_touch_retry_after;
+static bool s_usb_msc_exit_touch_down;
+RTC_NOINIT_ATTR static uint32_t s_usb_msc_boot_magic;
 static esp_err_t s_usb_msc_result = ESP_ERR_INVALID_STATE;
 static ui_screen_t s_ui_screen = UI_SCREEN_HOME;
 /* BLE submits requests; only the display task may change screens.  The
@@ -446,6 +460,11 @@ static bool s_usb_disk_dirty;
 static bool s_skyorb_dirty;
 static bool s_watch_dirty;
 static bool s_camera_dirty;
+static bool s_mic_test_dirty;
+static TickType_t s_mic_test_last_frame;
+static esp_err_t s_mic_test_action_result = ESP_OK;
+static uint8_t s_settings_debug_taps;
+static TickType_t s_settings_debug_deadline;
 static TickType_t s_camera_feedback_started;
 static TickType_t s_camera_feedback_until;
 static TickType_t s_camera_last_frame;
@@ -746,6 +765,9 @@ static void watch_render_frame(void);
 static void camera_enter(void);
 static void camera_handle_touch(int x, int y);
 static void camera_render_frame(void);
+static void mic_test_enter(void);
+static void mic_test_handle_touch(int x, int y);
+static void mic_test_render_frame(void);
 static int32_t watch_advance_display_time(int32_t displayed, int32_t target,
                                           bool *catch_up_pending);
 static clock_time_t clock_read_rtc(void);
@@ -1574,12 +1596,23 @@ static esp_err_t fluid_ble_media_command(const char *text, char *response,
         errno = 0;
         const int result = remove(s_ble_media_scan_path);
         const int remove_errno = errno;
+        struct stat deleted_info;
+        errno = 0;
+        const int verify_result = result == 0 ?
+                                  stat(s_ble_media_scan_path, &deleted_info) : -1;
+        const int verify_errno = errno;
         home_media_resume_reader();
         if (result != 0) {
             snprintf(response, response_size, "%s\r\n",
                      remove_errno == ENOENT ? "ERR media not found" :
                                                "ERR media delete failed");
             return remove_errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+        }
+        if (verify_result == 0 || verify_errno != ENOENT) {
+            ESP_LOGE(TAG, "BLE media: delete verification failed for %s errno=%d",
+                     s_ble_media_command_name, verify_errno);
+            snprintf(response, response_size, "ERR media delete not committed\r\n");
+            return ESP_FAIL;
         }
         s_home_media_rescan_pending = true;
         snprintf(response, response_size, "OK MEDIA_DELETED %s\r\n",
@@ -2620,7 +2653,7 @@ static uint16_t usb_disk_pixel(int x, int y)
     }
 
     uint16_t colour = rgb565(0, 0, 0);
-    const bool ready = s_usb_msc_started;
+    const bool ready = s_usb_msc_started || s_usb_msc_ui_on;
     const bool failed = !ready && s_usb_msc_result != ESP_ERR_INVALID_STATE;
     const uint16_t accent = failed ? rgb565(255, 69, 58) :
                             ready ? rgb565(48, 209, 88) : rgb565(10, 132, 255);
@@ -2654,23 +2687,23 @@ static uint16_t usb_disk_pixel(int x, int y)
 
     const char *state = ready ? "USB DISK ON" : failed ? "USB ERROR" : "USB DISK OFF";
     const int state_x = ready ? 145 : failed ? 157 : 137;
-    uint8_t alpha = home_font_alpha(x, y, state_x, 310, &lv_font_montserrat_28, state);
+    uint8_t alpha = home_font_alpha(x, y, state_x, 295, &lv_font_montserrat_28, state);
     if (alpha != 0) {
         return rgb565_blend(colour, text, alpha);
     }
     const char *hint = ready ? "EJECT ON COMPUTER BEFORE OFF" :
                        failed ? "TOGGLE TO TRY AGAIN" : "SERIAL REMAINS CONNECTED";
     const int hint_x = ready ? 105 : failed ? 151 : 137;
-    alpha = home_font_alpha(x, y, hint_x, 348, &lv_font_montserrat_14, hint);
+    alpha = home_font_alpha(x, y, hint_x, 335, &lv_font_montserrat_14, hint);
     if (alpha != 0) {
         return rgb565_blend(colour, secondary, alpha);
     }
-    const bool track = home_in_round_rect(x, y, 170, 387, 305, 439, 26);
+    const bool track = home_in_round_rect(x, y, 170, 365, 305, 417, 26);
     if (track) {
         colour = ready ? rgb565(48, 209, 88) : rgb565(58, 58, 60);
     }
     const int knob_x = ready ? 278 : 197;
-    if ((x - knob_x) * (x - knob_x) + (y - 413) * (y - 413) <= 21 * 21) {
+    if ((x - knob_x) * (x - knob_x) + (y - 391) * (y - 391) <= 21 * 21) {
         colour = text;
     }
     return colour;
@@ -4610,34 +4643,43 @@ static void cleanup_failed_usb_msc_start(void)
     s_usb_msc_card = NULL;
 }
 
+static bool usb_msc_boot_requested(void)
+{
+    return s_usb_msc_boot_magic == USB_MSC_BOOT_MAGIC;
+}
+
 static esp_err_t start_usb_msc_mode(void)
 {
     if (s_usb_msc_started) {
         return ESP_OK;
     }
-    if (!s_sd_nand_mounted || s_sd_nand_card == NULL) {
-        ESP_LOGE(TAG, "USB disk: U2 NAND is not mounted; MSC cannot start");
+
+    esp_err_t err = ESP_OK;
+    if (s_sd_nand_mounted && s_sd_nand_card != NULL) {
+        /* Legacy live handoff support: stop every local filesystem access
+         * before exposing raw blocks to USB.  New UI requests reboot into the
+         * dedicated path below, before BLE and media tasks are started. */
+        s_home_media_io_enabled = false;
+        for (int retry = 0; s_home_media_reader_busy && retry < 30; ++retry) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (s_home_media_reader_busy) {
+            s_home_media_io_enabled = true;
+            ESP_LOGE(TAG, "USB disk: media reader did not release U2 NAND");
+            return ESP_ERR_TIMEOUT;
+        }
+        err = esp_vfs_fat_sdcard_unmount(SD_NAND_MOUNT_POINT, s_sd_nand_card);
+        if (err != ESP_OK) {
+            s_home_media_io_enabled = true;
+            ESP_LOGE(TAG, "USB disk: cannot release U2 NAND: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_sd_nand_mounted = false;
+        s_sd_nand_card = NULL;
+    } else if (!usb_msc_boot_requested()) {
+        ESP_LOGE(TAG, "USB disk: no mounted VFS or dedicated boot request");
         return ESP_ERR_INVALID_STATE;
     }
-
-    /* Stop every local filesystem access before exposing raw blocks to USB. */
-    s_home_media_io_enabled = false;
-    for (int retry = 0; s_home_media_reader_busy && retry < 30; ++retry) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-    if (s_home_media_reader_busy) {
-        s_home_media_io_enabled = true;
-        ESP_LOGE(TAG, "USB disk: media reader did not release U2 NAND");
-        return ESP_ERR_TIMEOUT;
-    }
-    esp_err_t err = esp_vfs_fat_sdcard_unmount(SD_NAND_MOUNT_POINT, s_sd_nand_card);
-    if (err != ESP_OK) {
-        s_home_media_io_enabled = true;
-        ESP_LOGE(TAG, "USB disk: cannot release U2 NAND: %s", esp_err_to_name(err));
-        return err;
-    }
-    s_sd_nand_mounted = false;
-    s_sd_nand_card = NULL;
 
     s_usb_msc_card = calloc(1, sizeof(*s_usb_msc_card));
     if (s_usb_msc_card == NULL) {
@@ -4701,8 +4743,9 @@ static esp_err_t start_usb_msc_mode(void)
     }
 
     s_usb_msc_started = true;
-    ESP_LOGW(TAG, "USB disk: U2 NAND is now owned by the PC. Safely eject it, then restart "
-                  "the pendant to return to normal serial/app mode.");
+    s_usb_msc_boot_magic = 0;
+    ESP_LOGW(TAG, "USB disk: U2 NAND is now owned by the PC. Safely eject it, then tap "
+                  "OFF on PACON to return to normal app mode.");
     return ESP_OK;
 }
 
@@ -4773,12 +4816,10 @@ static esp_err_t init_lcd(void)
     if (err != ESP_OK) {
         return err;
     }
-    err = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
-    if (err != ESP_OK) {
-        return err;
-    }
-    vTaskDelay(pdMS_TO_TICKS(40));
-    err = lcd_set_brightness(s_user_brightness);
+    /* Keep the panel dark until its old GRAM contents have been replaced by a
+     * complete black frame.  Otherwise a warm restart exposes a green scan as
+     * the controller refreshes stale rows from top to bottom. */
+    err = lcd_set_brightness(0);
     if (err != ESP_OK) {
         return err;
     }
@@ -4802,6 +4843,24 @@ static esp_err_t init_lcd(void)
                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_lcd_canvas == NULL) {
         return ESP_ERR_NO_MEM;
+    }
+    for (int stripe_y = 0; stripe_y < LCD_HEIGHT; stripe_y += LCD_STRIPE_LINES) {
+        const int stripe_end = clamp_int(stripe_y + LCD_STRIPE_LINES, 0, LCD_HEIGHT);
+        err = esp_lcd_panel_draw_bitmap(s_lcd_panel, 0, stripe_y,
+                                        LCD_WIDTH, stripe_end, s_lcd_stripe);
+        if (err != ESP_OK ||
+            xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(250)) != pdTRUE) {
+            return err != ESP_OK ? err : ESP_ERR_TIMEOUT;
+        }
+    }
+    err = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+    if (err != ESP_OK) {
+        return err;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+    err = lcd_set_brightness(s_user_brightness);
+    if (err != ESP_OK) {
+        return err;
     }
     ESP_LOGI(TAG, "LCD canvas PSRAM=%u B; pipelined DMA stripes=2 x %d x %d",
              (unsigned)LCD_FRAME_BYTES, LCD_WIDTH, LCD_STRIPE_LINES);
@@ -4976,6 +5035,7 @@ static void apply_ble_ui_request(void)
     if (s_ble_ui_requests != NULL && xQueueReceive(s_ble_ui_requests, &target, 0) == pdTRUE) {
         bool busy = s_ble_media_transfer_active || s_usb_msc_started || s_usb_msc_start_requested;
         if (!busy) {
+            if (s_ui_screen == UI_SCREEN_MIC_TEST) pacon_mic_close();
             /* Clear in-flight local gestures before entering the requested
              * screen, but preserve all user settings and uploaded media. */
             s_home_slide_active = false;
@@ -5256,17 +5316,28 @@ static void poll_touch(void)
     }
 
     if (s_ui_screen == UI_SCREEN_USB_DISK) {
-        if (!s_touch_down && home_in_round_rect(x, y, 160, 377, 315, 449, 24)) {
+        if (!s_touch_down && home_in_round_rect(x, y, 155, 350, 320, 432, 24)) {
             if (s_usb_msc_started) {
+                if (!s_usb_msc_exit_armed) {
+                    /* FT3168 can retain the ON contact across the short
+                     * reboot.  It must report a real release, followed by the
+                     * arming delay, before a new touch may request OFF. */
+                    block_touch_until_release();
+                    return;
+                }
                 /* The PC must have ejected the volume first.  A reboot is the
                  * only safe ownership hand-off back to the firmware VFS. */
                 s_usb_msc_exit_requested = true;
                 ESP_LOGW(TAG, "USB disk: OFF requested; restarting into serial/app mode");
             } else {
                 s_usb_msc_result = ESP_ERR_INVALID_STATE;
-                s_usb_msc_start_requested = true;
+                /* Acknowledge the first accepted tap before the intentional
+                 * reboot; otherwise the control appears dead until MSC boot. */
+                s_usb_msc_ui_on = true;
                 s_usb_disk_dirty = true;
-                ESP_LOGW(TAG, "USB disk: ON requested; serial will disconnect after switch");
+                s_usb_msc_boot_magic = USB_MSC_BOOT_MAGIC;
+                s_usb_msc_reboot_requested = true;
+                ESP_LOGW(TAG, "USB disk: ON requested; restarting into dedicated MSC mode");
             }
             block_touch_until_release();
             return;
@@ -5302,6 +5373,12 @@ static void poll_touch(void)
 
     if (s_ui_screen == UI_SCREEN_CAMERA) {
         if (!s_touch_down) camera_handle_touch(x, y);
+        s_touch_down = true;
+        return;
+    }
+
+    if (s_ui_screen == UI_SCREEN_MIC_TEST) {
+        if (!s_touch_down) mic_test_handle_touch(x, y);
         s_touch_down = true;
         return;
     }
@@ -8748,6 +8825,173 @@ static void camera_render_frame(void)
     s_camera_last_frame = now;
 }
 
+static void mic_test_format_db(char *out, size_t out_size, int16_t dbfs_x10)
+{
+    if (dbfs_x10 <= -960) {
+        snprintf(out, out_size, "--.-");
+        return;
+    }
+    const int whole = dbfs_x10 / 10;
+    const int decimal = abs(dbfs_x10 % 10);
+    snprintf(out, out_size, "%d.%d", whole, decimal);
+}
+
+static void mic_test_enter(void)
+{
+    s_ui_screen = UI_SCREEN_MIC_TEST;
+    s_mic_test_dirty = true;
+    s_mic_test_last_frame = 0;
+    s_mic_test_action_result = pacon_mic_open();
+    s_apps_canvas_valid = false;
+    s_apps_home_transition_frame = NULL;
+    block_touch_until_release();
+    if (s_mic_test_action_result == ESP_OK) {
+        ESP_LOGI(TAG, "Mic test: monitoring; tap record for %u second WAV",
+                 (unsigned)(PACON_MIC_MAX_RECORD_MS / 1000U));
+    } else {
+        ESP_LOGE(TAG, "Mic test: open failed (%s)",
+                 esp_err_to_name(s_mic_test_action_result));
+    }
+}
+
+static void mic_test_handle_touch(int x, int y)
+{
+    if (x < 120 && y < 105) {
+        pacon_mic_close();
+        s_ui_screen = UI_SCREEN_SETTINGS;
+        s_settings_scroll_y = 0;
+        s_settings_full_refresh = true;
+        s_device_settings_dirty = true;
+        block_touch_until_release();
+        ESP_LOGI(TAG, "Mic test: returned to Settings and released I2S");
+        return;
+    }
+    if (!home_in_round_rect(x, y, 76, 344, 399, 416, 28)) return;
+
+    pacon_mic_status_t status;
+    pacon_mic_get_status(&status);
+    if (status.state == PACON_MIC_RECORDING) {
+        s_mic_test_action_result = pacon_mic_stop_recording();
+    } else if (status.state == PACON_MIC_MONITORING && s_sd_nand_mounted &&
+               !s_usb_msc_started) {
+        s_mic_test_action_result = pacon_mic_start_recording(MIC_TEST_WAV_PATH);
+    } else {
+        s_mic_test_action_result = status.last_error != ESP_OK ?
+                                   status.last_error : ESP_ERR_INVALID_STATE;
+    }
+    s_mic_test_dirty = true;
+    block_touch_until_release();
+}
+
+static void mic_test_render_frame(void)
+{
+    if (s_lcd_canvas == NULL) return;
+    pacon_mic_status_t status;
+    pacon_mic_get_status(&status);
+    const uint16_t black = rgb565(0, 0, 0);
+    const uint16_t panel = rgb565(28, 28, 30);
+    const uint16_t white = rgb565(245, 245, 247);
+    const uint16_t secondary = rgb565(142, 142, 147);
+    const uint16_t green = rgb565(48, 209, 88);
+    const uint16_t orange = rgb565(255, 159, 10);
+    const uint16_t red = rgb565(255, 69, 58);
+    const uint16_t cyan = rgb565(90, 200, 250);
+    const int center_x = LCD_WIDTH / 2;
+    const int center_y = LCD_HEIGHT / 2;
+
+    for (int py = 0; py < LCD_HEIGHT; ++py) {
+        uint16_t *line = s_lcd_canvas + (size_t)py * LCD_WIDTH;
+        for (int px = 0; px < LCD_WIDTH; ++px) {
+            const int dx = px - center_x;
+            const int dy = py - center_y;
+            line[px] = dx * dx + dy * dy <= 230 * 230 ? black : 0;
+        }
+    }
+    skyorb_line(84, 62, 70, 76, white, 255);
+    skyorb_line(70, 76, 84, 90, white, 255);
+    skyorb_text("MIC TEST", 177, 48, &lv_font_montserrat_18, white);
+
+    const char *state_text = "OFF";
+    uint16_t state_colour = secondary;
+    if (status.state == PACON_MIC_RECORDING) {
+        state_text = "RECORDING";
+        state_colour = red;
+    } else if (status.state == PACON_MIC_MONITORING) {
+        state_text = status.signal_present ? "LIVE SIGNAL" : "LISTENING";
+        state_colour = status.signal_present ? green : orange;
+    } else if (status.state == PACON_MIC_ERROR || s_mic_test_action_result != ESP_OK) {
+        state_text = "AUDIO ERROR";
+        state_colour = red;
+    }
+    skyorb_text_centered(state_text, center_x, 91, &lv_font_montserrat_14,
+                         state_colour);
+
+    fill_canvas_round_rect(54, 120, 421, 238, 18, panel, NULL);
+    int32_t wave_peak = 1;
+    for (size_t i = 0; i < PACON_MIC_WAVEFORM_POINTS; ++i) {
+        int32_t magnitude = status.waveform[i] < 0 ?
+                            -(int32_t)status.waveform[i] : status.waveform[i];
+        if (magnitude > wave_peak) wave_peak = magnitude;
+    }
+    int previous_x = 68;
+    int previous_y = 179 - (int)((int32_t)status.waveform[0] * 48 / wave_peak);
+    for (size_t i = 1; i < PACON_MIC_WAVEFORM_POINTS; ++i) {
+        const int x = 68 + (int)(i * 338U / (PACON_MIC_WAVEFORM_POINTS - 1U));
+        const int y = 179 - (int)((int32_t)status.waveform[i] * 48 / wave_peak);
+        skyorb_line(previous_x, previous_y, x, y, cyan, 255);
+        previous_x = x;
+        previous_y = y;
+    }
+    skyorb_line(68, 179, 406, 179, rgb565(72, 72, 74), 120);
+
+    char rms[20], peak[20], floor_text[20];
+    mic_test_format_db(rms, sizeof(rms), status.rms_dbfs_x10);
+    mic_test_format_db(peak, sizeof(peak), status.peak_dbfs_x10);
+    mic_test_format_db(floor_text, sizeof(floor_text), status.floor_dbfs_x10);
+    char metrics[64];
+    snprintf(metrics, sizeof(metrics), "RMS %s  PEAK %s dBFS", rms, peak);
+    skyorb_text_centered(metrics, center_x, 252, &lv_font_montserrat_14, white);
+    snprintf(metrics, sizeof(metrics), "QUIET FLOOR %s  CLIP %lu", floor_text,
+             (unsigned long)status.clipped_samples);
+    skyorb_text_centered(metrics, center_x, 277, &lv_font_montserrat_14, secondary);
+
+    fill_canvas_round_rect(76, 307, 399, 327, 10, rgb565(58, 58, 60), NULL);
+    const int level = clamp_int((status.peak_dbfs_x10 + 600) * 323 / 600, 0, 323);
+    if (level > 0) {
+        const uint16_t level_colour = status.peak_dbfs_x10 > -30 ? red :
+                                      (status.peak_dbfs_x10 > -120 ? orange : green);
+        fill_canvas_round_rect(76, 307, 76 + level, 327, 10, level_colour, NULL);
+    }
+
+    const bool recording = status.state == PACON_MIC_RECORDING;
+    const bool can_record = status.state == PACON_MIC_MONITORING &&
+                            s_sd_nand_mounted && !s_usb_msc_started;
+    fill_canvas_round_rect(76, 344, 399, 416, 28,
+                           recording ? rgb565(88, 24, 28) :
+                           (can_record ? rgb565(20, 84, 54) : panel), NULL);
+    char action[48];
+    if (recording) {
+        snprintf(action, sizeof(action), "STOP & SAVE  %lu.%lus",
+                 (unsigned long)(status.recorded_ms / 1000U),
+                 (unsigned long)((status.recorded_ms / 100U) % 10U));
+    } else if (status.file_ready) {
+        snprintf(action, sizeof(action), "SAVED - RECORD AGAIN");
+    } else if (!s_sd_nand_mounted) {
+        snprintf(action, sizeof(action), "SD NAND NOT READY");
+    } else {
+        snprintf(action, sizeof(action), "RECORD %u SECONDS",
+                 (unsigned)(PACON_MIC_MAX_RECORD_MS / 1000U));
+    }
+    skyorb_text_centered(action, center_x, 368, &lv_font_montserrat_18,
+                         recording ? red : (can_record ? green : secondary));
+    skyorb_text_centered("/MIC_TEST.WAV - export with USB Disk", center_x, 425,
+                         &lv_font_montserrat_14, secondary);
+
+    const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
+    (void)flush_canvas_rect(&full);
+    s_mic_test_dirty = false;
+    s_mic_test_last_frame = xTaskGetTickCount();
+}
 static void settings_enter(void)
 {
     s_ui_screen = UI_SCREEN_SETTINGS;
@@ -8755,6 +8999,8 @@ static void settings_enter(void)
     s_settings_touch_dragging = false;
     s_settings_full_refresh = true;
     s_settings_header_dirty = false;
+    s_settings_debug_taps = 0;
+    s_settings_debug_deadline = 0;
     s_device_settings_dirty = true;
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
@@ -8764,6 +9010,21 @@ static void settings_enter(void)
 
 static void settings_handle_touch(int x, int y)
 {
+    if (x >= 128 && y < 100) {
+        const TickType_t now = xTaskGetTickCount();
+        if (s_settings_debug_deadline == 0 ||
+            (int32_t)(now - s_settings_debug_deadline) >= 0) {
+            s_settings_debug_taps = 0;
+        }
+        s_settings_debug_deadline = now + pdMS_TO_TICKS(1200);
+        if (++s_settings_debug_taps >= 3U) {
+            s_settings_debug_taps = 0;
+            mic_test_enter();
+        } else {
+            block_touch_until_release();
+        }
+        return;
+    }
     if (x < 128 && y < 100) {
         s_ui_screen = UI_SCREEN_APPS;
         s_apps_dirty = true;
@@ -9513,6 +9774,105 @@ static void render_frame(void)
     }
 }
 
+static void usb_msc_poll_exit_touch(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    if (!s_touch_ready) {
+        if (s_usb_msc_touch_retry_after == 0 ||
+            (int32_t)(now - s_usb_msc_touch_retry_after) >= 0) {
+            ESP_LOGW(TAG, "USB disk: touch unavailable; retrying FT3168 initialization");
+            init_touch();
+            s_usb_msc_touch_retry_after = xTaskGetTickCount() + pdMS_TO_TICKS(1000);
+        }
+        if (!s_touch_ready) return;
+        now = xTaskGetTickCount();
+    }
+
+    uint8_t count = 0;
+    if (i2c_read(ADDR_TOUCH, 0x02, &count, 1) != ESP_OK) {
+        s_touch_ready = false;
+        s_usb_msc_touch_retry_after = now + pdMS_TO_TICKS(250);
+        return;
+    }
+    if ((count & 0x0F) == 0) {
+        s_usb_msc_exit_touch_down = false;
+        return;
+    }
+
+    uint8_t point[4] = {0};
+    if (i2c_read(ADDR_TOUCH, 0x03, point, sizeof(point)) != ESP_OK) return;
+    const int x = ((point[0] & 0x0F) << 8) | point[1];
+    const int y = ((point[2] & 0x0F) << 8) | point[3];
+    if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) return;
+
+    if (!s_usb_msc_exit_touch_down && s_usb_msc_exit_armed && y >= 330) {
+        ESP_LOGW(TAG, "USB disk: raw OFF touch at (%d,%d); returning to normal mode", x, y);
+        s_usb_msc_exit_requested = true;
+    }
+    s_usb_msc_exit_touch_down = true;
+}
+
+static esp_err_t usb_msc_restore_serial_jtag_phy(void)
+{
+    /* ESP32-S3 shares its internal FS/LS PHY between USB-OTG and the
+     * always-on USB Serial/JTAG controller. usb_del_phy() releases OTG but
+     * deliberately does not restore this mux, and esp_restart() does not
+     * reset the RTC USB mux either. Claim the PHY for Serial/JTAG explicitly
+     * before the CPU-only restart so Windows sees a real serial device again. */
+    usb_phy_handle_t serial_jtag_phy = NULL;
+    const usb_phy_config_t phy_config = {
+        .controller = USB_PHY_CTRL_SERIAL_JTAG,
+        .target = USB_PHY_TARGET_INT,
+    };
+    return usb_new_phy(&phy_config, &serial_jtag_phy);
+}
+
+static void usb_msc_disconnect_for_restart(void)
+{
+    if (s_usb_msc_started) {
+        ESP_LOGI(TAG, "USB disk: detaching TinyUSB MSC before normal-mode restart");
+        const esp_err_t err = tinyusb_driver_uninstall();
+        if (err == ESP_OK) {
+            s_usb_msc_started = false;
+        } else {
+            ESP_LOGE(TAG, "USB disk: TinyUSB detach failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    const esp_err_t serial_err = usb_msc_restore_serial_jtag_phy();
+    if (serial_err != ESP_OK) {
+        ESP_LOGE(TAG, "USB disk: Serial/JTAG PHY restore failed: %s",
+                 esp_err_to_name(serial_err));
+    } else {
+        ESP_LOGI(TAG, "USB disk: internal PHY returned to USB Serial/JTAG");
+    }
+
+    /* Hold the MSC disconnect long enough for Windows to retire the disk
+     * identity before the CPU-only restart continues in normal mode. */
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+}
+
+static void run_usb_msc_screen_loop(void)
+{
+    while (true) {
+        /* USB mode owns a raw reader so a stale page-transition contact or a
+         * failed one-shot FT3168 init cannot permanently disable OFF. */
+        usb_msc_poll_exit_touch();
+        if (s_usb_msc_started && !s_usb_msc_exit_armed &&
+            (int32_t)(xTaskGetTickCount() - s_usb_msc_exit_arm_after) >= 0) {
+            s_usb_msc_exit_armed = true;
+        }
+        if (s_usb_msc_reboot_requested || s_usb_msc_exit_requested) {
+            usb_msc_disconnect_for_restart();
+        }
+        /* Do not render or run unrelated services after TinyUSB takes the
+         * native USB PHY.  This loop is deliberately small so MSC/SDMMC gets
+         * a deterministic transfer environment. */
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "PACON pendant starting: Fluid + 0u0 (reset_reason=%d)",
@@ -9524,6 +9884,7 @@ void app_main(void)
     if (err != ESP_OK && err != ESP_ERR_NVS_INVALID_STATE) {
         ESP_LOGW(TAG, "NVS initialization failed: %s", esp_err_to_name(err));
     }
+    const bool usb_msc_boot = usb_msc_boot_requested();
 
     /* Load UI preferences before the panel is powered.  BLE is deliberately
      * started after the LCD DMA buffers have been allocated: the NimBLE
@@ -9554,6 +9915,7 @@ void app_main(void)
         ESP_LOGE(TAG, "SH8601 initialization failed: %s", esp_err_to_name(err));
         return;
     }
+    if (!usb_msc_boot) {
     /* Start the phone control channel after the display's internal DMA
      * allocations so BLE cannot starve the SH8601 panel setup. */
     s_ble_ui_requests = xQueueCreate(1, sizeof(ui_screen_t));
@@ -9577,6 +9939,28 @@ void app_main(void)
         if (pacon_load_switch("wifi_join", false) && s_skyorb_config.wifi_valid) {
             (void)wifi_request_profile_connection(s_skyorb_config.wifi_selected);
         }
+    }
+    } else {
+        /* The USB screen remains interactive so the user can safely eject on
+         * the PC and tap OFF to reboot back into the full application. */
+        init_touch();
+        s_usb_msc_exit_armed = false;
+        s_usb_msc_exit_arm_after = xTaskGetTickCount() + pdMS_TO_TICKS(1500);
+        block_touch_until_release();
+        /* Finish every local display/touch initialization and paint once
+         * before changing the USB PHY.  There are no display transfers after
+         * TinyUSB starts, so Windows can probe the disk without contention. */
+        s_ui_screen = UI_SCREEN_USB_DISK;
+        s_usb_msc_ui_on = true;
+        s_usb_disk_dirty = true;
+        render_usb_disk_frame();
+        s_usb_msc_result = start_usb_msc_mode();
+        if (s_usb_msc_result != ESP_OK) {
+            s_usb_msc_ui_on = false;
+            s_usb_disk_dirty = true;
+            render_usb_disk_frame();
+        }
+        run_usb_msc_screen_loop();
     }
 
     TickType_t last_frame = xTaskGetTickCount();
@@ -9627,24 +10011,29 @@ void app_main(void)
                 render_apps_frame();
             }
         } else if (s_ui_screen == UI_SCREEN_USB_DISK) {
+            /* Sample release once before the slow first full-frame paint.  A
+             * fast second tap must not be swallowed as the launcher contact. */
+            poll_touch();
             /* Paint the transition screen before USB re-enumerates, because
              * the serial monitor disappears as soon as the MSC device owns
              * the native USB data pair. */
             if (s_usb_disk_dirty) {
                 render_usb_disk_frame();
             }
-            if (s_usb_msc_start_requested) {
-                s_usb_msc_start_requested = false;
-                s_usb_msc_result = start_usb_msc_mode();
-                s_usb_disk_dirty = true;
-            }
             poll_touch();
-            if (s_usb_msc_exit_requested) {
-                /* The user has explicitly acknowledged safe eject.  A soft
-                 * reboot gives USB Serial/JTAG and the SD NAND VFS a clean,
-                 * deterministic reinitialisation path. */
-                vTaskDelay(pdMS_TO_TICKS(150));
+            if (s_usb_msc_started && !s_usb_msc_exit_armed &&
+                !s_touch_blocked_until_release &&
+                (int32_t)(xTaskGetTickCount() - s_usb_msc_exit_arm_after) >= 0) {
+                s_usb_msc_exit_armed = true;
+            }
+            if (s_usb_msc_reboot_requested) {
+                /* Keep USB Serial/JTAG alive until the transition screen has
+                 * been painted, then restart into a minimal MSC-only boot. */
+                vTaskDelay(pdMS_TO_TICKS(250));
                 esp_restart();
+            }
+            if (s_usb_msc_exit_requested) {
+                usb_msc_disconnect_for_restart();
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         } else if (s_ui_screen == UI_SCREEN_FLUID_SETTINGS) {
@@ -9702,6 +10091,14 @@ void app_main(void)
                 camera_render_frame();
             }
             vTaskDelay(pdMS_TO_TICKS(feedback_active ? 35 : 80));
+        } else if (s_ui_screen == UI_SCREEN_MIC_TEST) {
+            poll_touch();
+            now = xTaskGetTickCount();
+            if (s_ui_screen == UI_SCREEN_MIC_TEST &&
+                (s_mic_test_dirty || s_mic_test_last_frame == 0 ||
+                 (int32_t)(now - s_mic_test_last_frame) >= pdMS_TO_TICKS(80))) {
+                mic_test_render_frame();
+            }
         } else if (s_ui_screen == UI_SCREEN_SETTINGS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_SETTINGS && s_device_settings_dirty) {
