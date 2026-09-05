@@ -14,6 +14,7 @@
 2. 本文档；
 3. `USB_MSC_NOTES.md` 等专题文档；
 4. `DEVELOPMENT_LOG.md` 和 `POWER_KEY_AND_PMIC_DIAGNOSIS.md` 中的历史记录。
+5. `POWER_SAVING_PLAN.md` 中的 AMOLED 安全与 250 mAh 电池节能分阶段计划。
 
 历史日志保留了排障过程，其中部分阶段性结论已被后续实测推翻，不能脱离日期直接作为当前设计依据。
 
@@ -65,6 +66,16 @@ flowchart TD
 | IMU | QMI8658 | I2C `0x6A` | 流体、0u0 和 SkyOrb 方位交互 |
 | 圆屏 | SH8601 QSPI | RST 5，POWER 6，CS 7，CLK 8，D3 9，D2 10，D1 11，D0 12 | 475×466，SPI2_HOST |
 | 板载存储 | MKDV4GCL-AB SD NAND | D2 14，D3 15，CLK 16，CMD 17，D0 18，D1 21 | SDMMC 4-bit，挂载点 `/sdnand` |
+
+共享 I2C 外设跟随显示与页面状态节能。Home 等不使用倾斜交互的亮屏页面把 QMI8658
+设为 ±8g、3 Hz low-power；Fluid 以及启用倾斜反应的 0u0 页面恢复 ±8g、250 Hz；
+AMOLED Sleeping 时先关闭加速度计，恢复后丢弃前三个样本。FT3168 只在 AXP2101、
+QMI8658、PCF85063 和触摸自身的共享总线往返验证通过后启用 Monitor；Watch 的硬件
+手势引擎必须先关闭。FT3168 进入 Monitor 的写 ACK 是状态边界，不能紧接着读回确认：
+该模式下其他从设备使用共享总线后，触摸控制器可能暂不响应，直到有效触摸自动恢复
+Active。首个恢复触摸只负责唤醒 AMOLED，释放后才允许执行控件动作。
+专用 TinyUSB MSC 模式始终由 VBUS 供电，且触摸是唯一的屏幕唤醒与退出入口，
+因此该模式在 AMOLED Sleeping 时保留 FT3168 Active 扫描，不进入 Monitor。
 
 ### 4.2 已在测试工程验证、尚未正式集成
 
@@ -172,6 +183,15 @@ Fluid 源自 Opal_Fluid 的思路，并针对 PACON 的直接 QSPI 渲染路径�
 
 SkyOrb 参考 GulfCoastMaker/SkyOrb 与 ESP32-Plane-Radar 的功能思路，适配为单块圆形 SH8601 屏幕。当前雷达刷新周期 180 ms，网络数据定期抓取周期 180 s，最多显示 28 架飞机。
 
+Wi-Fi 开关保存的是用户联网意图，不等同于射频必须持续运行。STA 使用
+`WIFI_PS_MIN_MODEM` 保持连接期间的 DTIM Modem Power Save；SkyOrb 成功完成 HTTPS
+刷新后等待 5 秒再停止 STA，离开雷达页也请求停止。缓存数据仍可显示；雷达页到达
+下一次 180 秒刷新、重新进入雷达、进入 Wi-Fi 设置扫描或请求 SNTP 校时时，网络任务
+按需启动 STA 并重新完成 WPA/DHCP。自动暂停不会把 Wi-Fi 开关写成关闭。
+mbedTLS 状态和动态 TLS 缓冲放在 PSRAM。ESP32-S3 以 240 MHz 运行时使用软件 AES，
+避免硬件 AES 为 PSRAM TLS 记录额外申请同尺寸内部 DMA 跳板；内部 DMA 内存优先保留给
+已经过显示实测的两条 QSPI 流水线条带。
+
 雷达半径挡位为 5/10/15/25/35/50 km；其中 50 km 明确表示从屏幕中心到最外圈的半径，而不是直径。实时飞机按实际公里数映射到雷达半径；没有联网时不生成演示飞机。超出当前半径的目标只在外圈显示标记。画面持续显示 `RADIUS n KM`，并在中圈标出对应距离，确保顺/逆时针滑动切换后即使目标很少也能看出比例变化。
 
 配置保存在 NVS 命名空间 `skyorb`，包括最多 5 个已保存 Wi-Fi、当前选中网络、经纬度、自动定位标记和量程。旧版单网络 `ssid/password` 键会迁移为第一个 profile，同时仍镜像选中项以便回滚旧固件。未设置经纬度时，可在联网后尝试通过公网地址获得粗略位置；该结果只适合作为默认值，不替代用户设置。
@@ -262,7 +282,7 @@ Type-C 正反插不能作为“串口/U 盘模式”选择信号。两种模式�
 
 | 项目 | 状态 | 备注 |
 |---|---|---|
-| SH8601 显示、亮度、息屏和触摸唤醒 | 已在板验证 | 全行传输规则必须保留 |
+| SH8601 显示、亮度、息屏和触摸唤醒 | 已在板验证 | App 超时到达时降亮度，15 秒后 Sleep；全行传输规则必须保留 |
 | 图片/动画读取与左右切换 | 已在板验证 | 动画手势和刷新仍可继续优化 |
 | Fluid 三种模式和调色盘 | 已在板验证 | 流畅度优先 |
 | 0u0 基本触摸和 IMU 表情 | 已在板验证 | 与原应用的细节仍有差距 |
@@ -270,7 +290,9 @@ Type-C 正反插不能作为“串口/U 盘模式”选择信号。两种模式�
 | USB MSC 媒体拷贝 | 已在板验证 | 严禁双重挂载 |
 | BLE/板端 Wi-Fi profile 管理 | 已在板验证 | 最多保存 5 个网络，点击连接、长按删除 |
 | 旧 SoftAP/HTTP 配置路径 | 已移除并烧录 | 正式固件只保留 STA；HTTP 客户端供雷达与 IP 定位使用 |
-| SkyOrb HTTPS/TLS 内存策略 | 已启用，稳定性继续验证 | mbedTLS 使用 PSRAM 和动态缓冲；失败按阶段显示并每 15 秒重试，不能仅凭一次实时数据显示判定完成 |
+| SkyOrb HTTPS/TLS 内存策略 | 阶段 3 真机通过 | mbedTLS 使用 PSRAM、动态缓冲和软件 AES，避免与显示 DMA 条带争用内部内存；失败按阶段显示并每 15 秒重试 |
+| FT3168/QMI8658 外设待机策略 | 阶段 4 功能真机通过 | Home/非倾斜页 3 Hz、Fluid/0u0 TILT 250 Hz、熄屏 paused；普通页面 FT3168 Monitor，VBUS 供电的专用 MSC 保持 Active；首次触摸、Watch 手势互锁和 USB OFF 闭环均通过，物理电流待测 |
+| ESP32-S3 DFS 与频率锁 | 阶段 5 功能真机通过 | 空闲 80 MHz、上限 240 MHz；UI/QSPI、TLS、WPA/DHCP 按作用域持最大频率锁，Tickless Idle/Light Sleep 尚未启用，物理电流待测 |
 | SkyOrb 航班数据源 | ADSB.lol 公共 API | `/v2/point/{lat}/{lon}/{radius}`，readsb 兼容 JSON；客户端发送 PACON 项目标识，数据许可为 ODbL 1.0 |
 | SkyOrb 空数据状态 | 明确显示 | 请求成功但所选经纬度与量程内没有飞机时显示 `NO AIRCRAFT / IN SELECTED RANGE`；OLED 从保护性息屏唤醒时强制重绘当前界面 |
 | 系统界面统一 watchOS 启发式视觉 | 已编译，待板上确认 | 检查圆屏边缘、图标可辨识度和触摸命中 |

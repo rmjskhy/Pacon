@@ -3,6 +3,10 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_PM_ENABLE=y
+# Keep automatic Light Sleep out of the first phase-5 change.  It requires a
+# separate USB/BLE/Wi-Fi/I2C/QSPI wake and timing validation pass.
+# CONFIG_FREERTOS_USE_TICKLESS_IDLE is not set
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
@@ -47,6 +51,7 @@ CONFIG_ESP_WIFI_MGMT_SBUF_NUM=6
 # PSRAM and release the RX/TX buffers whenever the TLS state machine can.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_HARDWARE_AES=n
 
 # BLE uploads keep their user-visible .rgb565 names on the FAT volume.
 # Heap-backed long-file-name support is required for the final rename.

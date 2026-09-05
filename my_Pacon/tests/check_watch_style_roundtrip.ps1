@@ -8,11 +8,11 @@ $failures = [System.Collections.Generic.List[string]]::new()
 if ($firmware -notmatch '\\"style_name\\":\\"%s\\"') {
     $failures.Add('GET CLOCK does not expose an unambiguous style name.')
 }
-if ($firmware -notmatch 's_watch_rendered_style != s_watch_style') {
+if ($firmware -notmatch 's_watch_rendered_style != frame_style') {
     $failures.Add('Renderer does not detect a requested style transition.')
 }
-if ($firmware -notmatch 'previous frame cleared') {
-    $failures.Add('Style transition is not logged after a full-frame clear.')
+if ($firmware -notmatch 'next full frame replaces previous') {
+    $failures.Add('Style transition is not logged as one atomic replacement frame.')
 }
 if ($android -notmatch 'private void applyWatchStyle\(int requestedStyle\)') {
     $failures.Add('Android does not use a dedicated verified style switch.')

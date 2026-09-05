@@ -11,6 +11,6 @@ idf_component_register(
                 "assets/kkd2_hour.rgb565a"
                 "assets/kkd2_minute.rgb565a"
                 "assets/kkd2_complication.rgb565a"
-    REQUIRES driver fatfs sdmmc usb esp_lcd esp_lcd_sh8601 esp_tinyusb lvgl__lvgl
+    REQUIRES driver fatfs sdmmc usb esp_lcd esp_lcd_sh8601 esp_pm esp_tinyusb lvgl__lvgl
           esp_wifi esp_event esp_netif nvs_flash lwip
              esp_http_client esp-tls json bt)

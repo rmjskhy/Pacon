@@ -19,6 +19,7 @@ let declarations=constants.map(key=>`const ${key}=${c.match(new RegExp('#define 
 declarations+='const OUO_FACE_CENTER_X=(OUO_LEFT_EYE_X+OUO_RIGHT_EYE_X)/2;';
 vm.runInContext(`${declarations}
 let s_ouo_gaze_x=0,s_ouo_gaze_y=0,s_ouo_shake_x=0,s_ouo_shake_y=0;
+let s_ouo_burnin_shift_x=0,s_ouo_burnin_shift_y=0;
 let s_ouo_idle_palette_ready=false;
 const s_ouo_idle_palette=new Uint16Array(256),s_ouo_idle_tiles=new Uint8Array(96*268);
 const s_lcd_canvas=new Uint16Array(LCD_WIDTH*LCD_HEIGHT);

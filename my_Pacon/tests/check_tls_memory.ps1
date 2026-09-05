@@ -12,5 +12,8 @@ if ($defaults -notmatch '(?m)^CONFIG_MBEDTLS_DYNAMIC_BUFFER=y$') {
 if ($defaults -match '(?m)^CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y$') {
     throw 'Internal-only mbedTLS allocation exhausts fragmented DRAM after Wi-Fi starts.'
 }
+if ($defaults -notmatch '(?m)^CONFIG_MBEDTLS_HARDWARE_AES=n$') {
+    throw 'PACON must use software AES so TLS does not need a full-record internal DMA bounce buffer.'
+}
 
 Write-Host 'TLS memory configuration check passed.'

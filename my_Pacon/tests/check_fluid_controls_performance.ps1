@@ -3,7 +3,7 @@ $main = Get-Content (Join-Path $PSScriptRoot '..\main\fluid_pendant.c') -Raw
 if ($main -notmatch 'if \(s_ui_screen == UI_SCREEN_COLOUR_PICKER\) \{\s+fluid_colour_picker_touch\(x, y\);') {
     throw 'Colour drag must run outside the initial-press-only branch'
 }
-if ($main -notmatch 'fluid_service_preferences\(\);\s+fluid_controls_report_perf\(\);') {
+if ($main -notmatch 'fluid_service_preferences\(\);\s+watch_service_style_save\(xTaskGetTickCount\(\)\);\s+fluid_controls_report_perf\(\);') {
     throw 'Deferred persistence service must run after rendering'
 }
 if ($main -notmatch 's_ui_screen != UI_SCREEN_FLUID_SETTINGS && s_ui_screen != UI_SCREEN_COLOUR_PICKER\) \{\s+s_fluid_controls_canvas_screen = UI_SCREEN_HOME;') {

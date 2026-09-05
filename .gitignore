@@ -32,6 +32,7 @@
 **/config/
 **/bootloader-prefix/
 **/dependencies.lock
+**/managed_components/
 **/flasher_args.json
 **/*-flash_args
 **/flash_args*

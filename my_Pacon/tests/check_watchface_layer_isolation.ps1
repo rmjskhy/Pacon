@@ -7,7 +7,7 @@ $failures = [System.Collections.Generic.List[string]]::new()
 
 $composeMatch = [regex]::Match(
     $firmware,
-    'static void watch_compose_canvas\(const clock_time_t \*time\)\s*\{(?<body>.*?)\r?\n\}\r?\n\r?\nstatic void watch_render_frame',
+    'static void watch_compose_canvas\(const clock_time_t \*time, uint8_t style\)\s*\{(?<body>.*?)\r?\n\}\r?\n\r?\nstatic void watch_render_frame',
     [System.Text.RegularExpressions.RegexOptions]::Singleline)
 
 if (-not $composeMatch.Success) {

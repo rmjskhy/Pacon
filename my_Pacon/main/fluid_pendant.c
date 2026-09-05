@@ -32,6 +32,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_pm.h"
 #include "esp_sntp.h"
 #include "esp_crt_bundle.h"
 #include "esp_system.h"
@@ -88,13 +89,31 @@ static const char *TAG = "FLUID_PENDANT";
 #define I2C_TIMEOUT_MS          50
 #define ADDR_AXP2101            0x34
 #define ADDR_TOUCH              0x38
+#define FT3168_REG_GESTURE_ENABLE 0xD0
+#define FT3168_REG_GESTURE_MASK   0xD1
+#define FT3168_REG_GESTURE_ID     0xD3
+#define FT3168_REG_TOUCH_COUNT    0x02
+#define FT3168_REG_TOUCH_POINT1   0x03
+#define FT3168_REG_POWER_MODE     0xA5
+#define FT3168_POWER_ACTIVE       0x00
+#define FT3168_POWER_MONITOR      0x01
+#define FT3168_GESTURE_LEFT_RIGHT 0x03
+#define FT3168_GESTURE_SWIPE_LEFT 0x20
+#define FT3168_GESTURE_SWIPE_RIGHT 0x21
 #define ADDR_PCF85063           0x51
 #define ADDR_QMI8658            0x6A
+#define QMI8658_REG_CTRL1        0x02
+#define QMI8658_REG_CTRL2        0x03
+#define QMI8658_REG_CTRL7        0x08
+#define QMI8658_CTRL2_8G_250HZ   0x25
+#define QMI8658_CTRL2_8G_3HZ_LP  0x2F
 #define PIN_SPKOUT              GPIO_NUM_48
 
 #define AXP2101_CHIP_ID         0x4A
 #define AXP2101_CHIP_ID2        0x47
 #define PMIC_STATUS_PERIOD_MS   5000
+#define CPU_FREQ_MAX_MHZ        240
+#define CPU_FREQ_IDLE_MHZ       80
 
 #define LCD_HOST                SPI2_HOST
 #define LCD_WIDTH               475
@@ -106,6 +125,11 @@ static const char *TAG = "FLUID_PENDANT";
 #define WATCH_SOURCE_SIZE              450
 #define WATCH_MINUTE_POINTER_ANGLE     0.0f
 #define WATCH_HOUR_POINTER_ANGLE       (3.14159265f / 2.0f)
+#define WATCH_SWIPE_MIN_X              42
+#define WATCH_EDGE_SWIPE_MIN_X         10
+#define WATCH_EDGE_SWIPE_ZONE          150
+#define WATCH_SWIPE_AXIS_MARGIN        6
+#define WATCH_STYLE_SAVE_IDLE_MS       2000
 
 extern const uint8_t kkd1_character_start[]
     asm("_binary_kkd1_character_rgb565a_start");
@@ -171,10 +195,14 @@ extern const uint8_t kkd2_complication_end[]
 #define LCD_FRAME_BYTES         (LCD_FRAME_PIXELS * sizeof(uint16_t))
 #define LCD_BRIGHTNESS_NORMAL   0x80U /* About 50%; avoids continuous OLED overdrive. */
 #define LCD_BRIGHTNESS_DIM      0x24U /* Gentle idle level before the panel is blanked. */
-#define DISPLAY_DIM_TIMEOUT_MS  20000
 #define DISPLAY_SLEEP_TIMEOUT_DEFAULT_SECONDS 60U
+#define DISPLAY_SLEEP_AFTER_DIM_MS 15000U
+#define DISPLAY_SLEEP_OUT_SETTLE_MS 120U
+#define BATTERY_MAX_AWAKE_MS    300000U
 #define HOME_PIXEL_SHIFT_MS     120000
 #define HOME_STATUS_SHIFT_MS    60000
+#define WATCH_BURNIN_SHIFT_MS   90000U
+#define OUO_BURNIN_SHIFT_MS     90000U
 #define HOME_FALLBACK_MEDIA_COUNT 1
 #define HOME_EXTERNAL_MEDIA_MAX 12
 #define HOME_MEDIA_PATH_MAX     128
@@ -189,6 +217,7 @@ extern const uint8_t kkd2_complication_end[]
 #define APPS_ENTRANCE_STEPS     4
 #define FRAME_PERIOD_MS         30
 #define OUO_FRAME_PERIOD_MS     16
+#define WATCH_TOUCH_POLL_PERIOD_MS 10
 #define HOME_REFRESH_MS         1000
 #define FLUID_PERF_REPORT_MS    2000
 #define SETTINGS_SCROLL_MAX      440
@@ -203,6 +232,7 @@ extern const uint8_t kkd2_complication_end[]
  * continuously; the first fetch after connecting still happens immediately. */
 #define SKYORB_FETCH_PERIOD_MS   180000
 #define SKYORB_FETCH_RETRY_MS    15000
+#define SKYORB_WIFI_IDLE_GRACE_MS 5000
 #define SKYORB_MAX_AIRCRAFT      28
 #define SKYORB_CONFIG_NAMESPACE  "skyorb"
 #define CLOCK_CONFIG_NAMESPACE   "pacon_clock"
@@ -284,6 +314,20 @@ typedef enum {
     UI_SCREEN_SETTINGS,
     UI_SCREEN_WIFI_SETTINGS,
 } ui_screen_t;
+typedef enum {
+    DISPLAY_POWER_AWAKE = 0,
+    DISPLAY_POWER_DIMMED,
+    DISPLAY_POWER_SLEEPING,
+    DISPLAY_POWER_WAKING,
+} display_power_state_t;
+
+typedef enum {
+    IMU_POWER_UNKNOWN = 0,
+    IMU_POWER_PAUSED,
+    IMU_POWER_LOW_RATE,
+    IMU_POWER_TILT_RATE,
+} imu_power_state_t;
+
 
 typedef struct {
     float lat;
@@ -383,6 +427,8 @@ typedef enum {
 static esp_lcd_panel_handle_t s_lcd_panel;
 static esp_lcd_panel_io_handle_t s_lcd_io;
 static SemaphoreHandle_t s_lcd_done;
+static esp_pm_lock_handle_t s_ui_cpu_lock;
+static esp_pm_lock_handle_t s_network_cpu_lock;
 static uint16_t *s_lcd_stripe;
 static uint16_t *s_lcd_stripe_secondary;
 /* Native-endian RGB565 working surface.  It never goes directly to QSPI DMA:
@@ -400,7 +446,17 @@ static uint32_t s_home_perf_reads;
 static uint32_t s_home_perf_render_max_us;
 static bool s_i2c_ready;
 static bool s_imu_ready;
+static imu_power_state_t s_imu_power_state = IMU_POWER_UNKNOWN;
+static TickType_t s_imu_power_retry_after;
+static uint8_t s_imu_discard_samples;
 static bool s_touch_ready;
+static bool s_touch_monitor_active;
+static TickType_t s_touch_monitor_retry_after;
+static bool s_touch_monitor_validation_attempted;
+static bool s_touch_monitor_supported;
+static bool s_touch_watch_gesture_active;
+static bool s_touch_watch_gesture_config_attempted;
+static uint8_t s_touch_watch_gesture_last_id;
 static bool s_axp2101_ready;
 static bool s_sd_nand_mounted;
 static sdmmc_card_t *s_sd_nand_card;
@@ -470,6 +526,15 @@ static TickType_t s_camera_feedback_until;
 static TickType_t s_camera_last_frame;
 static esp_err_t s_camera_feedback_result = ESP_ERR_INVALID_STATE;
 static uint8_t s_watch_style;
+static int8_t s_watch_burnin_shift_x;
+static int8_t s_watch_burnin_shift_y;
+static uint8_t s_watch_burnin_shift_phase;
+static TickType_t s_next_watch_burnin_shift;
+static int s_watch_swipe_origin_x;
+static int s_watch_swipe_origin_y;
+static bool s_watch_swipe_handled;
+static bool s_watch_style_save_pending;
+static TickType_t s_watch_style_save_after;
 /* The BLE task may change the requested style while the UI task owns the
  * display.  Keeping the last style actually flushed lets the UI perform a
  * deterministic black-frame hand-off before drawing the other APK face. */
@@ -510,6 +575,12 @@ static bool s_skyorb_network_started;
 static bool s_skyorb_wifi_events_registered;
 static esp_err_t s_skyorb_network_status = ESP_ERR_INVALID_STATE;
 static bool s_skyorb_network_task_started;
+/* Saved Wi-Fi state is user intent; radio demand is transient so STA may stop
+ * between SkyOrb requests without changing the Settings switch or NVS. */
+static volatile bool s_wifi_radio_requested;
+static volatile bool s_wifi_radio_pause_requested;
+static TickType_t s_wifi_radio_pause_after;
+static bool s_wifi_radio_reconnect;
 /* Authoritative user-facing Wi-Fi switch state.  Connection/AP event flags
  * are transient and must not make the Settings switch appear to turn itself
  * off while the background radar task is still active. */
@@ -587,8 +658,9 @@ static esp_netif_t *s_skyorb_sta_netif;
 static TickType_t s_last_user_activity;
 static TickType_t s_next_home_pixel_shift;
 static TickType_t s_next_home_status_shift;
-static bool s_display_dimmed;
-static bool s_display_sleeping;
+static display_power_state_t s_display_power_state = DISPLAY_POWER_AWAKE;
+static TickType_t s_display_wake_ready_at;
+static bool s_display_restore_brightness_after_frame;
 static bool s_display_wake_touch_suppressed;
 static bool s_ouo_canvas_valid;
 static ouo_expression_t s_ouo_expression = OUO_EXPRESSION_IDLE;
@@ -614,6 +686,10 @@ static int64_t s_ouo_decode_last_us;
 static int64_t s_ouo_decode_window_us;
 static int s_ouo_gaze_x;
 static int s_ouo_gaze_y;
+static int8_t s_ouo_burnin_shift_x;
+static int8_t s_ouo_burnin_shift_y;
+static uint8_t s_ouo_burnin_shift_phase;
+static TickType_t s_next_ouo_burnin_shift;
 static int s_ouo_squish_pixels;
 static int s_ouo_mouth_stretch_pixels;
 static int s_ouo_mouth_x_offset;
@@ -753,6 +829,12 @@ static bool s_matrix_cell_used[MATRIX_CELLS];
 
 static esp_err_t i2c_read(uint8_t address, uint8_t reg, uint8_t *data, size_t length);
 static int clamp_int(int value, int low, int high);
+static esp_err_t init_dynamic_frequency_scaling(void);
+static bool ui_cpu_lock_acquire(void);
+static void ui_cpu_lock_release(bool acquired);
+static bool network_cpu_lock_acquire(void);
+static void network_cpu_lock_release(bool acquired);
+static void render_at_max_cpu(void (*render_fn)(void));
 static void read_tilt(int *gravity_x, int *gravity_y);
 static void skyorb_enter(void);
 static void skyorb_handle_touch(int x, int y);
@@ -761,6 +843,10 @@ static void skyorb_handle_touch_release(void);
 static void skyorb_render_frame(void);
 static void watch_enter(void);
 static void watch_handle_touch(int x, int y);
+static void watch_handle_touch_move(int x, int y);
+static void touch_service_watch_gesture(void);
+static void touch_poll_watch_gesture(void);
+static void peripheral_service_power(TickType_t now);
 static void watch_render_frame(void);
 static void camera_enter(void);
 static void camera_handle_touch(int x, int y);
@@ -774,6 +860,7 @@ static clock_time_t clock_read_rtc(void);
 static void clock_load_preferences(void);
 static void clock_service(TickType_t now);
 static void clock_save_preferences(void);
+static void watch_service_style_save(TickType_t now);
 static void alarm_stop(void);
 static void settings_enter(void);
 static void settings_handle_touch(int x, int y);
@@ -797,6 +884,99 @@ static const liquid_palette_t s_liquid_palettes[] = {
 };
 
 static liquid_palette_t s_custom_palette;
+
+static esp_err_t init_dynamic_frequency_scaling(void)
+{
+    esp_pm_lock_handle_t ui_lock = NULL;
+    esp_pm_lock_handle_t network_lock = NULL;
+    esp_err_t err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "pacon_ui", &ui_lock);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "pacon_net", &network_lock);
+    if (err != ESP_OK) {
+        (void)esp_pm_lock_delete(ui_lock);
+        return err;
+    }
+
+    const esp_pm_config_t config = {
+        .max_freq_mhz = CPU_FREQ_MAX_MHZ,
+        .min_freq_mhz = CPU_FREQ_IDLE_MHZ,
+        /* Tickless Idle/Light Sleep is a separate phase-5 experiment. */
+        .light_sleep_enable = false,
+    };
+    err = esp_pm_configure(&config);
+    if (err != ESP_OK) {
+        (void)esp_pm_lock_delete(network_lock);
+        (void)esp_pm_lock_delete(ui_lock);
+        return err;
+    }
+
+    s_ui_cpu_lock = ui_lock;
+    s_network_cpu_lock = network_lock;
+    ESP_LOGI(TAG, "[CPU-POWER] DFS enabled: %d-%d MHz; light sleep disabled",
+             CPU_FREQ_IDLE_MHZ, CPU_FREQ_MAX_MHZ);
+    return ESP_OK;
+}
+
+static bool ui_cpu_lock_acquire(void)
+{
+    if (s_ui_cpu_lock == NULL) {
+        return false;
+    }
+    const esp_err_t err = esp_pm_lock_acquire(s_ui_cpu_lock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[CPU-POWER] UI max-frequency lock failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+static void ui_cpu_lock_release(bool acquired)
+{
+    if (!acquired) {
+        return;
+    }
+    const esp_err_t err = esp_pm_lock_release(s_ui_cpu_lock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[CPU-POWER] UI max-frequency unlock failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static bool network_cpu_lock_acquire(void)
+{
+    if (s_network_cpu_lock == NULL) {
+        return false;
+    }
+    const esp_err_t err = esp_pm_lock_acquire(s_network_cpu_lock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[CPU-POWER] network max-frequency lock failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+static void network_cpu_lock_release(bool acquired)
+{
+    if (!acquired) {
+        return;
+    }
+    const esp_err_t err = esp_pm_lock_release(s_network_cpu_lock);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[CPU-POWER] network max-frequency unlock failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void render_at_max_cpu(void (*render_fn)(void))
+{
+    const bool acquired = ui_cpu_lock_acquire();
+    render_fn();
+    ui_cpu_lock_release(acquired);
+}
 
 static void hsv_to_rgb(float hue, float saturation, float value,
                        uint8_t *red, uint8_t *green, uint8_t *blue)
@@ -935,15 +1115,46 @@ static const sh8601_lcd_init_cmd_t s_lcd_init_cmds[] = {
     {0x29, (uint8_t[]){0x00}, 0, 10},
 };
 
-static esp_err_t lcd_set_brightness(uint8_t brightness)
+static esp_err_t lcd_tx_dcs(uint8_t dcs, const void *parameters, size_t parameter_size)
 {
     if (s_lcd_io == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     /* SH8601 QSPI does not accept a bare DCS command.  Match the bundled
      * driver's tx_param() encoding: opcode 0x02 + command byte on D[15:8]. */
-    const uint32_t command = (0x02UL << 24) | (0x51UL << 8);
-    return esp_lcd_panel_io_tx_param(s_lcd_io, command, &brightness, 1);
+    const uint32_t command = (0x02UL << 24) | ((uint32_t)dcs << 8);
+    return esp_lcd_panel_io_tx_param(s_lcd_io, command, parameters, parameter_size);
+}
+
+static esp_err_t lcd_set_brightness(uint8_t brightness)
+{
+    return lcd_tx_dcs(0x51, &brightness, 1);
+}
+
+static esp_err_t lcd_restore_runtime_config_after_sleep(void)
+{
+    const uint8_t spi_mode = 0x80;
+    const uint8_t tear_line[] = {0x01, 0xD1};
+    const uint8_t brightness_control = 0x20;
+    const uint8_t hbm_brightness = 0xFF;
+    const uint8_t brightness_off = 0x00;
+    const uint8_t columns[] = {0x00, 0x08, 0x01, 0xD9};
+    const uint8_t rows[] = {0x00, 0x00, 0x01, 0xD1};
+
+    esp_err_t err = lcd_tx_dcs(0xC4, &spi_mode, sizeof(spi_mode));
+    if (err == ESP_OK) err = lcd_tx_dcs(0x44, tear_line, sizeof(tear_line));
+    if (err == ESP_OK) {
+        err = lcd_tx_dcs(0x53, &brightness_control, sizeof(brightness_control));
+    }
+    if (err == ESP_OK) {
+        err = lcd_tx_dcs(0x63, &hbm_brightness, sizeof(hbm_brightness));
+    }
+    if (err == ESP_OK) {
+        err = lcd_tx_dcs(0x51, &brightness_off, sizeof(brightness_off));
+    }
+    if (err == ESP_OK) err = lcd_tx_dcs(0x2A, columns, sizeof(columns));
+    if (err == ESP_OK) err = lcd_tx_dcs(0x2B, rows, sizeof(rows));
+    return err;
 }
 
 static esp_err_t lcd_hold_power_off(void)
@@ -1004,6 +1215,12 @@ static void settings_save_display_timeout(void)
     nvs_close(nvs);
 }
 
+static bool display_power_inactive(void)
+{
+    return s_display_power_state == DISPLAY_POWER_SLEEPING ||
+           s_display_power_state == DISPLAY_POWER_WAKING;
+}
+
 static void apply_ble_brightness_if_pending(void)
 {
     if (!s_ble_brightness_pending) return;
@@ -1012,84 +1229,165 @@ static void apply_ble_brightness_if_pending(void)
     s_user_brightness = (uint8_t)clamp_int(brightness,
                                            SETTINGS_BRIGHTNESS_MIN,
                                            SETTINGS_BRIGHTNESS_MAX);
+    settings_save_brightness();
+    s_home_dirty = true;
+    s_device_settings_dirty = true;
+    if (display_power_inactive()) {
+        ESP_LOGI(TAG, "BLE: saved brightness=0x%02X for panel wake", s_user_brightness);
+        return;
+    }
     if (lcd_set_brightness(s_user_brightness) == ESP_OK) {
-        s_display_dimmed = false;
+        s_display_power_state = DISPLAY_POWER_AWAKE;
         s_last_user_activity = xTaskGetTickCount();
-        settings_save_brightness();
-        s_home_dirty = true;
-        s_device_settings_dirty = true;
         ESP_LOGI(TAG, "BLE: applied brightness register=0x%02X", s_user_brightness);
     } else {
         ESP_LOGW(TAG, "BLE: brightness update failed");
     }
 }
 
+static void display_mark_current_screen_dirty(void)
+{
+    switch (s_ui_screen) {
+    case UI_SCREEN_HOME: s_home_dirty = true; break;
+    case UI_SCREEN_APPS: s_apps_dirty = true; break;
+    case UI_SCREEN_FLUID_SETTINGS:
+        s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+        s_settings_dirty = true; break;
+    case UI_SCREEN_COLOUR_PICKER:
+        s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
+        s_colour_picker_dirty = true; break;
+    case UI_SCREEN_OUO: s_ouo_dirty = true; break;
+    case UI_SCREEN_OUO_MENU: s_ouo_menu_dirty = true; break;
+    case UI_SCREEN_USB_DISK: s_usb_disk_dirty = true; break;
+    case UI_SCREEN_SKYORB: s_skyorb_dirty = true; break;
+    case UI_SCREEN_WATCH: s_watch_dirty = true; break;
+    case UI_SCREEN_CAMERA: s_camera_dirty = true; break;
+    case UI_SCREEN_MIC_TEST: s_mic_test_dirty = true; break;
+    case UI_SCREEN_SETTINGS: s_device_settings_dirty = true; break;
+    case UI_SCREEN_WIFI_SETTINGS: s_wifi_settings_dirty = true; break;
+    case UI_SCREEN_FLUID:
+    default:
+        break;
+    }
+}
+
+static esp_err_t display_enter_sleep(void)
+{
+    if (s_lcd_panel == NULL || display_power_inactive()) return ESP_ERR_INVALID_STATE;
+
+    (void)lcd_set_brightness(0);
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_lcd_panel, false);
+    if (err == ESP_OK) err = lcd_tx_dcs(0x10, NULL, 0); /* SLPIN */
+    if (err != ESP_OK) {
+        (void)esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+        (void)lcd_set_brightness(s_user_brightness);
+        s_display_power_state = DISPLAY_POWER_AWAKE;
+        return err;
+    }
+    s_display_power_state = DISPLAY_POWER_SLEEPING;
+    s_display_restore_brightness_after_frame = false;
+    ESP_LOGI(TAG, "OLED: DISPOFF -> SLPIN complete");
+    return ESP_OK;
+}
+
+static void display_request_wake(TickType_t now)
+{
+    if (s_display_power_state != DISPLAY_POWER_SLEEPING) return;
+    const esp_err_t err = lcd_tx_dcs(0x11, NULL, 0); /* SLPOUT */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OLED: SLPOUT failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_display_power_state = DISPLAY_POWER_WAKING;
+    s_display_wake_ready_at = now + pdMS_TO_TICKS(DISPLAY_SLEEP_OUT_SETTLE_MS);
+    ESP_LOGI(TAG, "OLED: SLPOUT sent; settling for %u ms",
+             (unsigned)DISPLAY_SLEEP_OUT_SETTLE_MS);
+}
+
+static void display_service_power(TickType_t now)
+{
+    if (s_display_power_state != DISPLAY_POWER_WAKING ||
+        (int32_t)(now - s_display_wake_ready_at) < 0) {
+        return;
+    }
+
+    esp_err_t err = lcd_restore_runtime_config_after_sleep();
+    if (err == ESP_OK) err = esp_lcd_panel_disp_on_off(s_lcd_panel, true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OLED: wake restore failed: %s", esp_err_to_name(err));
+        s_display_wake_ready_at = now + pdMS_TO_TICKS(100);
+        return;
+    }
+
+    display_mark_current_screen_dirty();
+    s_display_power_state = DISPLAY_POWER_AWAKE;
+    s_display_restore_brightness_after_frame = true;
+    s_last_user_activity = now;
+    ESP_LOGI(TAG, "OLED: DISPON at zero brightness; redraw requested");
+}
+
+static void display_restore_brightness_after_frame(void)
+{
+    if (!s_display_restore_brightness_after_frame ||
+        s_display_power_state != DISPLAY_POWER_AWAKE) {
+        return;
+    }
+    if (lcd_set_brightness(s_user_brightness) == ESP_OK) {
+        s_display_restore_brightness_after_frame = false;
+        ESP_LOGI(TAG, "OLED: redraw complete; brightness restored");
+    }
+}
+
 static void display_note_activity(void)
 {
-    s_last_user_activity = xTaskGetTickCount();
-    bool woke_panel = false;
-    if (s_display_sleeping && s_lcd_panel != NULL) {
-        if (esp_lcd_panel_disp_on_off(s_lcd_panel, true) == ESP_OK) {
-            s_display_sleeping = false;
-            woke_panel = true;
-            ESP_LOGI(TAG, "OLED: panel woke on touch");
-
-            /* SH8601 display-off/on is not guaranteed to preserve the visible
-             * frame on every panel revision.  Force the active screen through
-             * its normal renderer after wake instead of assuming GRAM is still
-             * visible. */
-            switch (s_ui_screen) {
-            case UI_SCREEN_HOME: s_home_dirty = true; break;
-            case UI_SCREEN_APPS: s_apps_dirty = true; break;
-            case UI_SCREEN_FLUID_SETTINGS:
-                s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
-                s_settings_dirty = true; break;
-            case UI_SCREEN_COLOUR_PICKER:
-                s_fluid_controls_canvas_screen = UI_SCREEN_HOME;
-                s_colour_picker_dirty = true; break;
-            case UI_SCREEN_OUO: s_ouo_dirty = true; break;
-            case UI_SCREEN_OUO_MENU: s_ouo_menu_dirty = true; break;
-            case UI_SCREEN_USB_DISK: s_usb_disk_dirty = true; break;
-            case UI_SCREEN_SKYORB: s_skyorb_dirty = true; break;
-            case UI_SCREEN_WATCH: s_watch_dirty = true; break;
-            case UI_SCREEN_SETTINGS: s_device_settings_dirty = true; break;
-            case UI_SCREEN_WIFI_SETTINGS: s_wifi_settings_dirty = true; break;
-            case UI_SCREEN_FLUID:
-            default:
-                break;
-            }
-        }
+    const TickType_t now = xTaskGetTickCount();
+    s_last_user_activity = now;
+    if (s_display_power_state == DISPLAY_POWER_SLEEPING) {
+        display_request_wake(now);
+        return;
     }
-    if (!s_display_sleeping && (s_display_dimmed || woke_panel)) {
-        if (lcd_set_brightness(s_user_brightness) == ESP_OK) {
-            s_display_dimmed = false;
-            ESP_LOGI(TAG, "OLED: restored normal brightness");
-        }
+    if (s_display_power_state == DISPLAY_POWER_WAKING) return;
+    if (s_display_power_state == DISPLAY_POWER_DIMMED &&
+        lcd_set_brightness(s_user_brightness) == ESP_OK) {
+        s_display_power_state = DISPLAY_POWER_AWAKE;
+        ESP_LOGI(TAG, "OLED: restored normal brightness");
     }
 }
 
 static void display_update_idle(TickType_t now)
 {
-    if (s_lcd_panel == NULL || s_ui_screen == UI_SCREEN_USB_DISK ||
-        s_last_user_activity == 0 || s_display_sleeping) {
+    if (s_lcd_panel == NULL || s_last_user_activity == 0 ||
+        display_power_inactive()) {
         return;
     }
 
     const TickType_t idle = now - s_last_user_activity;
-    const uint32_t sleep_timeout_ms =
+    const uint32_t configured_timeout_ms =
         (uint32_t)s_display_sleep_timeout_seconds * 1000U;
+    uint32_t dim_timeout_ms = configured_timeout_ms;
+    uint32_t sleep_timeout_ms = configured_timeout_ms == 0U ? 0U :
+                                configured_timeout_ms + DISPLAY_SLEEP_AFTER_DIM_MS;
+    /* A disabled or unusually long user timeout must not leave the AMOLED
+     * continuously lit from the 250 mAh cell.  USB power, including the
+     * dedicated USB Disk page, keeps the explicit persisted user setting. */
+    if (!s_vbus_present &&
+        (sleep_timeout_ms == 0U || sleep_timeout_ms > BATTERY_MAX_AWAKE_MS)) {
+        sleep_timeout_ms = BATTERY_MAX_AWAKE_MS;
+    }
     if (sleep_timeout_ms != 0U && idle >= pdMS_TO_TICKS(sleep_timeout_ms)) {
-        if (esp_lcd_panel_disp_on_off(s_lcd_panel, false) == ESP_OK) {
-            s_display_sleeping = true;
-            ESP_LOGI(TAG, "OLED: panel blanked after %lu ms idle",
+        if (display_enter_sleep() == ESP_OK) {
+            ESP_LOGI(TAG, "OLED: panel sleeping after %lu ms idle",
                      (unsigned long)sleep_timeout_ms);
         }
         return;
     }
-    if (!s_display_dimmed && idle >= pdMS_TO_TICKS(DISPLAY_DIM_TIMEOUT_MS) &&
+    if (s_display_power_state == DISPLAY_POWER_AWAKE &&
+        dim_timeout_ms != 0U && idle >= pdMS_TO_TICKS(dim_timeout_ms) &&
         lcd_set_brightness(LCD_BRIGHTNESS_DIM) == ESP_OK) {
-        s_display_dimmed = true;
-        ESP_LOGI(TAG, "OLED: dimmed after %d ms idle", DISPLAY_DIM_TIMEOUT_MS);
+        s_display_power_state = DISPLAY_POWER_DIMMED;
+        ESP_LOGI(TAG, "OLED: dimmed after %lu ms idle; sleep in %u ms",
+                 (unsigned long)dim_timeout_ms,
+                 (unsigned)DISPLAY_SLEEP_AFTER_DIM_MS);
     }
 }
 
@@ -3361,8 +3659,8 @@ static void ouo_blit_idle_tiles(const dirty_rect_t *dirty)
         }
         s_ouo_idle_palette_ready = true;
     }
-    const int shift_x = s_ouo_gaze_x + s_ouo_shake_x;
-    const int shift_y = s_ouo_gaze_y + s_ouo_shake_y;
+    const int shift_x = s_ouo_gaze_x + s_ouo_shake_x + s_ouo_burnin_shift_x;
+    const int shift_y = s_ouo_gaze_y + s_ouo_shake_y + s_ouo_burnin_shift_y;
     const int lefts[3] = {OUO_LEFT_EYE_X - 48 + shift_x,
                           OUO_RIGHT_EYE_X - 48 + shift_x,
                           OUO_FACE_CENTER_X - 48 + shift_x};
@@ -3395,8 +3693,8 @@ static uint16_t ouo_pixel(int x, int y)
     const uint16_t white = rgb565(250, 250, 250);
     /* Geometry is scaled from captures of OuO 1.611 rather than reconstructed
      * from the launcher icon. */
-    const int face_shift_x = s_ouo_gaze_x + s_ouo_shake_x;
-    const int face_shift_y = s_ouo_gaze_y + s_ouo_shake_y;
+    const int face_shift_x = s_ouo_gaze_x + s_ouo_shake_x + s_ouo_burnin_shift_x;
+    const int face_shift_y = s_ouo_gaze_y + s_ouo_shake_y + s_ouo_burnin_shift_y;
     if (s_ouo_idle_visible && s_ouo_idle_tiles != NULL &&
         s_ouo_auto_expressions && !s_ouo_touch_active &&
         s_ouo_expression == OUO_EXPRESSION_IDLE) {
@@ -4220,6 +4518,27 @@ static void clock_save_preferences(void)
     nvs_close(handle);
 }
 
+static void watch_schedule_style_save(void)
+{
+    s_watch_style_save_pending = true;
+    s_watch_style_save_after = xTaskGetTickCount() +
+                               pdMS_TO_TICKS(WATCH_STYLE_SAVE_IDLE_MS);
+}
+
+static void watch_service_style_save(TickType_t now)
+{
+    if (!s_watch_style_save_pending || s_touch_down ||
+        (int32_t)(now - s_watch_style_save_after) < 0) {
+        return;
+    }
+
+    /* nvs_commit() can stall this board for roughly 0.6 s. Persist only
+     * after the swipe burst has gone idle, and coalesce all changes in that
+     * burst into one flash write. */
+    s_watch_style_save_pending = false;
+    clock_save_preferences();
+}
+
 static bool alarm_buzzer_init(void)
 {
     if (s_alarm_buzzer_ready) return true;
@@ -4886,7 +5205,255 @@ static void init_touch(void)
 
     uint8_t mode = 0;
     s_touch_ready = i2c_read(ADDR_TOUCH, 0x00, &mode, 1) == ESP_OK;
+    s_touch_monitor_active = false;
+    s_touch_monitor_retry_after = 0;
+    s_touch_monitor_validation_attempted = false;
+    s_touch_monitor_supported = false;
+    s_touch_watch_gesture_active = false;
+    s_touch_watch_gesture_config_attempted = false;
+    s_touch_watch_gesture_last_id = 0;
     ESP_LOGI(TAG, "FT3168 touch: %s", s_touch_ready ? "ready" : "not available");
+}
+
+static bool touch_validate_monitor_on_shared_i2c(void)
+{
+    if (s_touch_monitor_validation_attempted) return s_touch_monitor_supported;
+    s_touch_monitor_validation_attempted = true;
+
+    uint8_t touch_before = 0xFF;
+    uint8_t touch_after = 0xFF;
+    uint8_t axp_id = 0;
+    uint8_t imu_id = 0;
+    uint8_t rtc_status = 0;
+    const esp_err_t touch_before_err =
+        i2c_read(ADDR_TOUCH, FT3168_REG_POWER_MODE, &touch_before, 1);
+    const esp_err_t axp_err = i2c_read(ADDR_AXP2101, 0x03, &axp_id, 1);
+    const esp_err_t imu_err = i2c_read(ADDR_QMI8658, 0x00, &imu_id, 1);
+    const esp_err_t rtc_err = i2c_read(ADDR_PCF85063, 0x00, &rtc_status, 1);
+    const esp_err_t touch_after_err =
+        i2c_read(ADDR_TOUCH, FT3168_REG_POWER_MODE, &touch_after, 1);
+
+    s_touch_monitor_supported = touch_before_err == ESP_OK &&
+        touch_after_err == ESP_OK && touch_before == FT3168_POWER_ACTIVE &&
+        touch_after == FT3168_POWER_ACTIVE && axp_err == ESP_OK &&
+        (axp_id == AXP2101_CHIP_ID || axp_id == AXP2101_CHIP_ID2) &&
+        imu_err == ESP_OK && imu_id == 0x05 && rtc_err == ESP_OK;
+    if (s_touch_monitor_supported) {
+        ESP_LOGI(TAG,
+                 "FT3168: shared I2C validation passed; Monitor wake may be enabled");
+    } else {
+        ESP_LOGW(TAG,
+                 "FT3168: shared I2C validation failed; keeping Active "
+                 "(touch=%s/%s mode=0x%02X/0x%02X axp=%s/0x%02X "
+                 "imu=%s/0x%02X rtc=%s)",
+                 esp_err_to_name(touch_before_err), esp_err_to_name(touch_after_err),
+                 touch_before, touch_after, esp_err_to_name(axp_err), axp_id,
+                 esp_err_to_name(imu_err), imu_id, esp_err_to_name(rtc_err));
+    }
+    return s_touch_monitor_supported;
+}
+
+static void touch_enter_monitor(void)
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (!s_touch_ready || s_touch_monitor_active ||
+        (s_touch_monitor_retry_after != 0 &&
+         (int32_t)(now - s_touch_monitor_retry_after) < 0) ||
+        !touch_validate_monitor_on_shared_i2c()) {
+        return;
+    }
+
+    /* The watch gesture engine and Monitor both alter the controller's scan
+     * path.  Disable gestures first, then let the normal page service restore
+     * them only after the panel is awake again. */
+    if (s_touch_watch_gesture_active) {
+        const esp_err_t gesture_err =
+            i2c_write_byte(ADDR_TOUCH, FT3168_REG_GESTURE_ENABLE, 0x00);
+        if (gesture_err != ESP_OK) {
+            ESP_LOGW(TAG, "FT3168: refusing Monitor after gesture-disable failure: %s",
+                     esp_err_to_name(gesture_err));
+            return;
+        }
+        s_touch_watch_gesture_active = false;
+        s_touch_watch_gesture_last_id = 0;
+    }
+    s_touch_watch_gesture_config_attempted = false;
+
+    const esp_err_t write_err =
+        i2c_write_byte(ADDR_TOUCH, FT3168_REG_POWER_MODE, FT3168_POWER_MONITOR);
+    if (write_err == ESP_OK) {
+        /* FT3168 latches Monitor asynchronously.  The board returns the old
+         * 0x00 value immediately after an acknowledged write and, once the
+         * mode is active, intentionally stops answering after another slave
+         * uses the bus.  Treat the write ACK as authoritative; a touch event
+         * restores Active mode and clears the controller's I2C state. */
+        s_touch_monitor_active = true;
+        s_touch_monitor_retry_after = 0;
+        ESP_LOGI(TAG, "FT3168: Monitor mode enabled for OLED sleep");
+    } else {
+        /* A failed transition stays on the proven Active path.
+         * Never trade the only screen-wake input for a small power saving. */
+        s_touch_monitor_active = false;
+        s_touch_monitor_retry_after = now + pdMS_TO_TICKS(1000);
+        ESP_LOGW(TAG, "FT3168: Monitor write failed; keeping Active (%s)",
+                 esp_err_to_name(write_err));
+    }
+}
+
+static void touch_leave_monitor(void)
+{
+    if (!s_touch_monitor_active) return;
+    const esp_err_t err =
+        i2c_write_byte(ADDR_TOUCH, FT3168_REG_POWER_MODE, FT3168_POWER_ACTIVE);
+    if (err == ESP_OK) {
+        s_touch_monitor_active = false;
+        s_touch_monitor_retry_after = 0;
+        s_touch_watch_gesture_config_attempted = false;
+        ESP_LOGI(TAG, "FT3168: Active mode restored");
+    } else {
+        s_touch_monitor_retry_after = xTaskGetTickCount() + pdMS_TO_TICKS(250);
+        ESP_LOGW(TAG, "FT3168: Active restore failed; touch wake may retry: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void touch_service_watch_gesture(void)
+{
+    if (!s_touch_ready) return;
+    if (display_power_inactive()) return;
+    if (s_touch_watch_gesture_active && s_ui_screen != UI_SCREEN_WATCH) {
+        const esp_err_t result =
+            i2c_write_byte(ADDR_TOUCH, FT3168_REG_GESTURE_ENABLE, 0x00);
+        if (result != ESP_OK) {
+            ESP_LOGW(TAG, "FT3168 watch gesture disable failed: %s",
+                     esp_err_to_name(result));
+        }
+        s_touch_watch_gesture_active = false;
+        s_touch_watch_gesture_last_id = 0;
+        s_touch_down = false;
+        return;
+    }
+    if (s_ui_screen != UI_SCREEN_WATCH || s_touch_watch_gesture_active ||
+        s_touch_watch_gesture_config_attempted) return;
+
+    s_touch_watch_gesture_config_attempted = true;
+    const esp_err_t mask_result =
+        i2c_write_byte(ADDR_TOUCH, FT3168_REG_GESTURE_MASK,
+                       FT3168_GESTURE_LEFT_RIGHT);
+    const esp_err_t enable_result =
+        i2c_write_byte(ADDR_TOUCH, FT3168_REG_GESTURE_ENABLE, 0x01);
+    uint8_t readback = 0xFF;
+    const esp_err_t read_result =
+        i2c_read(ADDR_TOUCH, FT3168_REG_GESTURE_ENABLE, &readback, 1);
+    s_touch_watch_gesture_active = mask_result == ESP_OK &&
+        enable_result == ESP_OK && read_result == ESP_OK && readback == 0x01;
+    s_touch_watch_gesture_last_id = 0;
+    if (s_touch_watch_gesture_active) {
+        ESP_LOGI(TAG, "FT3168 hardware watch gestures enabled");
+    } else {
+        ESP_LOGW(TAG,
+                 "FT3168 hardware watch gestures unavailable; using coordinate fallback "
+                 "(mask=%s enable=%s read=%s value=0x%02X)",
+                 esp_err_to_name(mask_result), esp_err_to_name(enable_result),
+                 esp_err_to_name(read_result), readback);
+    }
+}
+
+static void display_update_feature_burnin_offsets(TickType_t now)
+{
+    static const int8_t kWatchOffsets[][2] = {
+        {0, 0}, {2, 0}, {2, 2}, {0, 2}, {-2, 2}, {-2, 0}, {-2, -2}, {0, -2},
+    };
+    static const int8_t kOuoOffsets[][2] = {
+        {0, 0}, {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1},
+    };
+
+    if (s_ui_screen == UI_SCREEN_WATCH &&
+        (int32_t)(now - s_next_watch_burnin_shift) >= 0) {
+        s_watch_burnin_shift_phase = (uint8_t)((s_watch_burnin_shift_phase + 1U) %
+            (sizeof(kWatchOffsets) / sizeof(kWatchOffsets[0])));
+        s_watch_burnin_shift_x = kWatchOffsets[s_watch_burnin_shift_phase][0];
+        s_watch_burnin_shift_y = kWatchOffsets[s_watch_burnin_shift_phase][1];
+        s_watch_dirty = true;
+        s_next_watch_burnin_shift = now + pdMS_TO_TICKS(WATCH_BURNIN_SHIFT_MS);
+    }
+    if (s_ui_screen == UI_SCREEN_OUO &&
+        (int32_t)(now - s_next_ouo_burnin_shift) >= 0) {
+        s_ouo_burnin_shift_phase = (uint8_t)((s_ouo_burnin_shift_phase + 1U) %
+            (sizeof(kOuoOffsets) / sizeof(kOuoOffsets[0])));
+        s_ouo_burnin_shift_x = kOuoOffsets[s_ouo_burnin_shift_phase][0];
+        s_ouo_burnin_shift_y = kOuoOffsets[s_ouo_burnin_shift_phase][1];
+        s_ouo_canvas_valid = false;
+        s_ouo_dirty = true;
+        s_next_ouo_burnin_shift = now + pdMS_TO_TICKS(OUO_BURNIN_SHIFT_MS);
+    }
+}
+
+static void touch_poll_watch_gesture(void)
+{
+    uint8_t gesture_id = 0;
+    if (i2c_read(ADDR_TOUCH, FT3168_REG_GESTURE_ID, &gesture_id, 1) != ESP_OK) {
+        return;
+    }
+    if (gesture_id != s_touch_watch_gesture_last_id) {
+        if ((gesture_id == FT3168_GESTURE_SWIPE_LEFT ||
+             gesture_id == FT3168_GESTURE_SWIPE_RIGHT) &&
+            !s_display_wake_touch_suppressed) {
+            const uint8_t previous = s_watch_style;
+            s_watch_style = (uint8_t)(1U - s_watch_style);
+            watch_schedule_style_save();
+            s_watch_dirty = true;
+            s_watch_last_frame = 0;
+            s_watch_display_seconds = -1;
+            block_touch_until_release();
+            display_note_activity();
+            ESP_LOGI(TAG, "Watch: hardware %s swipe switched %s -> %s",
+                     gesture_id == FT3168_GESTURE_SWIPE_LEFT ? "left" : "right",
+                     previous == 1U ? "KKD2" : "KKD1",
+                     s_watch_style == 1U ? "KKD2" : "KKD1");
+        }
+        s_touch_watch_gesture_last_id = gesture_id;
+    }
+
+    uint8_t count = 0;
+    if (i2c_read(ADDR_TOUCH, FT3168_REG_TOUCH_COUNT, &count, 1) != ESP_OK) {
+        return;
+    }
+    if ((count & 0x0FU) == 0U) {
+        s_touch_down = false;
+        s_touch_blocked_until_release = false;
+        s_display_wake_touch_suppressed = false;
+        return;
+    }
+
+    uint8_t point[4] = {0};
+    if (i2c_read(ADDR_TOUCH, FT3168_REG_TOUCH_POINT1, point, sizeof(point)) != ESP_OK) {
+        return;
+    }
+    const int x = ((point[0] & 0x0F) << 8) | point[1];
+    const int y = ((point[2] & 0x0F) << 8) | point[3];
+    if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) {
+        return;
+    }
+    if (!s_touch_down) {
+        if (display_power_inactive()) {
+            display_note_activity();
+            s_display_wake_touch_suppressed = true;
+        } else if (!s_touch_blocked_until_release) {
+            display_note_activity();
+            if (s_alarm_ringing) {
+                alarm_stop();
+                block_touch_until_release();
+                ESP_LOGI(TAG, "Watch: alarm dismissed by touch");
+            } else if (x < 104 && y < 104) {
+                s_ui_screen = UI_SCREEN_HOME;
+                s_home_dirty = true;
+                block_touch_until_release();
+                ESP_LOGI(TAG, "Watch: returned home");
+            }
+        }
+    }
+    s_touch_down = true;
 }
 
 static void init_imu(void)
@@ -4901,18 +5468,96 @@ static void init_imu(void)
     }
 
     /* 8 g range, 250 Hz output rate, accelerometer only. */
-    esp_err_t err = i2c_write_byte(ADDR_QMI8658, 0x08, 0x00);
+    esp_err_t err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL7, 0x00);
     if (err == ESP_OK) {
-        err = i2c_write_byte(ADDR_QMI8658, 0x02, 0x60);
+        err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL1, 0x60);
     }
     if (err == ESP_OK) {
-        err = i2c_write_byte(ADDR_QMI8658, 0x03, 0x25);
+        err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL2,
+                             QMI8658_CTRL2_8G_250HZ);
     }
     if (err == ESP_OK) {
-        err = i2c_write_byte(ADDR_QMI8658, 0x08, 0x01);
+        err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL7, 0x01);
     }
     s_imu_ready = err == ESP_OK;
+    s_imu_power_state = s_imu_ready ? IMU_POWER_TILT_RATE : IMU_POWER_UNKNOWN;
+    s_imu_power_retry_after = 0;
+    s_imu_discard_samples = 0;
     ESP_LOGI(TAG, "QMI8658 tilt control: %s", esp_err_to_name(err));
+}
+
+static esp_err_t imu_set_power_state(imu_power_state_t requested)
+{
+    esp_err_t err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL7, 0x00);
+    if (err != ESP_OK || requested == IMU_POWER_PAUSED) return err;
+
+    const uint8_t ctrl2 = requested == IMU_POWER_TILT_RATE ?
+                          QMI8658_CTRL2_8G_250HZ : QMI8658_CTRL2_8G_3HZ_LP;
+    err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL2, ctrl2);
+    if (err == ESP_OK) {
+        err = i2c_write_byte(ADDR_QMI8658, QMI8658_REG_CTRL7, 0x01);
+    }
+    return err;
+}
+
+static const char *imu_power_state_name(imu_power_state_t state)
+{
+    switch (state) {
+    case IMU_POWER_PAUSED: return "paused";
+    case IMU_POWER_LOW_RATE: return "3 Hz low-power";
+    case IMU_POWER_TILT_RATE: return "250 Hz tilt";
+    case IMU_POWER_UNKNOWN:
+    default: return "unknown";
+    }
+}
+
+static void peripheral_service_power(TickType_t now)
+{
+    /* If a non-touch wake path is added later, restore FT3168 before talking
+     * to another slave: the FT3168 data sheet calls out shared-bus access as a
+     * special case while Monitor is active. */
+    if (s_display_power_state != DISPLAY_POWER_SLEEPING &&
+        s_touch_monitor_active &&
+        (s_touch_monitor_retry_after == 0 ||
+         (int32_t)(now - s_touch_monitor_retry_after) >= 0)) {
+        touch_leave_monitor();
+    } else if (s_display_power_state != DISPLAY_POWER_SLEEPING &&
+               !s_touch_monitor_active) {
+        s_touch_monitor_retry_after = 0;
+    }
+
+    if (s_imu_ready &&
+        (s_imu_power_retry_after == 0 ||
+         (int32_t)(now - s_imu_power_retry_after) >= 0)) {
+        imu_power_state_t requested = IMU_POWER_LOW_RATE;
+        if (s_display_power_state == DISPLAY_POWER_SLEEPING) {
+            requested = IMU_POWER_PAUSED;
+        } else if (s_ui_screen == UI_SCREEN_FLUID ||
+                   (s_ui_screen == UI_SCREEN_OUO && s_ouo_tilt_reactions)) {
+            requested = IMU_POWER_TILT_RATE;
+        }
+        if (requested != s_imu_power_state) {
+            const esp_err_t err = imu_set_power_state(requested);
+            if (err == ESP_OK) {
+                s_imu_power_state = requested;
+                s_imu_power_retry_after = 0;
+                s_imu_discard_samples = requested == IMU_POWER_PAUSED ? 0 : 3;
+                ESP_LOGI(TAG, "QMI8658: %s", imu_power_state_name(requested));
+            } else {
+                s_imu_power_state = IMU_POWER_UNKNOWN;
+                s_imu_power_retry_after = now + pdMS_TO_TICKS(1000);
+                ESP_LOGW(TAG, "QMI8658 power transition failed: %s",
+                         esp_err_to_name(err));
+            }
+        }
+    }
+
+    /* Enter Monitor only after the IMU transition; touch polling remains the
+     * next deliberate transaction so a contact can wake the display. */
+    if (s_display_power_state == DISPLAY_POWER_SLEEPING &&
+        s_ui_screen != UI_SCREEN_USB_DISK) {
+        touch_enter_monitor();
+    }
 }
 
 /* The board now uses the 0x47 AXP2101 variant, while some parts report 0x4A. */
@@ -4950,9 +5595,14 @@ static void read_tilt(int *gravity_x, int *gravity_y)
     if (!s_imu_ready) {
         return;
     }
+    if (s_imu_power_state != IMU_POWER_TILT_RATE) return;
 
     uint8_t raw[6] = {0};
     if (i2c_read(ADDR_QMI8658, 0x35, raw, sizeof(raw)) != ESP_OK) {
+        return;
+    }
+    if (s_imu_discard_samples != 0) {
+        --s_imu_discard_samples;
         return;
     }
     int16_t accel_x = (int16_t)(((uint16_t)raw[1] << 8) | raw[0]);
@@ -5146,9 +5796,14 @@ static void fluid_colour_picker_touch(int x, int y)
     s_touch_down = true;
 }
 
+
 static void poll_touch(void)
 {
     if (!s_touch_ready) {
+        return;
+    }
+    if (s_touch_watch_gesture_active) {
+        touch_poll_watch_gesture();
         return;
     }
     uint8_t count = 0;
@@ -5175,6 +5830,15 @@ static void poll_touch(void)
         return;
     }
 
+    /* Monitor mode only detects a valid contact, then the controller returns
+     * itself to Active before coordinates are reported. */
+    if (s_touch_monitor_active) {
+        s_touch_monitor_active = false;
+        s_touch_monitor_retry_after = 0;
+        s_touch_watch_gesture_config_attempted = false;
+        ESP_LOGI(TAG, "FT3168: touch restored Active mode");
+    }
+
     /* Only the primary contact is consumed.  The current PACON interaction
      * model deliberately stays single-pointer; a second reported contact is
      * ignored instead of entering a separate squeeze state. */
@@ -5182,13 +5846,14 @@ static void poll_touch(void)
     if (i2c_read(ADDR_TOUCH, 0x03, point, sizeof(point)) != ESP_OK) {
         return;
     }
+    const uint8_t touch_event = (point[0] >> 6) & 0x03U;
     int x = ((point[0] & 0x0F) << 8) | point[1];
     int y = ((point[2] & 0x0F) << 8) | point[3];
     if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) {
         return;
     }
 
-    if (s_display_sleeping) {
+    if (display_power_inactive()) {
         display_note_activity();
         s_display_wake_touch_suppressed = true;
         s_touch_down = true;
@@ -5199,7 +5864,15 @@ static void poll_touch(void)
         return;
     }
     display_note_activity();
-
+    /* FT3168 DOWN is a stronger boundary than a possibly missed zero-contact
+     * sample.  Re-arm only the watch gesture; other pages retain their strict
+     * release ownership for navigation safety. */
+    if (s_ui_screen == UI_SCREEN_WATCH && touch_event == 0U &&
+        s_touch_blocked_until_release) {
+        s_touch_blocked_until_release = false;
+        s_touch_down = false;
+        s_watch_swipe_handled = false;
+    }
     /* Page transitions are edge-triggered.  Ignore all samples from the
      * contact that caused the transition and wait for FT3168 to report zero
      * contacts before arming another page gesture. */
@@ -5366,6 +6039,8 @@ static void poll_touch(void)
     if (s_ui_screen == UI_SCREEN_WATCH) {
         if (!s_touch_down) {
             watch_handle_touch(x, y);
+        } else {
+            watch_handle_touch_move(x, y);
         }
         s_touch_down = true;
         return;
@@ -6131,6 +6806,9 @@ static bool flush_canvas_rect(const dirty_rect_t *rect)
         }
         ++queued;
         ++stripe_index;
+        /* A watch face is a full-frame transfer.  Sampling between its eight
+         * DMA stripes prevents a quick swipe from living entirely in a blind window. */
+        if (s_ui_screen == UI_SCREEN_WATCH) poll_touch();
     }
     while (queued > 0) {
         if (xSemaphoreTake(s_lcd_done, pdMS_TO_TICKS(250)) != pdTRUE) {
@@ -6684,6 +7362,9 @@ static esp_err_t fluid_ble_command(const char *command, char *response,
     }
     if (strcasecmp(text, "SYNC WIFI TIME") == 0) {
         s_clock_wifi_sync_requested = true;
+        s_wifi_radio_requested = s_skyorb_wifi_enabled;
+        s_wifi_radio_pause_requested = false;
+        s_wifi_radio_pause_after = 0;
         s_clock_sync_state = s_skyorb_wifi_connected ? CLOCK_SYNC_IDLE : CLOCK_SYNC_WAIT_WIFI;
         snprintf(response, response_size, "OK WIFI TIME PENDING\r\n");
         return ESP_OK;
@@ -6941,6 +7622,9 @@ static bool skyorb_connect_saved_station(void)
     }
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
     if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_STA, &station);
+    /* Authenticate and obtain DHCP at full radio availability, then enable
+     * MIN_MODEM in GOT_IP. */
+    if (err == ESP_OK) err = esp_wifi_set_ps(WIFI_PS_NONE);
     s_wifi_connect_started = xTaskGetTickCount();
     if (err == ESP_OK) err = esp_wifi_connect();
     s_skyorb_wifi_connected = false;
@@ -6988,6 +7672,10 @@ static void skyorb_disable_network(void)
     s_wifi_connect_requested = false;
     s_wifi_connect_after_scan = false;
     s_wifi_scan_requested = false;
+    s_wifi_radio_requested = false;
+    s_wifi_radio_pause_requested = false;
+    s_wifi_radio_pause_after = 0;
+    s_wifi_radio_reconnect = false;
 
     (void)esp_wifi_disconnect();
     const esp_err_t err = esp_wifi_stop();
@@ -7005,6 +7693,39 @@ static void skyorb_disable_network(void)
     s_skyorb_network_status = (err == ESP_ERR_INVALID_STATE) ? ESP_OK : err;
     skyorb_mark_dirty();
     ESP_LOGI(TAG, "SkyOrb: Wi-Fi disabled; radar network paused (%s)",
+             err == ESP_ERR_INVALID_STATE ? "already stopped" : esp_err_to_name(err));
+}
+
+/* Called only by the network task, after any scan/HTTP operation has finished. */
+static void skyorb_pause_radio(void)
+{
+    if (!s_skyorb_network_started) {
+        s_wifi_radio_requested = false;
+        s_wifi_radio_pause_requested = false;
+        s_wifi_radio_pause_after = 0;
+        return;
+    }
+    s_wifi_radio_reconnect = s_skyorb_wifi_connected ||
+        s_wifi_link_state == WIFI_LINK_CONNECTING ||
+        s_wifi_link_state == WIFI_LINK_ASSOCIATED;
+    s_wifi_should_connect = false;
+    s_wifi_connect_requested = false;
+    s_wifi_connect_after_scan = false;
+    s_wifi_scan_requested = false;
+    s_wifi_radio_requested = false;
+    s_wifi_radio_pause_requested = false;
+    s_wifi_radio_pause_after = 0;
+    (void)esp_wifi_disconnect();
+    const esp_err_t err = esp_wifi_stop();
+    s_skyorb_network_started = false;
+    s_skyorb_wifi_connected = false;
+    s_wifi_link_state = WIFI_LINK_IDLE;
+    s_wifi_radio_requested = false;
+    s_wifi_radio_pause_requested = false;
+    s_wifi_radio_pause_after = 0;
+    s_skyorb_network_status = err == ESP_ERR_INVALID_STATE ? ESP_OK : err;
+    skyorb_mark_dirty();
+    ESP_LOGI(TAG, "[WIFI-POWER] STA paused; switch remains ON (%s)",
              err == ESP_ERR_INVALID_STATE ? "already stopped" : esp_err_to_name(err));
 }
 
@@ -7046,7 +7767,8 @@ static void skyorb_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
             s_wifi_link_state = WIFI_LINK_IDLE;
         }
         skyorb_mark_dirty();
-        if (s_skyorb_wifi_enabled && s_skyorb_network_started && s_wifi_should_connect) {
+        if (s_skyorb_wifi_enabled && s_skyorb_network_started &&
+            s_wifi_should_connect) {
             const esp_err_t retry = esp_wifi_connect();
             ESP_LOGW(TAG, "[WIFI-LINK] disconnected reason=%u; reconnect=%s",
                      (unsigned)s_skyorb_disconnect_reason, esp_err_to_name(retry));
@@ -7064,6 +7786,13 @@ static void skyorb_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
         s_skyorb_fetch_failed = false;
         s_skyorb_fetch_failure_stage = NULL;
         s_skyorb_auto_location_attempted = false;
+        const esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        if (ps_err != ESP_OK) {
+            ESP_LOGW(TAG, "[WIFI-POWER] GOT_IP but MIN_MODEM failed: %s",
+                     esp_err_to_name(ps_err));
+        } else {
+            ESP_LOGI(TAG, "[WIFI-POWER] GOT_IP; MIN_MODEM enabled");
+        }
         skyorb_mark_dirty();
         ESP_LOGI(TAG, "[WIFI-LINK] GOT_IP; location/ADS-B refresh enabled");
     }
@@ -7238,16 +7967,18 @@ static bool skyorb_start_network(void)
     if (err != ESP_OK) {
         return skyorb_network_failure("STA start", err);
     }
+    /* Keep scan/WPA/DHCP fully awake. GOT_IP enables MIN_MODEM only after the
+     * latency-sensitive handshake is complete. */
     err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (err != ESP_OK) {
-        return skyorb_network_failure("disable STA power save", err);
+        return skyorb_network_failure("prepare full-power association", err);
     }
     s_skyorb_network_started = true;
     if (driver_already_running) s_skyorb_network_status = ESP_OK;
     skyorb_load_config();
     wifi_mode_t mode = WIFI_MODE_NULL;
     const esp_err_t mode_err = esp_wifi_get_mode(&mode);
-    ESP_LOGI(TAG, "Wi-Fi STA: start=%s mode=%s/%d; waiting for scan/selection",
+    ESP_LOGI(TAG, "Wi-Fi STA: start=%s mode=%s/%d power_save=NONE-until-GOT_IP; waiting for scan/selection",
              driver_already_running ? "already-running" : "requested",
              esp_err_to_name(mode_err), (int)mode);
     return true;
@@ -7526,33 +8257,63 @@ static skyorb_location_result_t skyorb_locate_from_network_ip(void)
 static void skyorb_network_task(void *argument)
 {
     (void)argument;
-    ESP_LOGI(TAG, "[WIFI-DBG] network task entered; starting Wi-Fi once on dedicated task");
-    if (!skyorb_start_requested_network()) {
-        s_skyorb_fetch_failed = true;
-        skyorb_mark_dirty();
-        s_skyorb_network_task_started = false;
-        ESP_LOGE(TAG, "[WIFI-DBG] network task stopped because Wi-Fi startup failed");
-        vTaskDelete(NULL);
-        return;
-    }
-    ESP_LOGI(TAG, "[WIFI-DBG] network task startup complete; entering service loop");
+    bool association_lock_acquired = false;
+    ESP_LOGI(TAG, "[WIFI-DBG] network task entered; radio is demand-driven");
     /* Serialize STA scan/connect operations in this task so switching saved
      * profiles cannot race Wi-Fi event callbacks. */
     while (true) {
         if (!s_skyorb_wifi_enabled) {
+            if (association_lock_acquired) {
+                network_cpu_lock_release(association_lock_acquired);
+                association_lock_acquired = false;
+            }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
+        }
+        TickType_t now = xTaskGetTickCount();
+        if (!s_skyorb_network_started && !s_wifi_radio_requested) {
+            const bool refresh_due = s_ui_screen == UI_SCREEN_SKYORB &&
+                s_skyorb_last_fetch != 0 &&
+                (int32_t)(now - s_skyorb_last_fetch) >=
+                    pdMS_TO_TICKS(s_skyorb_fetch_failed ?
+                                  SKYORB_FETCH_RETRY_MS : SKYORB_FETCH_PERIOD_MS);
+            if (refresh_due) {
+                s_wifi_radio_requested = true;
+                ESP_LOGI(TAG, "[WIFI-POWER] cached radar refresh due; resuming STA");
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
         }
         /* The task deliberately survives an explicit Wi-Fi OFF so a later ON
          * does not need another large stack allocation. */
         if (!s_skyorb_network_started) {
             ESP_LOGI(TAG, "[WIFI-DBG] Wi-Fi re-enabled; restarting network on existing task");
             if (!skyorb_start_requested_network()) {
+                if (association_lock_acquired) {
+                    network_cpu_lock_release(association_lock_acquired);
+                    association_lock_acquired = false;
+                }
                 s_skyorb_fetch_failed = true;
                 skyorb_mark_dirty();
                 vTaskDelay(pdMS_TO_TICKS(500));
                 continue;
             }
+            if (s_wifi_radio_reconnect) {
+                s_wifi_radio_reconnect = false;
+                s_wifi_connect_requested = true;
+                ESP_LOGI(TAG, "[WIFI-POWER] STA restarted; reconnecting saved profile");
+            }
+        }
+        if (s_wifi_radio_pause_requested && !s_skyorb_fetch_in_progress &&
+            !s_skyorb_location_in_progress && !s_wifi_scan_in_progress) {
+            if (association_lock_acquired) {
+                network_cpu_lock_release(association_lock_acquired);
+                association_lock_acquired = false;
+            }
+            skyorb_pause_radio();
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
         if (s_wifi_scan_requested &&
             (!s_skyorb_wifi_connected || s_wifi_connect_after_scan)) {
@@ -7567,7 +8328,9 @@ static void skyorb_network_task(void *argument)
                 ESP_LOGI(TAG, "[WIFI-SWITCH] old link left: %s",
                          esp_err_to_name(leave));
             }
+            const bool scan_lock_acquired = network_cpu_lock_acquire();
             wifi_scan_saved_network();
+            network_cpu_lock_release(scan_lock_acquired);
             if (s_wifi_connect_after_scan) {
                 s_wifi_connect_after_scan = false;
                 s_wifi_connect_requested = true;
@@ -7578,12 +8341,18 @@ static void skyorb_network_task(void *argument)
             s_wifi_connect_requested = false;
             s_wifi_should_connect = true;
             s_skyorb_disconnect_reason = 0;
+            if (!association_lock_acquired) {
+                association_lock_acquired = network_cpu_lock_acquire();
+                if (association_lock_acquired) {
+                    ESP_LOGI(TAG, "[CPU-POWER] 240 MHz held for WPA/DHCP");
+                }
+            }
             if (!skyorb_connect_saved_station()) {
                 s_wifi_should_connect = false;
             }
             s_wifi_settings_dirty = true;
         }
-        const TickType_t now = xTaskGetTickCount();
+        now = xTaskGetTickCount();
         if (s_wifi_should_connect && !s_skyorb_wifi_connected &&
             s_wifi_connect_started != 0 &&
             (int32_t)(now - s_wifi_connect_started) >= pdMS_TO_TICKS(15000)) {
@@ -7592,6 +8361,12 @@ static void skyorb_network_task(void *argument)
             (void)esp_wifi_disconnect();
             skyorb_mark_dirty();
             ESP_LOGW(TAG, "[WIFI-LINK] connection timed out after 15 seconds");
+        }
+        if (association_lock_acquired &&
+            (s_skyorb_wifi_connected || !s_wifi_should_connect)) {
+            network_cpu_lock_release(association_lock_acquired);
+            association_lock_acquired = false;
+            ESP_LOGI(TAG, "[CPU-POWER] WPA/DHCP max-frequency lock released");
         }
         skyorb_config_t config = {0};
         xSemaphoreTake(s_skyorb_mutex, portMAX_DELAY);
@@ -7602,7 +8377,9 @@ static void skyorb_network_task(void *argument)
             s_skyorb_auto_location_attempted = true;
             s_skyorb_location_in_progress = true;
             s_skyorb_location_result = SKYORB_LOCATION_IN_PROGRESS;
+            const bool network_lock_acquired = network_cpu_lock_acquire();
             const skyorb_location_result_t located = skyorb_locate_from_network_ip();
+            network_cpu_lock_release(network_lock_acquired);
             s_skyorb_location_result = located;
             s_skyorb_location_in_progress = false;
             if (located != SKYORB_LOCATION_READY) {
@@ -7620,7 +8397,9 @@ static void skyorb_network_task(void *argument)
              (int32_t)(now - s_skyorb_last_fetch) >= pdMS_TO_TICKS(fetch_interval_ms))) {
             s_skyorb_fetch_in_progress = true;
             s_skyorb_last_fetch = now;
+            const bool network_lock_acquired = network_cpu_lock_acquire();
             const bool success = skyorb_fetch_aircraft();
+            network_cpu_lock_release(network_lock_acquired);
             if (!success) {
                 s_skyorb_fetch_failed = true;
                 skyorb_mark_dirty();
@@ -7630,6 +8409,19 @@ static void skyorb_network_task(void *argument)
                          (unsigned)SKYORB_FETCH_RETRY_MS);
             }
             s_skyorb_fetch_in_progress = false;
+            if (success) {
+                s_wifi_radio_pause_after = xTaskGetTickCount() +
+                                           pdMS_TO_TICKS(SKYORB_WIFI_IDLE_GRACE_MS);
+                ESP_LOGI(TAG, "[WIFI-POWER] HTTPS refresh complete; STA pause in %u ms",
+                         (unsigned)SKYORB_WIFI_IDLE_GRACE_MS);
+            }
+        }
+        now = xTaskGetTickCount();
+        if (s_wifi_radio_pause_after != 0 &&
+            (int32_t)(now - s_wifi_radio_pause_after) >= 0 &&
+            !s_skyorb_fetch_in_progress && !s_skyorb_location_in_progress &&
+            !s_wifi_scan_in_progress && !s_clock_wifi_sync_requested) {
+            skyorb_pause_radio();
         }
         vTaskDelay(pdMS_TO_TICKS(200));
     }
@@ -7897,7 +8689,15 @@ static void skyorb_compose_canvas(void)
     size_t count = 0;
     skyorb_snapshot_aircraft(aircraft, &count, &config, &demo);
     const float outer_km = s_skyorb_ranges_km[s_skyorb_range_index];
-    const bool show_aircraft = s_skyorb_wifi_connected;
+    /* A completed refresh deliberately stops the STA after its grace period.
+     * s_wifi_radio_reconnect remains set so this state is different from a
+     * disabled radio or a failed connection: keep the last radar snapshot on
+     * screen and describe it as cached instead of reporting a disconnect. */
+    const bool radio_sleeping = s_skyorb_wifi_enabled &&
+        !s_skyorb_network_started &&
+        !s_wifi_radio_requested &&
+        s_wifi_radio_reconnect;
+    const bool show_aircraft = s_skyorb_wifi_connected || radio_sleeping;
     if (show_aircraft && demo) {
         const float phase = (float)s_skyorb_sweep_angle * 0.01745329252f;
         const float demo_angle[] = {0.3f, 1.7f, 2.65f, 3.85f, 5.0f, 5.65f};
@@ -7963,6 +8763,11 @@ static void skyorb_compose_canvas(void)
                              rgb565(255, 190, 96));
         skyorb_text_centered("NO NETWORK", center_x, 138, &lv_font_montserrat_14,
                              rgb565(205, 214, 225));
+    } else if (radio_sleeping) {
+        skyorb_text_centered("RADIO PAUSED", center_x, 111, &lv_font_montserrat_18,
+                             rgb565(100, 210, 255));
+        skyorb_text_centered("CACHED DATA", center_x, 138, &lv_font_montserrat_14,
+                             rgb565(205, 214, 225));
     } else if (s_wifi_link_state == WIFI_LINK_AUTH_FAILED) {
         skyorb_text_centered("AUTH FAILED", center_x, 111, &lv_font_montserrat_18,
                              rgb565(255, 126, 118));
@@ -8027,7 +8832,7 @@ static void skyorb_render_frame(void)
                  "location=%d fetching=%d failed=%d sleeping=%d",
                  flushed, s_skyorb_wifi_enabled, s_skyorb_wifi_connected,
                  (unsigned)s_skyorb_aircraft_count, s_skyorb_config.location_valid,
-                 s_skyorb_fetch_in_progress, s_skyorb_fetch_failed, s_display_sleeping);
+                 s_skyorb_fetch_in_progress, s_skyorb_fetch_failed, display_power_inactive());
         last_diagnostic = now;
     }
     s_skyorb_dirty = false;
@@ -8251,33 +9056,60 @@ static void watch_compose_kkd1(const clock_time_t *time)
     }
 }
 
-static void watch_compose_canvas(const clock_time_t *time)
+static void watch_compose_canvas(const clock_time_t *time, uint8_t style)
 {
-    if (s_watch_style == 1U) {
+    if (style == 1U) {
         watch_compose_kkd2(time);
     } else {
         watch_compose_kkd1(time);
     }
 }
 
+static void watch_apply_burnin_shift(void)
+{
+    const int dx = s_watch_burnin_shift_x;
+    const int dy = s_watch_burnin_shift_y;
+    if (dx == 0 && dy == 0) return;
+
+    if (dy > 0) {
+        memmove(s_lcd_canvas + (size_t)dy * LCD_WIDTH, s_lcd_canvas,
+                (size_t)(LCD_HEIGHT - dy) * LCD_WIDTH * sizeof(uint16_t));
+        memset(s_lcd_canvas, 0,
+               (size_t)dy * LCD_WIDTH * sizeof(uint16_t));
+    } else if (dy < 0) {
+        const int rows = LCD_HEIGHT + dy;
+        memmove(s_lcd_canvas, s_lcd_canvas + (size_t)(-dy) * LCD_WIDTH,
+                (size_t)rows * LCD_WIDTH * sizeof(uint16_t));
+        memset(s_lcd_canvas + (size_t)rows * LCD_WIDTH, 0,
+               (size_t)(-dy) * LCD_WIDTH * sizeof(uint16_t));
+    }
+    for (int y = 0; y < LCD_HEIGHT; ++y) {
+        uint16_t *line = s_lcd_canvas + (size_t)y * LCD_WIDTH;
+        if (dx > 0) {
+            memmove(line + dx, line,
+                    (size_t)(LCD_WIDTH - dx) * sizeof(uint16_t));
+            memset(line, 0, (size_t)dx * sizeof(uint16_t));
+        } else if (dx < 0) {
+            const int columns = LCD_WIDTH + dx;
+            memmove(line, line - dx,
+                    (size_t)columns * sizeof(uint16_t));
+            memset(line + columns, 0, (size_t)(-dx) * sizeof(uint16_t));
+        }
+    }
+}
+
 static void watch_render_frame(void)
 {
     if (s_lcd_canvas == NULL) return;
+    const uint8_t frame_style = s_watch_style;
 
-    if (s_watch_rendered_style != s_watch_style) {
-        /* Do not rely on the panel retaining or replacing an old face during
-         * a style transition.  Flush an explicit black full frame first, then
-         * compose exactly one requested APK face below.  This happens only
-         * once per style change, so normal one-second animation is unaffected. */
-        memset(s_lcd_canvas, 0, LCD_WIDTH * LCD_HEIGHT * sizeof(uint16_t));
-        const dirty_rect_t clear = {
-            .x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT
-        };
-        (void)flush_canvas_rect(&clear);
-        s_watch_rendered_style = s_watch_style;
-        ESP_LOGI(TAG, "Watch renderer switched to %s (%u); previous frame cleared",
-                 s_watch_style == 1U ? "KKD2" : "KKD1",
-                 (unsigned)s_watch_style);
+    if (s_watch_rendered_style != frame_style) {
+        /* Both composers clear the RAM canvas before drawing.  Send only the
+         * completed replacement frame so no intermediate black frame is visible. */
+        s_watch_rendered_style = frame_style;
+        ESP_LOGI(TAG, "Watch renderer switched to %s (%u); next full frame replaces previous",
+                 frame_style == 1U ? "KKD2" : "KKD1",
+                 (unsigned)frame_style);
     }
 
     const clock_time_t time = watch_read_time();
@@ -8292,10 +9124,11 @@ static void watch_render_frame(void)
         display_time.minute = (s_watch_display_seconds / 60) % 60;
         display_time.second = s_watch_display_seconds % 60;
     }
-    watch_compose_canvas(&display_time);
+    watch_compose_canvas(&display_time, frame_style);
+    watch_apply_burnin_shift();
     const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
     (void)flush_canvas_rect(&full);
-    s_watch_dirty = catch_up_pending;
+    s_watch_dirty = catch_up_pending || s_watch_style != frame_style;
 }
 
 static void watch_enter(void)
@@ -8304,6 +9137,10 @@ static void watch_enter(void)
     s_watch_dirty = true;
     s_watch_last_frame = 0;
     s_watch_display_seconds = -1;
+    s_watch_swipe_origin_x = 0;
+    s_watch_swipe_origin_y = 0;
+    s_watch_swipe_handled = true;
+    s_touch_watch_gesture_config_attempted = false;
     /* Re-entering the app is also a hard visual boundary. */
     s_watch_rendered_style = UINT8_MAX;
     s_apps_canvas_valid = false;
@@ -8327,14 +9164,44 @@ static void watch_handle_touch(int x, int y)
         ESP_LOGI(TAG, "Watch: returned home");
         return;
     }
-    /* Watch style is selected explicitly from the phone settings.  An ordinary
-     * touch must not silently flip the persisted KKD1/KKD2 choice. */
+    s_watch_swipe_origin_x = x;
+    s_watch_swipe_origin_y = y;
+    s_watch_swipe_handled = false;
+}
+
+static void watch_handle_touch_move(int x, int y)
+{
+    if (s_watch_swipe_handled) return;
+    const int dx = x - s_watch_swipe_origin_x;
+    const int dy = y - s_watch_swipe_origin_y;
+    const bool inward_edge_flick =
+        (s_watch_swipe_origin_x <= WATCH_EDGE_SWIPE_ZONE &&
+         dx >= WATCH_EDGE_SWIPE_MIN_X) ||
+        (s_watch_swipe_origin_x >= LCD_WIDTH - WATCH_EDGE_SWIPE_ZONE &&
+         dx <= -WATCH_EDGE_SWIPE_MIN_X);
+    if ((!inward_edge_flick && abs(dx) < WATCH_SWIPE_MIN_X) ||
+        abs(dx) <= abs(dy) + WATCH_SWIPE_AXIS_MARGIN) return;
+
+    const uint8_t previous = s_watch_style;
+    s_watch_style = (uint8_t)(1U - s_watch_style);
+    watch_schedule_style_save();
+    s_watch_dirty = true;
+    s_watch_last_frame = 0;
+    s_watch_display_seconds = -1;
+    s_watch_swipe_handled = true;
     block_touch_until_release();
+    ESP_LOGI(TAG, "Watch: %s swipe switched %s -> %s",
+             dx < 0 ? "left" : "right",
+             previous == 1U ? "KKD2" : "KKD1",
+             s_watch_style == 1U ? "KKD2" : "KKD1");
 }
 
 static void skyorb_start_network_task(void)
 {
     s_skyorb_wifi_enabled = true;
+    s_wifi_radio_requested = true;
+    s_wifi_radio_pause_requested = false;
+    s_wifi_radio_pause_after = 0;
     (void)pacon_save_switch("wifi_on", true);
     skyorb_mark_dirty();
     if (s_skyorb_mutex == NULL) {
@@ -8605,7 +9472,10 @@ static void wifi_settings_enter(void)
     s_wifi_settings_dirty = true;
     s_wifi_delete_profile = -1;
     s_wifi_touch_profile = -1;
-    if (s_skyorb_wifi_enabled && !s_wifi_scan_in_progress) s_wifi_scan_requested = true;
+    if (s_skyorb_wifi_enabled) {
+        skyorb_start_network_task();
+        if (!s_wifi_scan_in_progress) s_wifi_scan_requested = true;
+    }
     block_touch_until_release();
     ESP_LOGI(TAG, "Settings: entered Wi-Fi detail page");
 }
@@ -9072,7 +9942,7 @@ static void settings_handle_touch(int x, int y)
         s_user_brightness = (uint8_t)(SETTINGS_BRIGHTNESS_MIN +
             ((slider - 92) * (SETTINGS_BRIGHTNESS_MAX - SETTINGS_BRIGHTNESS_MIN)) / 290);
         (void)lcd_set_brightness(s_user_brightness);
-        s_display_dimmed = false;
+        s_display_power_state = DISPLAY_POWER_AWAKE;
         settings_save_brightness();
         s_device_settings_dirty = true;
         return;
@@ -9091,7 +9961,7 @@ static void skyorb_enter(void)
     block_touch_until_release();
     if (s_skyorb_wifi_enabled) {
         skyorb_start_network_task();
-        ESP_LOGI(TAG, "Apps: entered Sky Radar; Wi-Fi remains enabled");
+        ESP_LOGI(TAG, "Apps: entered Sky Radar; Wi-Fi resumed on demand");
     } else {
         ESP_LOGI(TAG, "Apps: entered Sky Radar in offline/demo mode; Wi-Fi remains disabled");
     }
@@ -9104,6 +9974,7 @@ static void skyorb_handle_touch(int x, int y)
     if (x < 104 && y < 104) {
         s_ui_screen = UI_SCREEN_HOME;
         s_home_dirty = true;
+        s_wifi_radio_pause_requested = true;
         block_touch_until_release();
         ESP_LOGI(TAG, "SkyOrb: returned home");
         return;
@@ -9798,6 +10669,11 @@ static void usb_msc_poll_exit_touch(void)
         s_usb_msc_exit_touch_down = false;
         return;
     }
+    if (s_touch_monitor_active) {
+        s_touch_monitor_active = false;
+        s_touch_monitor_retry_after = 0;
+        ESP_LOGI(TAG, "FT3168: USB wake touch restored Active mode");
+    }
 
     uint8_t point[4] = {0};
     if (i2c_read(ADDR_TOUCH, 0x03, point, sizeof(point)) != ESP_OK) return;
@@ -9805,9 +10681,19 @@ static void usb_msc_poll_exit_touch(void)
     const int y = ((point[2] & 0x0F) << 8) | point[3];
     if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) return;
 
-    if (!s_usb_msc_exit_touch_down && s_usb_msc_exit_armed && y >= 330) {
-        ESP_LOGW(TAG, "USB disk: raw OFF touch at (%d,%d); returning to normal mode", x, y);
-        s_usb_msc_exit_requested = true;
+    if (!s_usb_msc_exit_touch_down) {
+        if (display_power_inactive()) {
+            /* The first contact only wakes the AMOLED.  Releasing and
+             * touching again is required before OFF may restart the board. */
+            display_note_activity();
+            s_usb_msc_exit_touch_down = true;
+            return;
+        }
+        display_note_activity();
+        if (s_usb_msc_exit_armed && y >= 330) {
+            ESP_LOGW(TAG, "USB disk: raw OFF touch at (%d,%d); returning to normal mode", x, y);
+            s_usb_msc_exit_requested = true;
+        }
     }
     s_usb_msc_exit_touch_down = true;
 }
@@ -9856,9 +10742,19 @@ static void usb_msc_disconnect_for_restart(void)
 static void run_usb_msc_screen_loop(void)
 {
     while (true) {
+        TickType_t now = xTaskGetTickCount();
+        display_update_idle(now);
+        display_service_power(now);
+        peripheral_service_power(now);
         /* USB mode owns a raw reader so a stale page-transition contact or a
          * failed one-shot FT3168 init cannot permanently disable OFF. */
         usb_msc_poll_exit_touch();
+        if (!display_power_inactive() && s_usb_disk_dirty) {
+            /* One full redraw after SLPOUT restores deterministic panel RAM;
+             * no periodic rendering runs while TinyUSB owns the USB PHY. */
+            render_at_max_cpu(render_usb_disk_frame);
+        }
+        display_restore_brightness_after_frame();
         if (s_usb_msc_started && !s_usb_msc_exit_armed &&
             (int32_t)(xTaskGetTickCount() - s_usb_msc_exit_arm_after) >= 0) {
             s_usb_msc_exit_armed = true;
@@ -9866,9 +10762,8 @@ static void run_usb_msc_screen_loop(void)
         if (s_usb_msc_reboot_requested || s_usb_msc_exit_requested) {
             usb_msc_disconnect_for_restart();
         }
-        /* Do not render or run unrelated services after TinyUSB takes the
-         * native USB PHY.  This loop is deliberately small so MSC/SDMMC gets
-         * a deterministic transfer environment. */
+        /* Apart from the one wake redraw, do not run unrelated services after
+         * TinyUSB takes the native USB PHY. */
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -9915,6 +10810,13 @@ void app_main(void)
         ESP_LOGE(TAG, "SH8601 initialization failed: %s", esp_err_to_name(err));
         return;
     }
+    err = init_dynamic_frequency_scaling();
+    if (err != ESP_OK) {
+        /* Configuration is applied only after the lock exists.  Failure here
+         * therefore leaves the boot-time fixed 240 MHz policy intact. */
+        ESP_LOGW(TAG, "[CPU-POWER] DFS unavailable; retaining fixed %d MHz: %s",
+                 CPU_FREQ_MAX_MHZ, esp_err_to_name(err));
+    }
     if (!usb_msc_boot) {
     /* Start the phone control channel after the display's internal DMA
      * allocations so BLE cannot starve the SH8601 panel setup. */
@@ -9953,13 +10855,14 @@ void app_main(void)
         s_ui_screen = UI_SCREEN_USB_DISK;
         s_usb_msc_ui_on = true;
         s_usb_disk_dirty = true;
-        render_usb_disk_frame();
+        render_at_max_cpu(render_usb_disk_frame);
         s_usb_msc_result = start_usb_msc_mode();
         if (s_usb_msc_result != ESP_OK) {
             s_usb_msc_ui_on = false;
             s_usb_disk_dirty = true;
-            render_usb_disk_frame();
+            render_at_max_cpu(render_usb_disk_frame);
         }
+        s_last_user_activity = xTaskGetTickCount();
         run_usb_msc_screen_loop();
     }
 
@@ -9969,6 +10872,8 @@ void app_main(void)
     s_last_user_activity = last_frame;
     s_next_home_status_shift = last_frame + pdMS_TO_TICKS(HOME_STATUS_SHIFT_MS);
     s_next_home_pixel_shift = last_frame + pdMS_TO_TICKS(HOME_PIXEL_SHIFT_MS);
+    s_next_watch_burnin_shift = last_frame + pdMS_TO_TICKS(WATCH_BURNIN_SHIFT_MS);
+    s_next_ouo_burnin_shift = last_frame + pdMS_TO_TICKS(OUO_BURNIN_SHIFT_MS);
     int64_t next_perf_report_us = esp_timer_get_time() + FLUID_PERF_REPORT_MS * 1000LL;
     int64_t physics_total_us = 0;
     int64_t render_total_us = 0;
@@ -9986,8 +10891,12 @@ void app_main(void)
         clock_service(now);
         apply_home_media_rescan_if_pending();
         home_update_burnin_offsets(now);
+        display_update_feature_burnin_offsets(now);
         display_update_idle(now);
-        if (s_display_sleeping) {
+        display_service_power(now);
+        peripheral_service_power(now);
+        touch_service_watch_gesture();
+        if (display_power_inactive()) {
             /* FT3168 remains powered; its next complete touch wakes OLED but
              * is suppressed so a sleeping screen cannot launch an app. */
             poll_touch();
@@ -9997,18 +10906,18 @@ void app_main(void)
                 (void)home_begin_pending_media_transition(now);
             }
             if (s_ui_screen == UI_SCREEN_HOME && s_home_slide_active) {
-                render_home_slide_frame();
+                render_at_max_cpu(render_home_slide_frame);
             } else if (s_ui_screen == UI_SCREEN_HOME &&
                 (s_home_dirty || home_advance_animation(now) ||
                  (int32_t)(now - next_home_refresh) >= 0)) {
-                render_home_frame();
+                render_at_max_cpu(render_home_frame);
                 next_home_refresh = now + pdMS_TO_TICKS(HOME_REFRESH_MS);
             }
         } else if (s_ui_screen == UI_SCREEN_APPS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_APPS &&
                 (s_apps_dirty || s_apps_dismiss_active)) {
-                render_apps_frame();
+                render_at_max_cpu(render_apps_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_USB_DISK) {
             /* Sample release once before the slow first full-frame paint.  A
@@ -10018,7 +10927,7 @@ void app_main(void)
              * the serial monitor disappears as soon as the MSC device owns
              * the native USB data pair. */
             if (s_usb_disk_dirty) {
-                render_usb_disk_frame();
+                render_at_max_cpu(render_usb_disk_frame);
             }
             poll_touch();
             if (s_usb_msc_started && !s_usb_msc_exit_armed &&
@@ -10039,25 +10948,27 @@ void app_main(void)
         } else if (s_ui_screen == UI_SCREEN_FLUID_SETTINGS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_FLUID_SETTINGS && s_settings_dirty) {
-                render_fluid_settings_frame();
+                render_at_max_cpu(render_fluid_settings_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_COLOUR_PICKER) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_COLOUR_PICKER && s_colour_picker_dirty) {
-                render_fluid_colour_picker_frame();
+                render_at_max_cpu(render_fluid_colour_picker_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_OUO) {
             const int64_t update_start_us = esp_timer_get_time();
             poll_touch();
+            const bool cpu_lock_acquired = ui_cpu_lock_acquire();
             step_ouo();
             s_ouo_update_last_us = esp_timer_get_time() - update_start_us;
             if (s_ui_screen == UI_SCREEN_OUO && s_ouo_dirty) {
                 render_ouo_frame();
             }
+            ui_cpu_lock_release(cpu_lock_acquired);
         } else if (s_ui_screen == UI_SCREEN_OUO_MENU) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_OUO_MENU && s_ouo_menu_dirty) {
-                render_ouo_menu_frame();
+                render_at_max_cpu(render_ouo_menu_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_SKYORB) {
             poll_touch();
@@ -10066,7 +10977,7 @@ void app_main(void)
                  (int32_t)(now - s_skyorb_last_frame) >=
                     (int32_t)pdMS_TO_TICKS(SKYORB_FRAME_PERIOD_MS))) {
                 s_skyorb_sweep_angle = (uint16_t)((s_skyorb_sweep_angle + 9U) % 360U);
-                skyorb_render_frame();
+                render_at_max_cpu(skyorb_render_frame);
                 s_skyorb_last_frame = xTaskGetTickCount();
             }
         } else if (s_ui_screen == UI_SCREEN_WATCH) {
@@ -10078,7 +10989,8 @@ void app_main(void)
                 /* Anchor the cadence at frame start.  Anchoring after the
                  * expensive layered render adds its duration to every second. */
                 s_watch_last_frame = now;
-                watch_render_frame();
+                render_at_max_cpu(watch_render_frame);
+                if (s_ui_screen == UI_SCREEN_WATCH) poll_touch();
             }
         } else if (s_ui_screen == UI_SCREEN_CAMERA) {
             poll_touch();
@@ -10088,7 +11000,7 @@ void app_main(void)
             if (s_ui_screen == UI_SCREEN_CAMERA &&
                 (s_camera_dirty || feedback_active || s_camera_last_frame == 0 ||
                  (int32_t)(now - s_camera_last_frame) >= pdMS_TO_TICKS(250))) {
-                camera_render_frame();
+                render_at_max_cpu(camera_render_frame);
             }
             vTaskDelay(pdMS_TO_TICKS(feedback_active ? 35 : 80));
         } else if (s_ui_screen == UI_SCREEN_MIC_TEST) {
@@ -10097,12 +11009,12 @@ void app_main(void)
             if (s_ui_screen == UI_SCREEN_MIC_TEST &&
                 (s_mic_test_dirty || s_mic_test_last_frame == 0 ||
                  (int32_t)(now - s_mic_test_last_frame) >= pdMS_TO_TICKS(80))) {
-                mic_test_render_frame();
+                render_at_max_cpu(mic_test_render_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_SETTINGS) {
             poll_touch();
             if (s_ui_screen == UI_SCREEN_SETTINGS && s_device_settings_dirty) {
-                render_device_settings_frame();
+                render_at_max_cpu(render_device_settings_frame);
             }
         } else if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS) {
             poll_touch();
@@ -10112,9 +11024,10 @@ void app_main(void)
                 s_wifi_settings_dirty = true;
             }
             if (s_ui_screen == UI_SCREEN_WIFI_SETTINGS && s_wifi_settings_dirty) {
-                render_wifi_settings_frame();
+                render_at_max_cpu(render_wifi_settings_frame);
             }
         } else {
+            const bool cpu_lock_acquired = ui_cpu_lock_acquire();
             int64_t physics_start_us = esp_timer_get_time();
             /* Keep the fluid lively even if the display transfer uses a full frame. */
             step_fluid();
@@ -10125,6 +11038,7 @@ void app_main(void)
             int64_t render_start_us = esp_timer_get_time();
             render_frame();
             render_total_us += esp_timer_get_time() - render_start_us;
+            ui_cpu_lock_release(cpu_lock_acquired);
             transfer_pixels_total += s_fluid_transfer_pixels;
             ++fluid_frames;
 
@@ -10145,7 +11059,9 @@ void app_main(void)
         }
 
         fluid_service_preferences();
+        watch_service_style_save(xTaskGetTickCount());
         fluid_controls_report_perf();
+        display_restore_brightness_after_frame();
         now = xTaskGetTickCount();
         if (s_axp2101_ready && (int32_t)(now - next_pmic_status) >= 0) {
             log_axp2101_charge_status();
@@ -10153,9 +11069,12 @@ void app_main(void)
         }
         /* OuO's animated eyes need the previewer's ~60 FPS cadence.  Keep the
          * heavier Fluid/home loop at its original 30 ms period. */
-        const uint32_t frame_period_ms = (s_ui_screen == UI_SCREEN_OUO ||
-            s_ui_screen == UI_SCREEN_FLUID_SETTINGS || s_ui_screen == UI_SCREEN_COLOUR_PICKER) ?
-                                         OUO_FRAME_PERIOD_MS : FRAME_PERIOD_MS;
+        const uint32_t frame_period_ms = s_ui_screen == UI_SCREEN_WATCH ?
+                                         WATCH_TOUCH_POLL_PERIOD_MS :
+            ((s_ui_screen == UI_SCREEN_OUO ||
+              s_ui_screen == UI_SCREEN_FLUID_SETTINGS ||
+              s_ui_screen == UI_SCREEN_COLOUR_PICKER) ?
+                                         OUO_FRAME_PERIOD_MS : FRAME_PERIOD_MS);
         vTaskDelayUntil(&last_frame, pdMS_TO_TICKS(frame_period_ms));
     }
 }
