@@ -44,7 +44,8 @@ BLE 在稳定等待期间不断开；休眠电流明显低于旧版。
 ## 阶段 5：ESP32 动态功耗
 
 - 先启用 80～240 MHz 动态调频；动画和 QSPI 传输用电源管理锁请求高频。
-- USB、BLE、Wi-Fi、I2C、QSPI 全部验证后，才评估 Tickless Idle/Light Sleep。
+- USB、BLE、Wi-Fi、I2C、QSPI 全部验证后启用 Tickless Idle；Automatic Light Sleep 继续
+  单独评估，不与调度器空闲优化一起引入。
 
 ## 阶段 6：帧率和低电量策略
 
@@ -113,6 +114,14 @@ BLE 在稳定等待期间不断开；休眠电流明显低于旧版。
 - [x] 阶段 5 USB 显示策略修正：移除专用模式固定 25 秒覆盖；App 设置时间到后
   降亮度，再过 15 秒进入 AMOLED Sleep，专用模式保持 FT3168 Active。COM11 用
   15 秒设置验证 15 秒变暗、30 秒熄屏、单次完整触摸立即唤醒。
-- [ ] 阶段 5 物理功耗验收与 Tickless Idle/Light Sleep 评估：先用电流表比较
-  80/240 MHz、网络活动/暂停和各页面整机电流，再决定是否继续启用系统睡眠。
+- [x] 阶段 5 第二部分启动验收：启用 Tickless Idle，Automatic Light Sleep 保持关闭。
+  单独启用 Tickless 会增加约 7040 B 静态 D/IRAM，导致 Wi-Fi `ESP_ERR_NO_MEM`；将
+  ESP-IDF 允许的非 ISR FreeRTOS 函数放回 Flash 后反向释放 9636 B，COM11 连续启动时
+  BLE、NAND、触摸、IMU、Wi-Fi 4 个静态 RX 缓冲及 STA 扫描均正常。
+- [x] 阶段 5 Tickless 功能回归：Home、Fluid、0u0、Watch、BLE、SkyOrb 首次连接、
+  3 分钟周期重连、射频暂停缓存、USB Disk 变暗/熄屏/单次唤醒/OFF 均通过。回归中修正
+  Fluid 平放假重力和 Watch 同方向连续滑动被硬件手势 ID 锁存的问题。
+- [ ] 阶段 5 物理功耗验收：用电流表比较 80/240 MHz、网络活动/暂停和各页面整机电流。
+- [ ] Automatic Light Sleep 单独评估：当前 BLE 控制器明确报告蓝牙启用时无法应用；
+  未完成 USB/BLE/Wi-Fi/I2C/QSPI 唤醒闭环前不得启用。
 - [ ] 阶段 6 尚未实施。

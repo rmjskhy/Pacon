@@ -24,8 +24,21 @@ if ($main -notmatch 'static void touch_service_watch_gesture\(void\)[\s\S]*?FT31
 if ($main -notmatch 'static void touch_poll_watch_gesture\(void\)[\s\S]*?gesture_id == FT3168_GESTURE_SWIPE_LEFT[\s\S]*?gesture_id == FT3168_GESTURE_SWIPE_RIGHT[\s\S]*?s_watch_style = \(uint8_t\)\(1U - s_watch_style\);[\s\S]*?watch_schedule_style_save\(\);') {
     $failures.Add('Hardware left/right gesture IDs do not switch and persist the watch style.')
 }
+$watchPoll = [regex]::Match(
+    $main,
+    'static void touch_poll_watch_gesture\(void\)(?<body>[\s\S]*?)\n\}\s+\nstatic void init_imu'
+)
+if (-not $watchPoll.Success -or
+    $watchPoll.Groups['body'].Value -notmatch 'gesture_id == FT3168_GESTURE_SWIPE_RIGHT\)[\s\S]*?!s_watch_swipe_handled[\s\S]*?!s_touch_blocked_until_release[\s\S]*?s_watch_swipe_handled = true;') {
+    $failures.Add('Hardware gesture switching is not guarded by the shared one-switch-per-contact lock.')
+}
+if (-not $watchPoll.Success -or
+    $watchPoll.Groups['body'].Value -notmatch 'if \(!s_touch_down\) \{[\s\S]*?watch_handle_touch\(x, y\);[\s\S]*?\} else if \(!s_touch_blocked_until_release\) \{[\s\S]*?watch_handle_touch_move\(x, y\);') {
+    $failures.Add('Hardware gesture mode lacks the coordinate fallback needed for repeated identical directions.')
+}
 if ($main -notmatch 'if \(s_touch_watch_gesture_active\) \{\s+touch_poll_watch_gesture\(\);\s+return;' -or
-    $main -notmatch 'else if \(x < 104 && y < 104\) \{\s+s_ui_screen = UI_SCREEN_HOME;') {
+    $main -notmatch 'static void touch_poll_watch_gesture\(void\)[\s\S]*?watch_handle_touch\(x, y\);' -or
+    $main -notmatch 'static void watch_handle_touch\(int x, int y\)[\s\S]*?if \(x < 104 && y < 104\) \{\s+s_ui_screen = UI_SCREEN_HOME;') {
     $failures.Add('Hardware gesture polling does not preserve coordinate-based top-left return.')
 }
 if ($main -match 'DEBUG-WATCH-GESTURE|DEBUG-WATCH-SWIPE|gesture_probe') {

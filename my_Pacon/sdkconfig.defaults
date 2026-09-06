@@ -6,7 +6,11 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 CONFIG_PM_ENABLE=y
 # Keep automatic Light Sleep out of the first phase-5 change.  It requires a
 # separate USB/BLE/Wi-Fi/I2C/QSPI wake and timing validation pass.
-# CONFIG_FREERTOS_USE_TICKLESS_IDLE is not set
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Tickless adds enough IRAM-resident scheduler/sleep code to starve the Wi-Fi
+# driver's DMA buffers. Keep ISR paths in IRAM while moving eligible task-only
+# FreeRTOS functions back to flash.
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 

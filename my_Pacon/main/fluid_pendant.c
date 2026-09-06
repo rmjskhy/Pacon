@@ -914,8 +914,15 @@ static esp_err_t init_dynamic_frequency_scaling(void)
 
     s_ui_cpu_lock = ui_lock;
     s_network_cpu_lock = network_lock;
-    ESP_LOGI(TAG, "[CPU-POWER] DFS enabled: %d-%d MHz; light sleep disabled",
+#if CONFIG_FREERTOS_USE_TICKLESS_IDLE
+    ESP_LOGI(TAG, "[CPU-POWER] DFS enabled: %d-%d MHz; Tickless Idle enabled; "
+             "automatic light sleep disabled",
              CPU_FREQ_IDLE_MHZ, CPU_FREQ_MAX_MHZ);
+#else
+    ESP_LOGI(TAG, "[CPU-POWER] DFS enabled: %d-%d MHz; Tickless Idle disabled; "
+             "automatic light sleep disabled",
+             CPU_FREQ_IDLE_MHZ, CPU_FREQ_MAX_MHZ);
+#endif
     return ESP_OK;
 }
 
@@ -5398,13 +5405,16 @@ static void touch_poll_watch_gesture(void)
     if (gesture_id != s_touch_watch_gesture_last_id) {
         if ((gesture_id == FT3168_GESTURE_SWIPE_LEFT ||
              gesture_id == FT3168_GESTURE_SWIPE_RIGHT) &&
-            !s_display_wake_touch_suppressed) {
+            !s_display_wake_touch_suppressed &&
+            !s_watch_swipe_handled &&
+            !s_touch_blocked_until_release) {
             const uint8_t previous = s_watch_style;
             s_watch_style = (uint8_t)(1U - s_watch_style);
             watch_schedule_style_save();
             s_watch_dirty = true;
             s_watch_last_frame = 0;
             s_watch_display_seconds = -1;
+            s_watch_swipe_handled = true;
             block_touch_until_release();
             display_note_activity();
             ESP_LOGI(TAG, "Watch: hardware %s swipe switched %s -> %s",
@@ -5441,17 +5451,10 @@ static void touch_poll_watch_gesture(void)
             s_display_wake_touch_suppressed = true;
         } else if (!s_touch_blocked_until_release) {
             display_note_activity();
-            if (s_alarm_ringing) {
-                alarm_stop();
-                block_touch_until_release();
-                ESP_LOGI(TAG, "Watch: alarm dismissed by touch");
-            } else if (x < 104 && y < 104) {
-                s_ui_screen = UI_SCREEN_HOME;
-                s_home_dirty = true;
-                block_touch_until_release();
-                ESP_LOGI(TAG, "Watch: returned home");
-            }
+            watch_handle_touch(x, y);
         }
+    } else if (!s_touch_blocked_until_release) {
+        watch_handle_touch_move(x, y);
     }
     s_touch_down = true;
 }
@@ -6307,10 +6310,12 @@ static void step_fluid(void)
     read_tilt(&gravity_x, &gravity_y);
     poll_touch();
 
-    /* The accelerometer has no X/Y component while the badge lies flat.
-     * Give the droplets a gentle downward settle, matching Opal simple mode. */
+    /* A face-up board has no in-plane gravity.  Keep the small sensor-noise
+     * dead zone neutral so a later tilt does not have to overcome artificial
+     * downward momentum before the droplets follow the measured direction. */
     if (abs(gravity_x) + abs(gravity_y) < 12) {
-        gravity_y = 92;
+        gravity_x = 0;
+        gravity_y = 0;
     }
 
     for (int i = 0; i < PARTICLE_COUNT; ++i) {

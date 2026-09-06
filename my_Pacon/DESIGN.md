@@ -292,7 +292,7 @@ Type-C 正反插不能作为“串口/U 盘模式”选择信号。两种模式�
 | 旧 SoftAP/HTTP 配置路径 | 已移除并烧录 | 正式固件只保留 STA；HTTP 客户端供雷达与 IP 定位使用 |
 | SkyOrb HTTPS/TLS 内存策略 | 阶段 3 真机通过 | mbedTLS 使用 PSRAM、动态缓冲和软件 AES，避免与显示 DMA 条带争用内部内存；失败按阶段显示并每 15 秒重试 |
 | FT3168/QMI8658 外设待机策略 | 阶段 4 功能真机通过 | Home/非倾斜页 3 Hz、Fluid/0u0 TILT 250 Hz、熄屏 paused；普通页面 FT3168 Monitor，VBUS 供电的专用 MSC 保持 Active；首次触摸、Watch 手势互锁和 USB OFF 闭环均通过，物理电流待测 |
-| ESP32-S3 DFS 与频率锁 | 阶段 5 功能真机通过 | 空闲 80 MHz、上限 240 MHz；UI/QSPI、TLS、WPA/DHCP 按作用域持最大频率锁，Tickless Idle/Light Sleep 尚未启用，物理电流待测 |
+| ESP32-S3 DFS、Tickless 与频率锁 | 阶段 5 功能真机通过 | 空闲 80 MHz、上限 240 MHz；UI/QSPI、TLS、WPA/DHCP 按作用域持最大频率锁；Tickless Idle 已启用，并把非 ISR FreeRTOS 函数放回 Flash 以保留 Wi-Fi 内部 RAM；Automatic Light Sleep 关闭，物理电流待测 |
 | SkyOrb 航班数据源 | ADSB.lol 公共 API | `/v2/point/{lat}/{lon}/{radius}`，readsb 兼容 JSON；客户端发送 PACON 项目标识，数据许可为 ODbL 1.0 |
 | SkyOrb 空数据状态 | 明确显示 | 请求成功但所选经纬度与量程内没有飞机时显示 `NO AIRCRAFT / IN SELECTED RANGE`；OLED 从保护性息屏唤醒时强制重绘当前界面 |
 | 系统界面统一 watchOS 启发式视觉 | 已编译，待板上确认 | 检查圆屏边缘、图标可辨识度和触摸命中 |

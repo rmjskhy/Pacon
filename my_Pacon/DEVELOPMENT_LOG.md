@@ -1,5 +1,32 @@
 # PACON 开发交接记录
 
+## 2026-09-06：电池节能阶段 5 Tickless Idle（功能真机完成）
+
+- 在已通过硬件测试的 80～240 MHz DFS 基线上单独启用 Tickless Idle，Automatic Light
+  Sleep 保持关闭。首次固件在启动 Wi-Fi 驱动时稳定复现 `ESP_ERR_NO_MEM`：首轮只能分配
+  1/4 个 1600 B 静态 RX 缓冲，重试降为 0/4；关闭 Tickless 后同一固件、同一启动顺序
+  恢复完整 4/4 缓冲和 STA 扫描，排除了热点与凭据原因。
+- 链接图单变量对照确认 Tickless 使静态 D/IRAM 从 188547 B 增至 195587 B（+7040 B）。
+  启用 ESP-IDF 的 `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH`，只把允许的非 ISR
+  FreeRTOS 函数放回 Flash，静态 D/IRAM 降至 185951 B；相对失败版释放 9636 B，未削减
+  Wi-Fi 缓冲、BLE 或外设功能。
+- COM11 冷启动检查通过：Tickless 配置标记正确，Wi-Fi 启动前内部堆为 51835 B，BLE、
+  FT3168、QMI8658、NAND 媒体加载后 Wi-Fi 驱动仍取得 4 个静态 RX 缓冲并进入 STA 扫描。
+  新增 `tools/check_tickless_wifi_boot.py`，可分别验证 Tickless enabled/disabled 固件，并在
+  `ESP_ERR_NO_MEM` 或驱动初始化失败时立即报错。
+- Tickless 功能回归期间发现 Fluid 平放时长期向屏幕底部聚集、向上翘约 30 度才反向。
+  根因是 IMU 平面重力落入死区后人为写入 `gravity_y = 92`，使真实反向重力必须先抵消
+  已积累的向下速度。现将死区改为 X/Y 同时归零，保留原有速度阻尼；平放自然停稳，
+  轻微倾斜即跟随真实方向。新增中性死区回归，COM11 四向倾斜真机验证通过。
+- Watch 的 FT3168 硬件手势 ID 会保持上次的左/右方向；旧实现只在 ID 改变时切换，导致
+  连续同方向滑动被吞。现让硬件手势与 100 Hz 坐标位移回退共用“一次接触只切一次”锁，
+  既避免同一次滑动重复切换，也允许锁存 ID 时由坐标路径完成操作。左右各连续两次切换
+  均在 COM11 真机通过。
+- 最终真机回归覆盖 Home、Fluid、0u0、Watch、BLE `GET STATUS`、SkyOrb 首次连接、
+  `RADIO PAUSED / CACHED DATA`、3 分钟周期重连，以及 USB Disk 15 秒变暗、30 秒熄屏、
+  单次触摸唤醒和 OFF 返回主界面，均正常。完整源代码回归与 ESP-IDF 构建通过；阶段 5
+  尚缺电流表物理功耗数据，不能以功能日志替代。
+
 ## 2026-09-06：电池节能阶段 5 动态调频（功能真机验收完成）
 
 - ESP32-S3 启用 80～240 MHz 动态调频；Tickless Idle 与 Light Sleep 继续关闭，避免在
