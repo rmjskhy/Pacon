@@ -3,11 +3,18 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_pm.h"
+#include "esp_mn_iface.h"
+#include "esp_mn_models.h"
+#include "esp_mn_speech_commands.h"
+#include "model_path.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -24,6 +31,8 @@
 #define MIC_BYTES_PER_SEC  (PACON_MIC_SAMPLE_RATE_HZ * sizeof(int16_t))
 #define MIC_MAX_DATA_BYTES ((PACON_MIC_MAX_RECORD_MS * MIC_BYTES_PER_SEC) / 1000U)
 #define MIC_PATH_MAX       160U
+#define MIC_COMMAND_WINDOW_MS 6000
+#define MIC_COMMAND_START_ID  1
 
 static const char *TAG = "PACON_MIC";
 static i2s_chan_handle_t s_rx_channel;
@@ -35,6 +44,16 @@ static FILE *s_record_file;
 static char s_record_final_path[MIC_PATH_MAX];
 static char s_record_temp_path[MIC_PATH_MAX];
 static uint32_t s_record_bytes;
+static srmodel_list_t *s_sr_models;
+static esp_mn_iface_t *s_multinet;
+static model_iface_data_t *s_multinet_data;
+static int16_t *s_multinet_pcm;
+static size_t s_multinet_chunk_samples;
+static size_t s_multinet_fill;
+static bool s_multinet_commands_allocated;
+static pacon_mic_voice_command_t s_voice_command_event;
+static esp_pm_lock_handle_t s_wake_cpu_lock;
+static bool s_wake_cpu_lock_acquired;
 static pacon_mic_status_t s_status = {
     .state = PACON_MIC_OFF,
     .last_error = ESP_OK,
@@ -97,6 +116,106 @@ static int16_t apply_soft_limited_gain(int32_t sample)
         (int32_t)(((int64_t)excess * MIC_LIMITER_RANGE) /
                   (excess + MIC_LIMITER_RANGE));
     return (int16_t)(negative ? -compressed : compressed);
+}
+
+/* s_lock must be held. MultiNet weights use the model partition/PSRAM; the
+ * command engine exists only while its Recorder-page switch is enabled. */
+static void voice_commands_disable_locked(void)
+{
+    if (s_wake_cpu_lock_acquired) {
+        esp_pm_lock_release(s_wake_cpu_lock);
+        s_wake_cpu_lock_acquired = false;
+    }
+    if (s_multinet != NULL && s_multinet_data != NULL) {
+        s_multinet->destroy(s_multinet_data);
+    }
+    s_multinet_data = NULL;
+    s_multinet = NULL;
+    if (s_multinet_commands_allocated) (void)esp_mn_commands_free();
+    s_multinet_commands_allocated = false;
+    free(s_multinet_pcm);
+    s_multinet_pcm = NULL;
+    s_multinet_chunk_samples = 0;
+    s_multinet_fill = 0;
+    if (s_sr_models != NULL) esp_srmodel_deinit(s_sr_models);
+    s_sr_models = NULL;
+    s_voice_command_event = PACON_MIC_VOICE_NONE;
+    s_status.voice_commands_enabled = false;
+    s_status.voice_commands_ready = false;
+}
+
+/* s_lock must be held. */
+static esp_err_t voice_commands_enable_locked(void)
+{
+    if (s_status.voice_commands_ready) return ESP_OK;
+    s_status.voice_commands_enabled = true;
+    s_status.voice_commands_ready = false;
+    s_sr_models = esp_srmodel_init("model");
+    if (s_sr_models == NULL) return ESP_ERR_NOT_FOUND;
+    char *model_name = esp_srmodel_filter(s_sr_models, ESP_MN_PREFIX,
+                                          ESP_MN_CHINESE);
+    if (model_name == NULL) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NOT_FOUND;
+    }
+    s_multinet = esp_mn_handle_from_name(model_name);
+    if (s_multinet == NULL) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    s_multinet_data = s_multinet->create(model_name, MIC_COMMAND_WINDOW_MS);
+    if (s_multinet_data == NULL) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NO_MEM;
+    }
+    const int chunk = s_multinet->get_samp_chunksize(s_multinet_data);
+    if (chunk <= 0 || s_multinet->get_samp_rate(s_multinet_data) !=
+                      (int)PACON_MIC_SAMPLE_RATE_HZ) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (esp_mn_commands_alloc(s_multinet, s_multinet_data) != ESP_OK) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NO_MEM;
+    }
+    s_multinet_commands_allocated = true;
+    if (esp_mn_commands_add(MIC_COMMAND_START_ID, "wo cao") != ESP_OK ||
+        esp_mn_commands_update() != NULL) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_multinet_pcm = heap_caps_malloc((size_t)chunk * sizeof(int16_t),
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_multinet_pcm == NULL) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NO_MEM;
+    }
+    s_multinet_chunk_samples = (size_t)chunk;
+    s_multinet_fill = 0;
+    if (s_wake_cpu_lock == NULL &&
+        esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "pacon_wake",
+                           &s_wake_cpu_lock) != ESP_OK) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_ERR_NO_MEM;
+    }
+    if (esp_pm_lock_acquire(s_wake_cpu_lock) != ESP_OK) {
+        voice_commands_disable_locked();
+        s_status.voice_commands_enabled = true;
+        return ESP_FAIL;
+    }
+    s_wake_cpu_lock_acquired = true;
+    s_status.voice_commands_ready = true;
+    s_status.last_error = ESP_OK;
+    ESP_LOGI(TAG, "MultiNet ready: %s; wo cao toggles recording", model_name);
+    return ESP_OK;
 }
 
 /* s_lock must be held. */
@@ -205,6 +324,45 @@ static void mic_capture_task(void *context)
                 (void)finalize_recording_locked(false);
             } else if (s_record_bytes >= MIC_MAX_DATA_BYTES) {
                 (void)finalize_recording_locked(true);
+            }
+        }
+        if (s_status.voice_commands_ready && s_multinet_pcm != NULL) {
+            size_t consumed = 0;
+            while (consumed < frames) {
+                const size_t room = s_multinet_chunk_samples - s_multinet_fill;
+                const size_t count = (frames - consumed) < room ?
+                                     (frames - consumed) : room;
+                memcpy(s_multinet_pcm + s_multinet_fill, pcm + consumed,
+                       count * sizeof(pcm[0]));
+                s_multinet_fill += count;
+                consumed += count;
+                if (s_multinet_fill == s_multinet_chunk_samples) {
+                    const esp_mn_state_t state =
+                        s_multinet->detect(s_multinet_data, s_multinet_pcm);
+                    s_multinet_fill = 0;
+                    if (state == ESP_MN_STATE_DETECTED) {
+                        esp_mn_results_t *results =
+                            s_multinet->get_results(s_multinet_data);
+                        const int command_id = results != NULL && results->num > 0 ?
+                                               results->command_id[0] : 0;
+                        if (s_voice_command_event == PACON_MIC_VOICE_NONE &&
+                            command_id == MIC_COMMAND_START_ID) {
+                            if (s_status.state == PACON_MIC_MONITORING) {
+                                s_voice_command_event = PACON_MIC_VOICE_START;
+                            } else if (s_status.state == PACON_MIC_RECORDING) {
+                                s_voice_command_event = PACON_MIC_VOICE_STOP;
+                            }
+                        }
+                        ++s_status.voice_command_count;
+                        ESP_LOGI(TAG, "voice command=%d text=%s probability=%.3f",
+                                 command_id,
+                                 results != NULL ? results->string : "?",
+                                 results != NULL && results->num > 0 ?
+                                 results->prob[0] : 0.0f);
+                    } else if (state == ESP_MN_STATE_TIMEOUT) {
+                        s_multinet->clean(s_multinet_data);
+                    }
+                }
             }
         }
         xSemaphoreGive(s_lock);
@@ -359,6 +517,33 @@ esp_err_t pacon_mic_stop_recording(void)
     return err;
 }
 
+esp_err_t pacon_mic_set_voice_commands_enabled(bool enabled)
+{
+    if (s_lock == NULL || !s_running) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = ESP_OK;
+    if (enabled) {
+        err = voice_commands_enable_locked();
+        if (err != ESP_OK) s_status.last_error = err;
+    } else {
+        voice_commands_disable_locked();
+        s_status.last_error = ESP_OK;
+    }
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+pacon_mic_voice_command_t pacon_mic_take_voice_command(void)
+{
+    if (s_lock == NULL || xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return PACON_MIC_VOICE_NONE;
+    }
+    const pacon_mic_voice_command_t command = s_voice_command_event;
+    s_voice_command_event = PACON_MIC_VOICE_NONE;
+    xSemaphoreGive(s_lock);
+    return command;
+}
+
 void pacon_mic_get_status(pacon_mic_status_t *status)
 {
     if (status == NULL) return;
@@ -392,6 +577,7 @@ void pacon_mic_close(void)
         s_task_done = NULL;
     }
     xSemaphoreTake(s_lock, portMAX_DELAY);
+    voice_commands_disable_locked();
     s_status.state = PACON_MIC_OFF;
     xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "monitor stopped and I2S released");

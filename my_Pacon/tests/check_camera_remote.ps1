@@ -27,7 +27,7 @@ $checks = @(
     @($fluid, 'PHONE CONNECTED', 'camera connection ring status'),
     @($fluid, 'CAPTURED', 'camera capture feedback animation'),
     @($fluid, 'const int icon_radius = 39', 'uniform launcher icon radius'),
-    @($fluid, 'home_in_circle\(x, y, LCD_WIDTH / 2, 385, 44\)', 'camera launcher touch target'),
+    @($fluid, 'home_in_circle\(x, y, 333, 385, 44\)', 'camera launcher touch target'),
     @($android, 'cameraButton', 'Android camera command button'),
     @($sdkconfig, 'CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2', 'parallel HID and app connections')
 )

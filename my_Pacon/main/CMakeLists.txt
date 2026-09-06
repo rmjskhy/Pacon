@@ -13,4 +13,4 @@ idf_component_register(
                 "assets/kkd2_complication.rgb565a"
     REQUIRES driver fatfs sdmmc usb esp_lcd esp_lcd_sh8601 esp_pm esp_tinyusb lvgl__lvgl
           esp_wifi esp_event esp_netif nvs_flash lwip
-             esp_http_client esp-tls json bt)
+             esp_http_client esp-tls json bt espressif__esp-sr)

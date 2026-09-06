@@ -68,7 +68,14 @@ function Invoke-FirmwareBuild {
     $env:IDF_TOOLS_PATH = $toolsPath
     $env:IDF_PYTHON_ENV_PATH = $pythonEnv
     $toolchainBin = Join-Path $toolsPath 'tools\xtensa-esp-elf\esp-14.2.0_20250730\xtensa-esp-elf\bin'
+    $pythonBin = Join-Path $pythonEnv 'Scripts'
     Require-Path $toolchainBin 'ESP32-S3 toolchain binaries'
+    Require-Path $pythonBin 'ESP-IDF Python binaries'
+    # ESP-SR's model packer invokes `python` by name from a CMake custom
+    # command, so make the verified IDF environment win over WindowsApps.
+    if (($env:PATH -split ';') -notcontains $pythonBin) {
+        $env:PATH = "$pythonBin;$env:PATH"
+    }
     if (($env:PATH -split ';') -notcontains $toolchainBin) {
         $env:PATH = "$toolchainBin;$env:PATH"
     }

@@ -82,7 +82,7 @@ static const char *TAG = "FLUID_PENDANT";
 #define PIN_SD_D0               GPIO_NUM_18
 #define PIN_SD_D1               GPIO_NUM_21
 #define SD_NAND_MOUNT_POINT     "/sdnand"
-#define MIC_TEST_WAV_PATH       SD_NAND_MOUNT_POINT "/MIC_TEST.WAV"
+#define MIC_RECORD_PATH_MAX     64U
 #define USB_MSC_BOOT_MAGIC      UINT32_C(0x554D5343) /* "UMSC" */
 
 #define I2C_PORT                I2C_NUM_0
@@ -217,6 +217,8 @@ extern const uint8_t kkd2_complication_end[]
 #define APPS_ENTRANCE_STEPS     4
 #define FRAME_PERIOD_MS         30
 #define OUO_FRAME_PERIOD_MS     16
+#define OUO_IDLE_FRAME_PERIOD_MS 33
+#define FLUID_IDLE_FRAME_PERIOD_MS 50
 #define WATCH_TOUCH_POLL_PERIOD_MS 10
 #define HOME_REFRESH_MS         1000
 #define FLUID_PERF_REPORT_MS    2000
@@ -519,6 +521,8 @@ static bool s_camera_dirty;
 static bool s_mic_test_dirty;
 static TickType_t s_mic_test_last_frame;
 static esp_err_t s_mic_test_action_result = ESP_OK;
+static char s_mic_record_path[MIC_RECORD_PATH_MAX] =
+    SD_NAND_MOUNT_POINT "/REC_001.WAV";
 static uint8_t s_settings_debug_taps;
 static TickType_t s_settings_debug_deadline;
 static TickType_t s_camera_feedback_started;
@@ -814,18 +818,21 @@ static bool s_ble_media_transfer_active;
 static uint32_t s_home_animation_frame;
 static TickType_t s_home_next_animation_tick;
 
-static fluid_particle_t s_particles[PARTICLE_COUNT];
-static int16_t s_drawn_x[PARTICLE_COUNT];
-static int16_t s_drawn_y[PARTICLE_COUNT];
-static int16_t s_matrix_x[PARTICLE_COUNT];
-static int16_t s_matrix_y[PARTICLE_COUNT];
+/* Fluid simulation data is neither DMA-facing nor accessed by an ISR.  Keep
+ * this relatively large workspace in PSRAM so Wi-Fi can reserve its small,
+ * contiguous internal-RAM RX buffers even when ESP-SR is linked. */
+EXT_RAM_BSS_ATTR static fluid_particle_t s_particles[PARTICLE_COUNT];
+EXT_RAM_BSS_ATTR static int16_t s_drawn_x[PARTICLE_COUNT];
+EXT_RAM_BSS_ATTR static int16_t s_drawn_y[PARTICLE_COUNT];
+EXT_RAM_BSS_ATTR static int16_t s_matrix_x[PARTICLE_COUNT];
+EXT_RAM_BSS_ATTR static int16_t s_matrix_y[PARTICLE_COUNT];
 static bool s_matrix_layout_ready;
 static bool s_fluid_canvas_valid;
-static uint16_t s_hash_count[HASH_CELLS];
-static uint16_t s_hash_start[HASH_CELLS + 1];
-static uint16_t s_hash_cursor[HASH_CELLS];
-static uint16_t s_hash_particle[PARTICLE_COUNT];
-static bool s_matrix_cell_used[MATRIX_CELLS];
+EXT_RAM_BSS_ATTR static uint16_t s_hash_count[HASH_CELLS];
+EXT_RAM_BSS_ATTR static uint16_t s_hash_start[HASH_CELLS + 1];
+EXT_RAM_BSS_ATTR static uint16_t s_hash_cursor[HASH_CELLS];
+EXT_RAM_BSS_ATTR static uint16_t s_hash_particle[PARTICLE_COUNT];
+EXT_RAM_BSS_ATTR static bool s_matrix_cell_used[MATRIX_CELLS];
 
 static esp_err_t i2c_read(uint8_t address, uint8_t reg, uint8_t *data, size_t length);
 static int clamp_int(int value, int low, int high);
@@ -2774,7 +2781,7 @@ static uint16_t apps_pixel(int x, int y)
     const int dy = y - center_y;
     const int glow = clamp_int(150 - (dx * dx + dy * dy) / 370, 0, 150);
     uint16_t colour = rgb565(glow / 45, glow / 30, glow / 18);
-    /* Equal 3-3-1 honeycomb: every app owns the same 78 px circle and the
+    /* Equal 3-3-2 honeycomb: every app owns the same 78 px circle and the
      * same 88 px touch target. */
     const int icon_size = 82;
     const int icon_radius = 39;
@@ -2913,9 +2920,29 @@ static uint16_t apps_pixel(int x, int y)
         }
         if (radius2 >= 35 * 35) colour = rgb565(215, 220, 229);
     }
-    /* Camera remote: a compact lens icon below Settings.  Its ring mirrors
+    /* Recorder: visible microphone icon in the lower-left honeycomb slot. */
+    const int mic_cx = 142;
+    const int mic_cy = 385;
+    const int mic_dx = x - mic_cx;
+    const int mic_dy = y - mic_cy;
+    const int mic_r2 = mic_dx * mic_dx + mic_dy * mic_dy;
+    if (mic_r2 <= icon_radius * icon_radius) {
+        colour = mic_r2 >= 35 * 35 ? rgb565(255, 69, 58) : rgb565(36, 38, 45);
+        if (home_in_round_rect(mic_dx + 39, mic_dy + 39, 31, 14, 47, 48, 8)) {
+            colour = rgb565(245, 245, 247);
+        }
+        const int bowl_r2 = mic_dx * mic_dx + (mic_dy - 5) * (mic_dy - 5);
+        if (bowl_r2 >= 17 * 17 && bowl_r2 <= 20 * 20 && mic_dy >= -1 && mic_dy <= 19) {
+            colour = rgb565(245, 245, 247);
+        }
+        if ((abs(mic_dx) <= 2 && mic_dy >= 20 && mic_dy <= 28) ||
+            (abs(mic_dy - 28) <= 2 && abs(mic_dx) <= 11)) {
+            colour = rgb565(245, 245, 247);
+        }
+    }
+    /* Camera remote: a compact lens icon in the lower-right slot. Its ring mirrors
      * the live HID readiness used by the dedicated shutter page. */
-    const int camera_cx = LCD_WIDTH / 2;
+    const int camera_cx = 333;
     const int camera_cy = 385;
     const int camera_dx = x - camera_cx;
     const int camera_dy = y - camera_cy;
@@ -5977,7 +6004,9 @@ static void poll_touch(void)
                 enter_usb_disk_screen();
             } else if (home_in_circle(x, y, LCD_WIDTH / 2, 265, 44)) {
                 settings_enter();
-            } else if (home_in_circle(x, y, LCD_WIDTH / 2, 385, 44)) {
+            } else if (home_in_circle(x, y, 142, 385, 44)) {
+                mic_test_enter();
+            } else if (home_in_circle(x, y, 333, 385, 44)) {
                 camera_enter();
             } else if (y >= 438) {
                 begin_apps_dismiss();
@@ -9711,20 +9740,43 @@ static void mic_test_format_db(char *out, size_t out_size, int16_t dbfs_x10)
     snprintf(out, out_size, "%d.%d", whole, decimal);
 }
 
+static void mic_test_select_record_path(void)
+{
+    struct stat info;
+    for (unsigned index = 1; index <= 999; ++index) {
+        snprintf(s_mic_record_path, sizeof(s_mic_record_path),
+                 SD_NAND_MOUNT_POINT "/REC_%03u.WAV", index);
+        if (stat(s_mic_record_path, &info) != 0) return;
+    }
+    snprintf(s_mic_record_path, sizeof(s_mic_record_path),
+             SD_NAND_MOUNT_POINT "/REC_999.WAV");
+}
+
+static void mic_test_begin_recording(void)
+{
+    if (!s_sd_nand_mounted || s_usb_msc_started) {
+        s_mic_test_action_result = ESP_ERR_INVALID_STATE;
+        return;
+    }
+    mic_test_select_record_path();
+    s_mic_test_action_result = pacon_mic_start_recording(s_mic_record_path);
+}
+
 static void mic_test_enter(void)
 {
     s_ui_screen = UI_SCREEN_MIC_TEST;
     s_mic_test_dirty = true;
     s_mic_test_last_frame = 0;
     s_mic_test_action_result = pacon_mic_open();
+    mic_test_select_record_path();
     s_apps_canvas_valid = false;
     s_apps_home_transition_frame = NULL;
     block_touch_until_release();
     if (s_mic_test_action_result == ESP_OK) {
-        ESP_LOGI(TAG, "Mic test: monitoring; tap record for %u second WAV",
+        ESP_LOGI(TAG, "Recorder: monitoring; tap record for up to %u seconds",
                  (unsigned)(PACON_MIC_MAX_RECORD_MS / 1000U));
     } else {
-        ESP_LOGE(TAG, "Mic test: open failed (%s)",
+        ESP_LOGE(TAG, "Recorder: open failed (%s)",
                  esp_err_to_name(s_mic_test_action_result));
     }
 }
@@ -9733,26 +9785,27 @@ static void mic_test_handle_touch(int x, int y)
 {
     if (x < 120 && y < 105) {
         pacon_mic_close();
-        s_ui_screen = UI_SCREEN_SETTINGS;
-        s_settings_scroll_y = 0;
-        s_settings_full_refresh = true;
-        s_device_settings_dirty = true;
+        s_ui_screen = UI_SCREEN_APPS;
+        s_apps_dirty = true;
+        s_apps_canvas_valid = false;
         block_touch_until_release();
-        ESP_LOGI(TAG, "Mic test: returned to Settings and released I2S");
+        ESP_LOGI(TAG, "Recorder: returned to app launcher and released I2S");
         return;
     }
-    if (!home_in_round_rect(x, y, 76, 344, 399, 416, 28)) return;
 
     pacon_mic_status_t status;
     pacon_mic_get_status(&status);
-    if (status.state == PACON_MIC_RECORDING) {
+    if (home_in_round_rect(x, y, 54, 282, 421, 334, 18)) {
+        s_mic_test_action_result =
+            pacon_mic_set_voice_commands_enabled(!status.voice_commands_enabled);
+    } else if (home_in_round_rect(x, y, 76, 344, 399, 407, 28) &&
+               status.state == PACON_MIC_RECORDING) {
         s_mic_test_action_result = pacon_mic_stop_recording();
-    } else if (status.state == PACON_MIC_MONITORING && s_sd_nand_mounted &&
-               !s_usb_msc_started) {
-        s_mic_test_action_result = pacon_mic_start_recording(MIC_TEST_WAV_PATH);
+    } else if (home_in_round_rect(x, y, 76, 344, 399, 407, 28) &&
+               status.state == PACON_MIC_MONITORING) {
+        mic_test_begin_recording();
     } else {
-        s_mic_test_action_result = status.last_error != ESP_OK ?
-                                   status.last_error : ESP_ERR_INVALID_STATE;
+        return;
     }
     s_mic_test_dirty = true;
     block_touch_until_release();
@@ -9784,24 +9837,25 @@ static void mic_test_render_frame(void)
     }
     skyorb_line(84, 62, 70, 76, white, 255);
     skyorb_line(70, 76, 84, 90, white, 255);
-    skyorb_text("MIC TEST", 177, 48, &lv_font_montserrat_18, white);
+    skyorb_text("RECORDER", 174, 48, &lv_font_montserrat_18, white);
 
     const char *state_text = "OFF";
     uint16_t state_colour = secondary;
     if (status.state == PACON_MIC_RECORDING) {
         state_text = "RECORDING";
         state_colour = red;
-    } else if (status.state == PACON_MIC_MONITORING) {
-        state_text = status.signal_present ? "LIVE SIGNAL" : "LISTENING";
-        state_colour = status.signal_present ? green : orange;
     } else if (status.state == PACON_MIC_ERROR || s_mic_test_action_result != ESP_OK) {
-        state_text = "AUDIO ERROR";
+        state_text = status.voice_commands_enabled ? "CMD ERROR" : "AUDIO ERROR";
         state_colour = red;
+    } else if (status.state == PACON_MIC_MONITORING) {
+        state_text = status.voice_commands_ready ? "SAY WO CAO" :
+                     (status.signal_present ? "LIVE SIGNAL" : "LISTENING");
+        state_colour = status.signal_present ? green : orange;
     }
     skyorb_text_centered(state_text, center_x, 91, &lv_font_montserrat_14,
                          state_colour);
 
-    fill_canvas_round_rect(54, 120, 421, 238, 18, panel, NULL);
+    fill_canvas_round_rect(54, 105, 421, 210, 18, panel, NULL);
     int32_t wave_peak = 1;
     for (size_t i = 0; i < PACON_MIC_WAVEFORM_POINTS; ++i) {
         int32_t magnitude = status.waveform[i] < 0 ?
@@ -9809,15 +9863,15 @@ static void mic_test_render_frame(void)
         if (magnitude > wave_peak) wave_peak = magnitude;
     }
     int previous_x = 68;
-    int previous_y = 179 - (int)((int32_t)status.waveform[0] * 48 / wave_peak);
+    int previous_y = 157 - (int)((int32_t)status.waveform[0] * 42 / wave_peak);
     for (size_t i = 1; i < PACON_MIC_WAVEFORM_POINTS; ++i) {
         const int x = 68 + (int)(i * 338U / (PACON_MIC_WAVEFORM_POINTS - 1U));
-        const int y = 179 - (int)((int32_t)status.waveform[i] * 48 / wave_peak);
+        const int y = 157 - (int)((int32_t)status.waveform[i] * 42 / wave_peak);
         skyorb_line(previous_x, previous_y, x, y, cyan, 255);
         previous_x = x;
         previous_y = y;
     }
-    skyorb_line(68, 179, 406, 179, rgb565(72, 72, 74), 120);
+    skyorb_line(68, 157, 406, 157, rgb565(72, 72, 74), 120);
 
     char rms[20], peak[20], floor_text[20];
     mic_test_format_db(rms, sizeof(rms), status.rms_dbfs_x10);
@@ -9825,23 +9879,31 @@ static void mic_test_render_frame(void)
     mic_test_format_db(floor_text, sizeof(floor_text), status.floor_dbfs_x10);
     char metrics[64];
     snprintf(metrics, sizeof(metrics), "RMS %s  PEAK %s dBFS", rms, peak);
-    skyorb_text_centered(metrics, center_x, 252, &lv_font_montserrat_14, white);
+    skyorb_text_centered(metrics, center_x, 220, &lv_font_montserrat_14, white);
     snprintf(metrics, sizeof(metrics), "QUIET FLOOR %s  CLIP %lu", floor_text,
              (unsigned long)status.clipped_samples);
-    skyorb_text_centered(metrics, center_x, 277, &lv_font_montserrat_14, secondary);
+    skyorb_text_centered(metrics, center_x, 243, &lv_font_montserrat_14, secondary);
 
-    fill_canvas_round_rect(76, 307, 399, 327, 10, rgb565(58, 58, 60), NULL);
+    fill_canvas_round_rect(76, 264, 399, 276, 6, rgb565(58, 58, 60), NULL);
     const int level = clamp_int((status.peak_dbfs_x10 + 600) * 323 / 600, 0, 323);
     if (level > 0) {
         const uint16_t level_colour = status.peak_dbfs_x10 > -30 ? red :
                                       (status.peak_dbfs_x10 > -120 ? orange : green);
-        fill_canvas_round_rect(76, 307, 76 + level, 327, 10, level_colour, NULL);
+        fill_canvas_round_rect(76, 264, 76 + level, 276, 6, level_colour, NULL);
     }
+
+    fill_canvas_round_rect(54, 282, 421, 334, 18, panel, NULL);
+    skyorb_text("VOICE COMMAND", 76, 296, &lv_font_montserrat_14, white);
+    skyorb_text("WO CAO: START / STOP", 76, 315, &lv_font_montserrat_14,
+                status.voice_commands_ready ? green : secondary);
+    const uint16_t switch_colour = status.voice_commands_enabled ? green : rgb565(72, 72, 74);
+    fill_canvas_round_rect(350, 292, 405, 324, 16, switch_colour, NULL);
+    skyorb_circle_dot(status.voice_commands_enabled ? 389 : 366, 308, 12, white);
 
     const bool recording = status.state == PACON_MIC_RECORDING;
     const bool can_record = status.state == PACON_MIC_MONITORING &&
                             s_sd_nand_mounted && !s_usb_msc_started;
-    fill_canvas_round_rect(76, 344, 399, 416, 28,
+    fill_canvas_round_rect(76, 344, 399, 407, 28,
                            recording ? rgb565(88, 24, 28) :
                            (can_record ? rgb565(20, 84, 54) : panel), NULL);
     char action[48];
@@ -9854,13 +9916,14 @@ static void mic_test_render_frame(void)
     } else if (!s_sd_nand_mounted) {
         snprintf(action, sizeof(action), "SD NAND NOT READY");
     } else {
-        snprintf(action, sizeof(action), "RECORD %u SECONDS",
+        snprintf(action, sizeof(action), "TAP TO RECORD  %u SEC",
                  (unsigned)(PACON_MIC_MAX_RECORD_MS / 1000U));
     }
-    skyorb_text_centered(action, center_x, 368, &lv_font_montserrat_18,
+    skyorb_text_centered(action, center_x, 365, &lv_font_montserrat_18,
                          recording ? red : (can_record ? green : secondary));
-    skyorb_text_centered("/MIC_TEST.WAV - export with USB Disk", center_x, 425,
-                         &lv_font_montserrat_14, secondary);
+    const char *shown_path = strrchr(s_mic_record_path, '/');
+    skyorb_text_centered(shown_path != NULL ? shown_path : s_mic_record_path,
+                         center_x, 416, &lv_font_montserrat_14, secondary);
 
     const dirty_rect_t full = {.x1 = 0, .y1 = 0, .x2 = LCD_WIDTH, .y2 = LCD_HEIGHT};
     (void)flush_canvas_rect(&full);
@@ -10773,6 +10836,27 @@ static void run_usb_msc_screen_loop(void)
     }
 }
 
+static uint32_t ui_frame_period_ms(void)
+{
+    if (s_ui_screen == UI_SCREEN_WATCH) {
+        return WATCH_TOUCH_POLL_PERIOD_MS;
+    }
+    if (s_ui_screen == UI_SCREEN_OUO) {
+        const bool interactive = s_ouo_touch_active ||
+                                 s_ouo_expression != OUO_EXPRESSION_IDLE;
+        return interactive ? OUO_FRAME_PERIOD_MS : OUO_IDLE_FRAME_PERIOD_MS;
+    }
+    if (s_ui_screen == UI_SCREEN_FLUID) {
+        const bool interactive = s_touch_down || s_touch_energy != 0;
+        return interactive ? FRAME_PERIOD_MS : FLUID_IDLE_FRAME_PERIOD_MS;
+    }
+    if (s_ui_screen == UI_SCREEN_FLUID_SETTINGS ||
+        s_ui_screen == UI_SCREEN_COLOUR_PICKER) {
+        return OUO_FRAME_PERIOD_MS;
+    }
+    return FRAME_PERIOD_MS;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "PACON pendant starting: Fluid + 0u0 (reset_reason=%d)",
@@ -11011,6 +11095,23 @@ void app_main(void)
         } else if (s_ui_screen == UI_SCREEN_MIC_TEST) {
             poll_touch();
             now = xTaskGetTickCount();
+            if (s_ui_screen == UI_SCREEN_MIC_TEST) {
+                const pacon_mic_voice_command_t command =
+                    pacon_mic_take_voice_command();
+                pacon_mic_status_t status;
+                pacon_mic_get_status(&status);
+                if (command == PACON_MIC_VOICE_START &&
+                    status.state == PACON_MIC_MONITORING) {
+                    mic_test_begin_recording();
+                    ESP_LOGI(TAG, "Recorder: wo cao started %s", s_mic_record_path);
+                } else if (command == PACON_MIC_VOICE_STOP &&
+                           status.state == PACON_MIC_RECORDING) {
+                    s_mic_test_action_result = pacon_mic_stop_recording();
+                    ESP_LOGI(TAG, "Recorder: wo cao stopped and saved %s",
+                             s_mic_record_path);
+                }
+                if (command != PACON_MIC_VOICE_NONE) s_mic_test_dirty = true;
+            }
             if (s_ui_screen == UI_SCREEN_MIC_TEST &&
                 (s_mic_test_dirty || s_mic_test_last_frame == 0 ||
                  (int32_t)(now - s_mic_test_last_frame) >= pdMS_TO_TICKS(80))) {
@@ -11034,9 +11135,13 @@ void app_main(void)
         } else {
             const bool cpu_lock_acquired = ui_cpu_lock_acquire();
             int64_t physics_start_us = esp_timer_get_time();
-            /* Keep the fluid lively even if the display transfer uses a full frame. */
-            step_fluid();
-            step_fluid();
+            /* Preserve about 60 physics steps/s when idle rendering drops to
+             * 20 FPS; touch-active rendering keeps the existing two steps. */
+            const uint32_t fluid_physics_steps =
+                ui_frame_period_ms() == FLUID_IDLE_FRAME_PERIOD_MS ? 3U : 2U;
+            for (uint32_t step = 0; step < fluid_physics_steps; ++step) {
+                step_fluid();
+            }
             physics_total_us += esp_timer_get_time() - physics_start_us;
 
             now = xTaskGetTickCount();
@@ -11072,14 +11177,7 @@ void app_main(void)
             log_axp2101_charge_status();
             next_pmic_status += pdMS_TO_TICKS(PMIC_STATUS_PERIOD_MS);
         }
-        /* OuO's animated eyes need the previewer's ~60 FPS cadence.  Keep the
-         * heavier Fluid/home loop at its original 30 ms period. */
-        const uint32_t frame_period_ms = s_ui_screen == UI_SCREEN_WATCH ?
-                                         WATCH_TOUCH_POLL_PERIOD_MS :
-            ((s_ui_screen == UI_SCREEN_OUO ||
-              s_ui_screen == UI_SCREEN_FLUID_SETTINGS ||
-              s_ui_screen == UI_SCREEN_COLOUR_PICKER) ?
-                                         OUO_FRAME_PERIOD_MS : FRAME_PERIOD_MS);
+        const uint32_t frame_period_ms = ui_frame_period_ms();
         vTaskDelayUntil(&last_frame, pdMS_TO_TICKS(frame_period_ms));
     }
 }

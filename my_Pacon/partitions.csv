@@ -1,3 +1,4 @@
 # Name,     Type,    SubType,    Offset,    Size
 nvs,        data,    nvs,        ,          0x6000
-app0,       app,     factory,    ,          15000K
+app0,       app,     factory,    ,          11000K
+model,      data,               ,          ,          4500K

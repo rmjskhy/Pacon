@@ -22,10 +22,9 @@ Require ($mic.Contains('#define MIC_DIGITAL_GAIN_X  4') -and
          $mic.Contains('apply_soft_limited_gain') -and
          $mic.Contains('sample = apply_soft_limited_gain(sample);')) `
     'Recording must apply 12 dB digital gain through the soft limiter'
-Require ($header.Contains('PACON_MIC_MAX_RECORD_MS   10000U')) 'Diagnostic recording must remain bounded to ten seconds'
+Require ($header.Contains('PACON_MIC_MAX_RECORD_MS   60000U')) 'Recording must remain bounded to sixty seconds'
 Require ($main.Contains('UI_SCREEN_MIC_TEST')) 'Microphone screen is not part of the UI state machine'
-Require ($main.Contains('++s_settings_debug_taps >= 3U')) 'Hidden Settings triple-tap entrance is missing'
-Require ($main.Contains('pacon_mic_start_recording(MIC_TEST_WAV_PATH)')) 'Record action is not wired to the WAV path'
+Require ($main.Contains('pacon_mic_start_recording(s_mic_record_path)')) 'Record action is not wired to the WAV path'
 Require ($main.Contains('pacon_mic_close();')) 'I2S is not released when leaving the diagnostic'
 Require ($main.Contains('(int32_t)(now - s_mic_test_last_frame) >= pdMS_TO_TICKS(80)')) 'Live screen refresh cadence is missing'
 Write-Host 'Microphone diagnostic wiring OK'

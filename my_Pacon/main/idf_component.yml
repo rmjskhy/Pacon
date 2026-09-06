@@ -5,3 +5,4 @@ dependencies:
     version: "*"
     override_path: "../../Pacon/components/espressif__cmake_utilities"
   espressif/esp_tinyusb: "^1.2"
+  espressif/esp-sr: "^2.1.0"

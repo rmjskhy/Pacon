@@ -11,11 +11,21 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # driver's DMA buffers. Keep ISR paths in IRAM while moving eligible task-only
 # FreeRTOS functions back to flash.
 CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# ESP-SR pulls ESP-DL's optimized kernels into the small SRAM1 IRAM window.
+# PACON never allocates heap memory from an IRAM ISR; keep ISR ringbuffer APIs
+# in IRAM while moving only task-context heap/ringbuffer functions to flash.
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# Single-microphone Chinese command model used by the Recorder app.
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_SR_MN_CN_MULTINET6_QUANT=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ESP32-S3R8 configuration verified by the bring-up project.
 CONFIG_SPIRAM=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_TYPE_AUTO=y
 CONFIG_SPIRAM_SPEED_80M=y

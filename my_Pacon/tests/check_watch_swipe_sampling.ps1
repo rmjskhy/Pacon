@@ -21,7 +21,7 @@ if (-not $flush.Success -or
 if ($main -notmatch '#define WATCH_TOUCH_POLL_PERIOD_MS\s+10') {
     $failures.Add('Watch touch polling is not configured for 100 Hz.')
 }
-if ($main -notmatch 's_ui_screen == UI_SCREEN_WATCH \?\s+WATCH_TOUCH_POLL_PERIOD_MS') {
+if ($main -notmatch 'static uint32_t ui_frame_period_ms\(void\)[\s\S]*?s_ui_screen == UI_SCREEN_WATCH[\s\S]*?return WATCH_TOUCH_POLL_PERIOD_MS;') {
     $failures.Add('The watch page does not select its dedicated touch polling period.')
 }
 

@@ -1302,3 +1302,23 @@ the media catalog; the next work starts with the Android settings UX.
   OuO 的待机快速路径与动态表情共用每 90 秒 1 像素漂移。新增
   `check_static_display_protection.ps1`，更新两个抽取式测试夹具；全量回归与 ESP-IDF 构建通过，
   待烧录完成 USB/时钟/OuO 真机验收及物理电流测量。
+
+### 2026-09-06：阶段 6 第一部分与 Recorder 离线中文语音控制
+
+- 阶段 6 第一部分加入按活动状态变化的帧率：OuO 动态交互保持高帧率、空闲时降低刷新；
+  Fluid 在触摸或明显运动时提升帧率，静止时目标约 20 FPS。Fluid 粒子和仿真工作数组迁移到
+  PSRAM，避免与 Wi-Fi、BLE 和语音模型争用内部 RAM。`check_adaptive_frame_rate.ps1`、全量回归
+  和固件构建通过；0u0 与 Fluid 均已通过真机测试，Fluid 倾斜、触摸和静置降帧期间无拖影、
+  明显卡顿或其它异常。
+- 新增 Recorder 页面：I2S 麦克风实时波形、点击开始/停止、最长 60 秒录音，以及按编号写入
+  NAND 的 `REC_NNN.WAV`；临时文件完成后原子改名，避免中断留下伪装成完整 WAV 的文件。
+- 初版 `Hi ESP` WakeNet 在命中后调用 `clean()` 导致 `dl_convq_queue_bzero` 中
+  `LoadProhibited` 并自动重启；删除该不安全清理调用后，真机命中可进入录音且不再复位。
+- 根据实测改用 ESP-SR MultiNet6 中文模型，模型分区扩大到 4500 KiB，命令 `wo cao` 对应
+  “卧槽”。同一句命令按 Recorder 当前状态切换：未录音时开始，录音中再次命中则停止保存；
+  不再注册识别不稳定的 `ei you`。COM11 串口确认两次命中并在 2128 ms 后原子保存
+  `REC_006.WAV`（68096 字节），用户真机确认功能正常且无重启。
+- 为兼顾 ESP-SR 与 Wi-Fi，允许部分 BSS 放入 PSRAM，并将可安全执行的 heap/ringbuffer 函数
+  放回 Flash。最终应用约 5.38 MiB、中文模型约 3.53 MiB；启动检查确认 Wi-Fi 的 4 个静态 RX
+  缓冲成功分配，Tickless Idle 保持启用，未出现 `ESP_ERR_NO_MEM`。Recorder 专项检查和完整
+  `pacon.ps1 test` 均通过。
